@@ -150,6 +150,26 @@
 </div>
 {% else %}
 
+<!-- ── ACTIVE PERIOD BANNER ── -->
+{% if current_period %}
+<div class="max-w-7xl mx-auto px-4 pt-5 pb-0">
+  <div class="flex items-center gap-3 rounded-2xl px-5 py-3 text-sm font-medium"
+       style="background:color-mix(in srgb, var(--accent) 12%, transparent); border:1px solid color-mix(in srgb, var(--accent) 25%, transparent)">
+    <span class="inline-flex items-center justify-center w-7 h-7 rounded-full text-white text-xs"
+          style="background:var(--accent)">
+      <i class="fas fa-clock"></i>
+    </span>
+    <span style="color:var(--accent)" class="font-semibold">{{ current_period.name }} Period</span>
+    {% if current_period.window_start and current_period.window_end %}
+    <span class="opacity-60">
+      {{ fmt_time(current_period.window_start, cfg.time_format) }} – {{ fmt_time(current_period.window_end, cfg.time_format) }}
+    </span>
+    {% endif %}
+    <span class="ml-auto opacity-50 text-xs">Showing buses for this period only</span>
+  </div>
+</div>
+{% endif %}
+
 <!-- ── LEGEND ── -->
 <div class="max-w-7xl mx-auto px-4 pt-5 pb-2">
   <div class="c-card rounded-2xl shadow-sm border border-slate-100 p-4">
@@ -195,7 +215,10 @@
               style="border-color:rgba(0,0,0,.1)">
         <option value="">{{ t('schedule') }}: All</option>
         {% for st in schedule_types %}
-        <option value="{{ st.name }}">{{ st.name }}</option>
+        <option value="{{ st.name }}"
+          {% if current_period and current_period.id == st.id %}selected{% endif %}>
+          {{ st.name }}
+        </option>
         {% endfor %}
       </select>
       <!-- Favorites toggle -->

@@ -206,6 +206,55 @@
         </div>
       </form>
 
+      <!-- Period Time Windows -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+        <div class="px-5 py-4 border-b border-slate-100">
+          <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+            <i class="fas fa-layer-group text-indigo-500"></i><span>Period Time Windows</span>
+          </h3>
+          <p class="text-xs text-slate-400 mt-1">Defines which buses are shown and which incidents are active for each period of the day.</p>
+        </div>
+        <form method="POST" action="{{ url_for('config_page', tab='operational') }}">
+          <input type="hidden" name="section" value="schedule_windows">
+          <div class="divide-y divide-slate-50">
+            {% for p in schedule_types %}
+            <div class="px-5 py-3 flex items-center gap-4">
+              <span class="w-24 text-sm font-semibold text-slate-700">{{ p.name }}</span>
+              <div class="flex items-center gap-2 flex-1">
+                <div>
+                  <label class="block text-xs text-slate-400 mb-1">Start</label>
+                  <input type="time" name="window_start_{{ p.id }}"
+                         value="{{ p.window_start or '' }}"
+                         class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                </div>
+                <span class="text-slate-300 mt-4">—</span>
+                <div>
+                  <label class="block text-xs text-slate-400 mb-1">End</label>
+                  <input type="time" name="window_end_{{ p.id }}"
+                         value="{{ p.window_end or '' }}"
+                         class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                </div>
+              </div>
+              <span class="text-xs text-slate-400 mt-4 hidden sm:block">
+                {% if p.window_start and p.window_end %}
+                  {{ fmt_time(p.window_start, cfg.time_format) }} – {{ fmt_time(p.window_end, cfg.time_format) }}
+                {% else %}
+                  <span class="text-amber-400">No window set</span>
+                {% endif %}
+              </span>
+            </div>
+            {% endfor %}
+          </div>
+          {% if can_write %}
+          <div class="px-5 py-3 bg-slate-50 border-t border-slate-100">
+            <button type="submit" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium">
+              <i class="fas fa-save mr-1"></i>Save Windows
+            </button>
+          </div>
+          {% endif %}
+        </form>
+      </div>
+
       <!-- Operational schedules -->
       <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
         <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">

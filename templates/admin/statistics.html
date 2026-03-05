@@ -136,6 +136,49 @@
   {% endif %}
 </div>
 
+<!-- Incidents by Bus & Period -->
+<div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 mb-5">
+  <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+    <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+      <i class="fas fa-layer-group text-indigo-500"></i>
+      <span>Incidents by Bus &amp; Period of Day</span>
+    </h3>
+    {% if period_bus_json != '{}' %}
+    <div class="flex items-center gap-2 flex-wrap" id="period-filter-btns">
+      <button onclick="filterPeriodChart('all')" data-period="all"
+              class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white transition-all">
+        All Periods
+      </button>
+      <button onclick="filterPeriodChart('Morning')" data-period="Morning"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-50 text-slate-600 border border-slate-200 hover:border-orange-400 transition-all">
+        <span class="inline-block w-2 h-2 rounded-full bg-orange-400 mr-1"></span>Morning
+      </button>
+      <button onclick="filterPeriodChart('Midday')" data-period="Midday"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-50 text-slate-600 border border-slate-200 hover:border-blue-400 transition-all">
+        <span class="inline-block w-2 h-2 rounded-full bg-blue-500 mr-1"></span>Midday
+      </button>
+      <button onclick="filterPeriodChart('Afternoon')" data-period="Afternoon"
+              class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-50 text-slate-600 border border-slate-200 hover:border-purple-400 transition-all">
+        <span class="inline-block w-2 h-2 rounded-full bg-purple-500 mr-1"></span>Afternoon
+      </button>
+    </div>
+    {% endif %}
+  </div>
+  {% if period_bus_json != '{}' %}
+  <div class="h-72"><canvas id="periodBusChart"></canvas></div>
+  <p class="text-xs text-slate-400 mt-3 text-center">
+    <i class="fas fa-info-circle mr-1"></i>
+    Only incidents with an assigned period are shown. Incidents without a period are excluded.
+  </p>
+  {% else %}
+  <div class="h-40 flex flex-col items-center justify-center text-slate-300">
+    <i class="fas fa-layer-group text-5xl mb-3"></i>
+    <p class="text-slate-400 text-sm">No period-specific incident data for this range</p>
+    <p class="text-slate-300 text-xs mt-1">Record incidents with a Schedule Period assigned to see this chart</p>
+  </div>
+  {% endif %}
+</div>
+
 <!-- Export & Email -->
 {% if can_export %}
 <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 mb-5">
@@ -236,10 +279,12 @@
 
 {% block scripts %}
 <script>
-const byType    = {{ by_type_json|safe }};
-const byTypeCl  = {{ by_type_colors_json|safe }};
-const byBus     = {{ by_bus_json|safe }};
-const byDay     = {{ by_day_json|safe }};
+const byType       = {{ by_type_json|safe }};
+const byTypeCl     = {{ by_type_colors_json|safe }};
+const byBus        = {{ by_bus_json|safe }};
+const byDay        = {{ by_day_json|safe }};
+const periodBusData = {{ period_bus_json|safe }};
+const recordBuses  = {{ record_buses_json|safe }};
 
 let mainChart = null;
 
@@ -300,6 +345,74 @@ if (Object.keys(byDay).length) {
       scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
     }
   });
+}
+
+// ── Period × Bus chart ────────────────────────────────────────────────────────
+const PERIOD_PALETTE = {
+  'Morning':   { bg: 'rgba(249,115,22,0.75)',  border: 'rgba(249,115,22,1)'  },
+  'Midday':    { bg: 'rgba(59,130,246,0.75)',   border: 'rgba(59,130,246,1)'  },
+  'Afternoon': { bg: 'rgba(139,92,246,0.75)',   border: 'rgba(139,92,246,1)'  },
+};
+function _periodColor(name, prop) {
+  return (PERIOD_PALETTE[name] || { bg: 'rgba(148,163,184,0.75)', border: 'rgba(148,163,184,1)' })[prop];
+}
+
+let periodBusChart = null;
+
+function filterPeriodChart(active) {
+  // Update button styles
+  document.querySelectorAll('#period-filter-btns button').forEach(btn => {
+    const isActive = btn.dataset.period === active;
+    btn.className = isActive
+      ? 'px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white transition-all'
+      : 'px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-50 text-slate-600 border border-slate-200 hover:border-indigo-300 transition-all';
+  });
+
+  const ctx = document.getElementById('periodBusChart');
+  if (!ctx) return;
+  if (periodBusChart) periodBusChart.destroy();
+
+  const periods = active === 'all' ? Object.keys(periodBusData) : [active];
+  const datasets = periods
+    .filter(p => periodBusData[p])
+    .map(p => ({
+      label: p,
+      data: recordBuses.map(b => (periodBusData[p] || {})[b] || 0),
+      backgroundColor: _periodColor(p, 'bg'),
+      borderColor: _periodColor(p, 'border'),
+      borderWidth: 1,
+      borderRadius: 4,
+    }));
+
+  periodBusChart = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: recordBuses, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          position: 'top',
+          labels: { boxWidth: 12, padding: 16, font: { size: 11 } }
+        },
+        tooltip: {
+          callbacks: {
+            title: items => 'Bus ' + items[0].label,
+            label: item => ` ${item.dataset.label}: ${item.raw} incident${item.raw !== 1 ? 's' : ''}`,
+          }
+        }
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { font: { size: 11 } } },
+        y: { beginAtZero: true, ticks: { stepSize: 1, font: { size: 11 } },
+             grid: { color: 'rgba(226,232,240,0.6)' } },
+      },
+    }
+  });
+}
+
+if (recordBuses.length && Object.keys(periodBusData).length) {
+  filterPeriodChart('all');
 }
 </script>
 {% endblock %}

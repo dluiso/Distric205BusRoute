@@ -1,7 +1,7 @@
 {% extends "admin/base.html" %}
 {% block title %}Buses{% endblock %}
 {% block page_title %}Bus Management{% endblock %}
-{% block page_subtitle %}Register buses and assign daily incident status{% endblock %}
+{% block page_subtitle %}Register buses and assign daily incident status{% if current_period %} &mdash; <span class="text-indigo-600 font-semibold">{{ current_period.name }} period active</span>{% endif %}{% endblock %}
 
 {% block content %}
 <!-- Toolbar -->
@@ -450,6 +450,7 @@
     const div = document.getElementById(`dep-edit-${cb.dataset.sid}`);
     if (div) div.classList.toggle('hidden', !cb.checked);
   }
+  const CURRENT_PERIOD_ID = {{ (current_period.id if current_period else 'null') }};
   function openIncidentModal(busId, identifier) {
     document.getElementById('form-incident').action = `/admin/buses/${busId}/incident`;
     document.getElementById('inc-bus-label').textContent = identifier;
@@ -461,6 +462,9 @@
     document.getElementById('inc-reason-custom').classList.add('hidden');
     document.getElementById('inc-reason-text').value = '';
     document.getElementById('add-reason-panel').classList.add('hidden');
+    // Auto-select the active period
+    const sel = document.querySelector('#form-incident select[name="schedule_type_id"]');
+    if (sel) sel.value = CURRENT_PERIOD_ID !== null ? String(CURRENT_PERIOD_ID) : '';
     openModal('modal-incident');
   }
   function toggleCustomReason() {

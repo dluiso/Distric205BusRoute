@@ -224,10 +224,12 @@ class User(UserMixin, db.Model):
 
 
 class BusScheduleType(db.Model):
-    id          = db.Column(db.Integer, primary_key=True)
-    name        = db.Column(db.String(50), unique=True, nullable=False)
-    time_label  = db.Column(db.String(20))   # e.g. "7:00 AM"
-    sort_order  = db.Column(db.Integer, default=0)
+    id           = db.Column(db.Integer, primary_key=True)
+    name         = db.Column(db.String(50), unique=True, nullable=False)
+    time_label   = db.Column(db.String(20))   # e.g. "7:00 AM"
+    sort_order   = db.Column(db.Integer, default=0)
+    window_start = db.Column(db.String(5))    # HH:MM display window begins
+    window_end   = db.Column(db.String(5))    # HH:MM display window ends
 
 
 class IncidentType(db.Model):
@@ -460,6 +462,8 @@ def _migrate_add_columns():
         ('configuration',           'mail_use_ssl',    'BOOLEAN DEFAULT 0'),
         ('configuration',           'time_format',     "VARCHAR(4) DEFAULT '12h'"),
         ('notification_subscriber', 'group_id',        'INTEGER'),
+        ('bus_schedule_type',       'window_start',    'VARCHAR(5)'),
+        ('bus_schedule_type',       'window_end',      'VARCHAR(5)'),
     ]
     with db.engine.connect() as conn:
         for table, col, coltype in cols:
@@ -483,11 +487,32 @@ def init_db():
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 
-def get_bus_status(bus_id, for_date=None):
-    """Returns (IncidentType, delay_minutes) for a bus on a given date."""
+def get_current_period():
+    """Returns the active BusScheduleType based on current local time, or None."""
+    try:
+        cfg = get_config()
+        tz = pytz.timezone(cfg.timezone)
+        now = datetime.now(tz)
+        current_time = now.strftime('%H:%M')
+        periods = BusScheduleType.query.filter(
+            BusScheduleType.window_start != None,
+            BusScheduleType.window_end   != None,
+        ).order_by(BusScheduleType.sort_order).all()
+        for p in periods:
+            if p.window_start and p.window_end and p.window_start <= current_time <= p.window_end:
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def get_bus_status(bus_id, for_date=None, schedule_type_id=None):
+    """Returns (IncidentType, delay_minutes) for a bus on a given date/period."""
     if for_date is None: for_date = date.today()
-    rec = BusIncidentRecord.query.filter_by(bus_id=bus_id, incident_date=for_date)\
-              .order_by(BusIncidentRecord.created_at.desc()).first()
+    q = BusIncidentRecord.query.filter_by(bus_id=bus_id, incident_date=for_date)
+    if schedule_type_id:
+        q = q.filter_by(schedule_type_id=schedule_type_id)
+    rec = q.order_by(BusIncidentRecord.created_at.desc()).first()
     if rec:
         return rec.incident_type, rec.delay_minutes
     default = IncidentType.query.filter_by(is_default=True).first()
@@ -523,14 +548,36 @@ def is_operational():
     except Exception:
         return True, None
 
-def bus_list_today():
+def bus_list_today(period=None):
+    """Return bus status list for today, optionally filtered to a specific period.
+
+    When ``period`` is a BusScheduleType, only buses assigned to that period are
+    returned and their status is resolved against period-specific incidents only.
+    Pass period=None to bypass filtering (admin views, statistics, etc.).
+    """
     today = date.today()
-    buses = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
+    current_period = period  # caller may override; default = auto-detect
+    if current_period is None:
+        current_period = get_current_period()
+
+    if current_period is not None:
+        assigned_ids = {a.bus_id for a in BusScheduleAssignment.query.filter_by(
+            schedule_type_id=current_period.id).all()}
+        buses = Bus.query.filter(
+            Bus.active == True,
+            Bus.id.in_(assigned_ids),
+        ).order_by(Bus.identifier).all()
+    else:
+        buses = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
+
+    period_id = current_period.id if current_period else None
     result = []
     for bus in buses:
-        status, delay = get_bus_status(bus.id, today)
-        incidents = BusIncidentRecord.query.filter_by(bus_id=bus.id, incident_date=today)\
-                        .order_by(BusIncidentRecord.created_at.desc()).all()
+        status, delay = get_bus_status(bus.id, today, schedule_type_id=period_id)
+        q = BusIncidentRecord.query.filter_by(bus_id=bus.id, incident_date=today)
+        if period_id:
+            q = q.filter_by(schedule_type_id=period_id)
+        incidents = q.order_by(BusIncidentRecord.created_at.desc()).all()
         schedules = [a.schedule_type for a in bus.schedule_assignments]
         latest = incidents[0] if incidents else None
         eta = latest.eta if latest else None
@@ -543,7 +590,8 @@ def bus_list_today():
         result.append({'bus': bus, 'status': status, 'delay': delay,
                        'incidents': incidents, 'schedules': schedules,
                        'schedule_assignments': bus.schedule_assignments,
-                       'eta': eta, 'delay_reason': delay_reason})
+                       'eta': eta, 'delay_reason': delay_reason,
+                       'current_period': current_period})
     return result
 
 def configure_mail(cfg, override=None):
@@ -857,10 +905,19 @@ def _seed_defaults():
     # Config singleton
     if not Configuration.query.first():
         db.session.add(Configuration()); db.session.commit()
-    # Schedule types
-    for name, label, order in [('Morning','7:00 AM',0),('Midday','12:00 PM',1),('Afternoon','3:00 PM',2)]:
-        if not BusScheduleType.query.filter_by(name=name).first():
-            db.session.add(BusScheduleType(name=name, time_label=label, sort_order=order))
+    # Schedule types (with default time windows)
+    for name, label, order, w_start, w_end in [
+        ('Morning',   '7:00 AM',  0, '06:00', '11:30'),
+        ('Midday',    '12:00 PM', 1, '11:30', '14:00'),
+        ('Afternoon', '3:00 PM',  2, '14:00', '19:00'),
+    ]:
+        existing = BusScheduleType.query.filter_by(name=name).first()
+        if not existing:
+            db.session.add(BusScheduleType(name=name, time_label=label, sort_order=order,
+                                           window_start=w_start, window_end=w_end))
+        elif not existing.window_start:
+            existing.window_start = w_start
+            existing.window_end   = w_end
     db.session.commit()
     # Incident types
     for name, color, icon, is_def, is_sys, order in [
@@ -896,12 +953,14 @@ def _seed_defaults():
 def index():
     cfg = get_config()
     operational, offline_msg = is_operational()
-    buses_data = bus_list_today() if operational else []
+    current_period = get_current_period() if operational else None
+    buses_data     = bus_list_today(period=current_period) if operational else []
     incident_types = IncidentType.query.order_by(IncidentType.sort_order).all()
     schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
     return render_template('public/index.html',
                            buses_data=buses_data, incident_types=incident_types,
                            schedule_types=schedule_types, cfg=cfg,
+                           current_period=current_period,
                            operational=operational, offline_msg=offline_msg,
                            today=date.today())
 
@@ -910,8 +969,9 @@ def api_buses():
     operational, _ = is_operational()
     if not operational:
         return jsonify({'operational': False, 'buses': []})
-    today = date.today()
-    buses_data = bus_list_today()
+    today          = date.today()
+    current_period = get_current_period()
+    buses_data     = bus_list_today(period=current_period)
     result = []
     for item in buses_data:
         bus = item['bus']
@@ -932,7 +992,8 @@ def api_buses():
                           for i in item['incidents']],
             'schedules': [s.name for s in item['schedules']],
         })
-    return jsonify({'operational': True, 'buses': result})
+    period_info = {'id': current_period.id, 'name': current_period.name} if current_period else None
+    return jsonify({'operational': True, 'current_period': period_info, 'buses': result})
 
 
 # ── AUTH ROUTES ───────────────────────────────────────────────────────────────
@@ -1080,15 +1141,17 @@ def dashboard():
 @login_required
 @require_module('buses')
 def buses():
-    today      = date.today()
-    buses_data = bus_list_today()
-    incident_types  = IncidentType.query.order_by(IncidentType.sort_order).all()
-    schedule_types  = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
-    delay_reasons   = DelayReason.query.order_by(DelayReason.sort_order).all()
-    can_write  = current_user.has_access('buses', 'full')
+    today          = date.today()
+    current_period = get_current_period()
+    buses_data     = bus_list_today(period=current_period)
+    incident_types = IncidentType.query.order_by(IncidentType.sort_order).all()
+    schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
+    delay_reasons  = DelayReason.query.order_by(DelayReason.sort_order).all()
+    can_write      = current_user.has_access('buses', 'full')
     return render_template('admin/buses.html',
                            buses_data=buses_data, incident_types=incident_types,
                            schedule_types=schedule_types, delay_reasons=delay_reasons,
+                           current_period=current_period,
                            can_write=can_write, today=today)
 
 @app.route('/admin/buses/add', methods=['POST'])
@@ -1311,6 +1374,18 @@ def statistics():
             avg_delay[b].append(r.delay_minutes)
     avg_delay_final = {k: round(sum(v)/len(v), 1) for k, v in avg_delay.items()}
 
+    # Period × Bus breakdown for the period chart
+    schedule_periods = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
+    period_bus_data  = {p.name: {} for p in schedule_periods}
+    for r in records:
+        pname = r.schedule_type.name if r.schedule_type else None
+        if pname and pname in period_bus_data:
+            b = r.bus.identifier
+            period_bus_data[pname][b] = period_bus_data[pname].get(b, 0) + 1
+    # Only keep periods that actually have data
+    period_bus_data = {k: v for k, v in period_bus_data.items() if v}
+    record_buses = sorted({r.bus.identifier for r in records})
+
     all_buses  = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
     all_types  = IncidentType.query.order_by(IncidentType.sort_order).all()
     can_export = current_user.has_access('statistics', 'limited')
@@ -1324,6 +1399,8 @@ def statistics():
         by_bus_json=json.dumps(by_bus),
         by_day_json=json.dumps(by_day),
         avg_delay_json=json.dumps(avg_delay_final),
+        period_bus_json=json.dumps(period_bus_data),
+        record_buses_json=json.dumps(record_buses),
         total=len(records), all_buses=all_buses, all_types=all_types,
         can_export=can_export, today=today,
     )
@@ -1380,20 +1457,80 @@ def export_statistics(fmt):
         return resp
 
     elif fmt == 'pdf' and PDF_AVAILABLE:
-        pdf = FPDF()
+        def _pdf_safe(text):
+            return (str(text)
+                    .replace('\u2014', '--').replace('\u2013', '-')
+                    .replace('\u2018', "'").replace('\u2019', "'")
+                    .replace('\u201c', '"').replace('\u201d', '"')
+                    .encode('latin-1', errors='replace').decode('latin-1'))
+
+        class _BusReportPDF(FPDF):
+            def footer(self):
+                self.set_y(-12)
+                self.set_font('Helvetica', 'I', 7)
+                self.set_text_color(150, 150, 150)
+                self.cell(0, 5, 'Powered by Avidity Technologies Inc', align='C')
+                self.set_text_color(0, 0, 0)
+
+        pdf = _BusReportPDF(orientation='L', unit='mm', format='A4')
+        pdf.set_auto_page_break(auto=True, margin=16)
+        pdf.set_margins(10, 10, 10)
         pdf.add_page()
-        pdf.set_font('Helvetica', 'B', 14)
-        pdf.cell(0, 10, title, ln=True)
-        pdf.set_font('Helvetica', '', 8)
-        col_widths = [22,16,30,28,26,18,20,26,20]
+
+        # ── Header: logo + app name + report title ──────────────────────────
+        logo_x = 10
+        logo_fs = None
+        if cfg.logo_path:
+            candidate = os.path.join(BASE_DIR, cfg.logo_path.lstrip('/').replace('/', os.sep))
+            if os.path.exists(candidate):
+                logo_fs = candidate
+        if logo_fs:
+            try:
+                pdf.image(logo_fs, x=logo_x, y=10, h=14)
+                text_x = logo_x + 18
+            except Exception:
+                text_x = logo_x
+        else:
+            text_x = logo_x
+
+        pdf.set_xy(text_x, 10)
+        pdf.set_font('Helvetica', 'B', 15)
+        pdf.set_text_color(30, 64, 175)
+        pdf.cell(0, 8, _pdf_safe(cfg.app_name or 'Bus Tracker'), ln=True)
+        pdf.set_x(text_x)
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(100, 116, 139)
+        pdf.cell(0, 5, _pdf_safe(title), ln=True)
+        pdf.set_text_color(0, 0, 0)
+
+        # Separator line
+        pdf.set_y(max(pdf.get_y(), 26))
+        pdf.set_draw_color(226, 232, 240)
+        pdf.line(10, pdf.get_y(), 287, pdf.get_y())
+        pdf.ln(3)
+
+        # ── Table header ────────────────────────────────────────────────────
+        # A4 landscape usable width ≈ 277mm (297 - 2×10)
+        col_widths = [28, 20, 42, 38, 34, 20, 27, 40, 28]
+        pdf.set_font('Helvetica', 'B', 7)
+        pdf.set_fill_color(30, 64, 175)
+        pdf.set_text_color(255, 255, 255)
         for h, w in zip(headers, col_widths):
-            pdf.cell(w, 7, h, border=1)
+            pdf.cell(w, 7, _pdf_safe(h), border=0, fill=True, align='C')
         pdf.ln()
+
+        # ── Table rows ──────────────────────────────────────────────────────
+        pdf.set_font('Helvetica', '', 7)
+        pdf.set_text_color(15, 23, 42)
+        alt = False
         for row in rows:
+            pdf.set_fill_color(241, 245, 249) if alt else pdf.set_fill_color(255, 255, 255)
             for val, w in zip(row, col_widths):
-                pdf.cell(w, 6, str(val)[:20], border=1)
+                pdf.cell(w, 6, _pdf_safe(str(val))[:35], border=0, fill=True)
             pdf.ln()
-        resp = make_response(pdf.output())
+            alt = not alt
+
+        resp = make_response(bytes(pdf.output()))
         resp.headers['Content-Type'] = 'application/pdf'
         resp.headers['Content-Disposition'] = f'attachment; filename="bus_report_{d_from}_{d_to}.pdf"'
         return resp
@@ -1836,6 +1973,12 @@ def config_page():
             cfg.commit_delay_min = request.form.get('commit_delay_min', cfg.commit_delay_min, type=int)
             cfg.offline_message  = request.form.get('offline_message', cfg.offline_message)
             cfg.show_always      = 'show_always' in request.form
+        elif section == 'schedule_windows':
+            for p in BusScheduleType.query.all():
+                w_start = request.form.get(f'window_start_{p.id}', '').strip()
+                w_end   = request.form.get(f'window_end_{p.id}',   '').strip()
+                p.window_start = w_start or None
+                p.window_end   = w_end   or None
         elif section == 'language':
             cfg.lang_frontend = request.form.get('lang_frontend', 'en')
             cfg.lang_backend  = request.form.get('lang_backend', 'en')
@@ -1856,16 +1999,17 @@ def config_page():
         return redirect(url_for('config_page', tab=section))
 
     # Operational schedules and holidays
-    schedules  = OperationalSchedule.query.order_by(OperationalSchedule.name).all()
-    holidays   = Holiday.query.order_by(Holiday.holiday_date.desc()).all()
-    timezones  = ['America/New_York','America/Chicago','America/Denver',
-                  'America/Los_Angeles','America/Anchorage','Pacific/Honolulu',
-                  'America/Puerto_Rico','Europe/London','Europe/Madrid']
+    schedules      = OperationalSchedule.query.order_by(OperationalSchedule.name).all()
+    holidays       = Holiday.query.order_by(Holiday.holiday_date.desc()).all()
+    schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
+    timezones      = ['America/New_York','America/Chicago','America/Denver',
+                      'America/Los_Angeles','America/Anchorage','Pacific/Honolulu',
+                      'America/Puerto_Rico','Europe/London','Europe/Madrid']
     active_tab = request.args.get('tab', 'general')
     can_write  = current_user.has_access('config', 'full')
     return render_template('admin/config.html', cfg=cfg, schedules=schedules,
-                           holidays=holidays, timezones=timezones,
-                           active_tab=active_tab, can_write=can_write)
+                           holidays=holidays, schedule_types=schedule_types,
+                           timezones=timezones, active_tab=active_tab, can_write=can_write)
 
 @app.route('/admin/config/upload-logo', methods=['POST'])
 @login_required
