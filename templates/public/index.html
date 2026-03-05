@@ -122,8 +122,10 @@
         <span class="text-xs font-medium opacity-80" style="color:var(--nav-text)">Live</span>
       </div>
       {% endif %}
-      <!-- Date -->
+      <!-- Date & Time -->
       <span class="text-xs opacity-60 hidden sm:inline" style="color:var(--nav-text)" id="nav-date"></span>
+      <span class="text-xs opacity-60 hidden sm:inline" style="color:var(--nav-text)">·</span>
+      <span class="text-xs opacity-60 hidden sm:inline font-medium" style="color:var(--nav-text)" id="nav-clock"></span>
       <!-- Dark mode toggle -->
       <button id="theme-btn" onclick="toggleTheme()" class="theme-toggle" title="Toggle dark mode" aria-label="Toggle dark mode">
         <i id="theme-icon" class="fas fa-moon text-sm" style="color:var(--nav-text)"></i>
@@ -374,9 +376,26 @@
 {% endif %} {# /operational #}
 
 <script>
-// ── Date display ──
+// ── Date & clock display ──
 document.getElementById('nav-date').textContent =
   new Date().toLocaleDateString('en-US', {weekday:'short',month:'short',day:'numeric'});
+
+const CLOCK_24H = '{{ cfg.time_format }}' === '24h';
+function updateClock() {
+  const now = new Date();
+  let h = now.getHours(), m = now.getMinutes(), s = now.getSeconds();
+  let timeStr;
+  if (CLOCK_24H) {
+    timeStr = String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+  } else {
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    timeStr = h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0') + ' ' + ampm;
+  }
+  document.getElementById('nav-clock').textContent = timeStr;
+}
+updateClock();
+setInterval(updateClock, 1000);
 
 // ── Dark mode ──
 const THEME_KEY = 'bustrack_theme';

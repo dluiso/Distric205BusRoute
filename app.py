@@ -10,6 +10,7 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from flask_mail import Mail, Message
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime, date, timedelta
 from functools import wraps
 from sqlalchemy import func
@@ -46,6 +47,7 @@ try:
 except ImportError:
     pass
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 _secret = os.environ.get('SECRET_KEY', '')
 if not _secret or _secret == 'changeme-set-in-env':
     _secret = secrets.token_hex(32)   # auto-generate for dev; wizard writes a real key
