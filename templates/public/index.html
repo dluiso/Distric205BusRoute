@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="{{ cfg.lang_frontend }}" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ cfg.app_name }}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  {% if cfg.icon_path %}
+  <link rel="icon" href="{{ cfg.icon_path }}">
+  {% endif %}
+  <style>
+    /* ── Light theme (CSS variables from admin config) ── */
+    :root {
+      --bg:       {{ cfg.color_bg }};
+      --nav:      {{ cfg.color_nav }};
+      --card:     {{ cfg.color_card }};
+      --text:     {{ cfg.color_text }};
+      --accent:   {{ cfg.color_accent }};
+      --nav-text: {{ cfg.color_nav_text }};
+    }
+
+    /* ── Dark theme override ── */
+    html[data-theme="dark"] {
+      --bg:       #0f172a;
+      --nav:      #080f1e;
+      --card:     #1e293b;
+      --text:     #e2e8f0;
+      --accent:   #60a5fa;
+      --nav-text: #f1f5f9;
+    }
+
+    /* ── Base ── */
+    body    { background-color: var(--bg); color: var(--text); transition: background-color .3s, color .3s; }
+    .c-nav  { background-color: var(--nav); color: var(--nav-text); }
+    .c-card { background-color: var(--card); transition: background-color .3s; }
+    .c-accent { background-color: var(--accent); }
+    .c-accent-text { color: var(--accent); }
+
+    .bus-card { transition: transform .15s, box-shadow .15s; }
+    .bus-card:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,0,0,.12); }
+    .bus-card.hidden-card { display: none; }
+
+    @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:.4} }
+    .live-dot { animation: pulse-dot 2s infinite; }
+
+    /* ── Dark mode — text overrides ── */
+    html[data-theme="dark"] .text-slate-800,
+    html[data-theme="dark"] .text-slate-700 { color: #f1f5f9; }
+    html[data-theme="dark"] .text-slate-600,
+    html[data-theme="dark"] .text-slate-500 { color: rgba(241,245,249,.55); }
+    html[data-theme="dark"] .text-slate-400,
+    html[data-theme="dark"] .text-slate-300 { color: rgba(241,245,249,.38); }
+    html[data-theme="dark"] .text-blue-500  { color: #93c5fd; }
+    html[data-theme="dark"] .text-blue-400  { color: #7dd3fc; }
+    html[data-theme="dark"] .font-bold.text-slate-800 { color: #f1f5f9; }
+
+    /* ── Dark mode — borders ── */
+    html[data-theme="dark"] .border-slate-100,
+    html[data-theme="dark"] .border-slate-200 { border-color: rgba(255,255,255,.07) !important; }
+    html[data-theme="dark"] .border-slate-50  { border-color: rgba(255,255,255,.04) !important; }
+
+    /* ── Dark mode — backgrounds ── */
+    html[data-theme="dark"] .bg-slate-100 { background-color: rgba(255,255,255,.08) !important; }
+    html[data-theme="dark"] .bg-slate-50  { background-color: rgba(255,255,255,.04) !important; }
+
+    /* ── Dark mode — inputs / selects ── */
+    html[data-theme="dark"] input[type="text"],
+    html[data-theme="dark"] select {
+      background-color: rgba(15,23,42,.8) !important;
+      color: #e2e8f0 !important;
+      border-color: rgba(255,255,255,.14) !important;
+    }
+    html[data-theme="dark"] input[type="text"]::placeholder { color: rgba(241,245,249,.3); }
+
+    /* ── Dark mode — opacity adjustments ── */
+    html[data-theme="dark"] .opacity-50,
+    html[data-theme="dark"] .opacity-60 { opacity: .55; }
+    html[data-theme="dark"] .opacity-40 { opacity: .45; }
+
+    /* ── Dark mode — bus card hover ── */
+    html[data-theme="dark"] .bus-card:hover { box-shadow: 0 8px 30px rgba(0,0,0,.45); }
+
+    /* ── Dark mode — offline card border ── */
+    html[data-theme="dark"] .offline-card { border-color: rgba(255,255,255,.07) !important; }
+
+    /* ── Theme toggle button ── */
+    .theme-toggle {
+      width: 2.25rem; height: 2.25rem;
+      border-radius: 9999px;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      transition: background-color .2s;
+      background: rgba(255,255,255,.12);
+    }
+    .theme-toggle:hover { background: rgba(255,255,255,.22); }
+  </style>
+</head>
+<body class="min-h-screen">
+
+<!-- ── NAVBAR ── -->
+<nav class="c-nav shadow-md sticky top-0 z-20">
+  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center space-x-3">
+      {% if cfg.logo_path %}
+      <img src="{{ cfg.logo_path }}" class="w-8 h-8 rounded-lg object-contain bg-white/10 p-0.5" alt="logo">
+      {% else %}
+      <div class="w-8 h-8 rounded-lg bg-white/15 flex items-center justify-center">
+        <i class="fas fa-bus text-sm" style="color:var(--nav-text)"></i>
+      </div>
+      {% endif %}
+      <div>
+        <p class="font-bold text-sm leading-tight" style="color:var(--nav-text)">{{ cfg.app_name }}</p>
+        <p class="text-xs opacity-60" style="color:var(--nav-text)">{{ cfg.app_subtitle }}</p>
+      </div>
+    </div>
+    <div class="flex items-center space-x-3">
+      <!-- Live indicator -->
+      {% if operational %}
+      <div class="flex items-center space-x-1.5 bg-white/10 px-3 py-1.5 rounded-full">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 live-dot"></span>
+        <span class="text-xs font-medium opacity-80" style="color:var(--nav-text)">Live</span>
+      </div>
+      {% endif %}
+      <!-- Date -->
+      <span class="text-xs opacity-60 hidden sm:inline" style="color:var(--nav-text)" id="nav-date"></span>
+      <!-- Dark mode toggle -->
+      <button id="theme-btn" onclick="toggleTheme()" class="theme-toggle" title="Toggle dark mode" aria-label="Toggle dark mode">
+        <i id="theme-icon" class="fas fa-moon text-sm" style="color:var(--nav-text)"></i>
+      </button>
+      <!-- Admin link -->
+      <a href="{{ url_for('login') }}"
+         class="text-xs opacity-60 hover:opacity-100 transition-opacity" style="color:var(--nav-text)">
+        <i class="fas fa-lock mr-1"></i>Admin
+      </a>
+    </div>
+  </div>
+</nav>
+
+<!-- ── OFFLINE BANNER ── -->
+{% if not operational %}
+<div class="max-w-7xl mx-auto px-4 py-10 text-center">
+  <div class="c-card offline-card rounded-3xl shadow-sm border border-slate-100 p-10 max-w-lg mx-auto">
+    <div class="w-20 h-20 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-5">
+      <i class="fas fa-bus-alt text-slate-300 text-3xl"></i>
+    </div>
+    <h2 class="text-xl font-bold mb-2">Service Offline</h2>
+    <p class="text-sm opacity-60">{{ offline_msg or 'Bus service is currently offline.' }}</p>
+  </div>
+</div>
+{% else %}
+
+<!-- ── LEGEND ── -->
+<div class="max-w-7xl mx-auto px-4 pt-5 pb-2">
+  <div class="c-card rounded-2xl shadow-sm border border-slate-100 p-4">
+    <p class="text-xs font-semibold uppercase tracking-wider opacity-50 mb-3">
+      <i class="fas fa-circle-info mr-1"></i>{{ t('bus_legend') }}
+    </p>
+    <div class="flex flex-wrap gap-2">
+      {% for it in incident_types %}
+      <div class="flex items-center space-x-1.5 px-3 py-1.5 rounded-full text-xs font-medium text-white"
+           style="background-color:{{ it.color }}">
+        <i class="fas {{ it.icon }} text-xs"></i>
+        <span>{{ it.name }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<!-- ── FILTERS ── -->
+<div class="max-w-7xl mx-auto px-4 py-3">
+  <div class="c-card rounded-2xl shadow-sm border border-slate-100 p-4">
+    <div class="flex flex-wrap gap-3 items-center">
+      <!-- Search -->
+      <div class="relative flex-1 min-w-48">
+        <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 opacity-30 text-sm"></i>
+        <input type="text" id="filter-search" placeholder="{{ t('search') }}"
+               class="w-full pl-9 pr-3 py-2 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 bg-transparent"
+               style="border-color:rgba(0,0,0,.1)"
+               oninput="applyFilters()">
+      </div>
+      <!-- Status filter -->
+      <select id="filter-status" onchange="applyFilters()"
+              class="px-3 py-2 rounded-xl border text-sm focus:outline-none focus:ring-2 bg-transparent"
+              style="border-color:rgba(0,0,0,.1)">
+        <option value="">{{ t('all_status') }}</option>
+        {% for it in incident_types %}
+        <option value="{{ it.name }}">{{ it.name }}</option>
+        {% endfor %}
+      </select>
+      <!-- Schedule filter -->
+      <select id="filter-schedule" onchange="applyFilters()"
+              class="px-3 py-2 rounded-xl border text-sm focus:outline-none focus:ring-2 bg-transparent"
+              style="border-color:rgba(0,0,0,.1)">
+        <option value="">{{ t('schedule') }}: All</option>
+        {% for st in schedule_types %}
+        <option value="{{ st.name }}">{{ st.name }}</option>
+        {% endfor %}
+      </select>
+      <!-- Favorites toggle -->
+      <button id="btn-favs" onclick="toggleFavs()"
+              class="flex items-center space-x-2 px-4 py-2 rounded-xl border text-sm font-medium transition-colors"
+              style="border-color:rgba(0,0,0,.1)">
+        <i class="fas fa-star text-amber-400 text-xs"></i>
+        <span>{{ t('favorites') }}</span>
+      </button>
+      <!-- Result count -->
+      <span id="result-count" class="text-xs opacity-50 ml-auto"></span>
+    </div>
+  </div>
+</div>
+
+<!-- ── BUS GRID ── -->
+<div class="max-w-7xl mx-auto px-4 pb-10">
+  {% if buses_data %}
+  <div id="bus-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+    {% for item in buses_data %}
+    {% set bus = item.bus %}
+    {% set status = item.status %}
+    {% set delay = item.delay %}
+    {% set schedules = item.schedules %}
+    <div class="bus-card c-card rounded-2xl shadow-sm border border-slate-100 overflow-hidden flex flex-col"
+         id="card-{{ bus.id }}"
+         data-name="{{ bus.name }}"
+         data-id="{{ bus.identifier }}"
+         data-route="{{ bus.route or '' }}"
+         data-status="{{ status.name if status else 'On Time' }}"
+         data-schedules="{{ schedules | map(attribute='name') | join(',') }}">
+
+      <!-- Colored header -->
+      <div class="px-4 py-3 flex items-center justify-between"
+           style="background-color:{{ status.color if status else '#10b981' }}">
+        <div class="flex items-center space-x-2">
+          <i class="fas {{ status.icon if status else 'fa-check-circle' }} text-white text-sm"></i>
+          <span class="text-white font-bold text-sm">{{ bus.identifier }}</span>
+        </div>
+        <div class="flex items-center space-x-2 flex-wrap">
+          {% if delay and delay > 0 %}
+          <span class="bg-white/20 text-white text-xs font-bold px-2 py-0.5 rounded-full">
+            +{{ delay }} {{ t('delay') }}
+          </span>
+          {% endif %}
+          {% if item.eta %}
+          <span class="bg-white/20 text-white text-xs font-bold px-2 py-0.5 rounded-full">
+            ETA {{ fmt_time(item.eta, cfg.time_format) }}
+          </span>
+          {% endif %}
+          <!-- Favorite star -->
+          <button onclick="toggleFavorite({{ bus.id }}, this)" class="fav-btn opacity-70 hover:opacity-100 transition-opacity"
+                  data-bus-id="{{ bus.id }}" title="{{ t('favorite') }}">
+            <i class="fas fa-star text-white text-xs" id="star-{{ bus.id }}"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Body -->
+      <div class="p-4 flex-1 space-y-2">
+        <div>
+          <p class="font-bold text-slate-800 leading-tight">{{ bus.name }}</p>
+          {% if bus.route %}
+          <p class="text-xs opacity-50 mt-0.5"><i class="fas fa-map-marker-alt mr-1"></i>{{ bus.route }}</p>
+          {% endif %}
+        </div>
+
+        <!-- Status badge -->
+        <div class="flex items-center space-x-1.5">
+          <span class="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-semibold text-white"
+                style="background-color:{{ status.color if status else '#10b981' }}">
+            <i class="fas {{ status.icon if status else 'fa-check-circle' }} text-xs"></i>
+            <span>{{ status.name if status else t('on_time') }}</span>
+          </span>
+        </div>
+
+        <!-- Schedule pills with departure times -->
+        {% if item.schedule_assignments %}
+        <div class="flex flex-wrap gap-1">
+          {% for a in item.schedule_assignments %}
+          <span class="text-xs px-2 py-0.5 bg-slate-100 text-slate-500 rounded-full">
+            {{ a.schedule_type.name }}{% if a.departure_time %} <span class="text-blue-500 font-medium">{{ fmt_time(a.departure_time, cfg.time_format) }}</span>{% endif %}
+          </span>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        <!-- Delay reason -->
+        {% if item.delay_reason %}
+        <div class="flex items-center space-x-1.5 text-xs opacity-60">
+          <i class="fas fa-comment-alt text-xs"></i>
+          <span class="truncate">{{ item.delay_reason }}</span>
+        </div>
+        {% endif %}
+
+        <!-- Today's incidents -->
+        {% if item.incidents %}
+        <div class="pt-2 border-t border-slate-50 space-y-1">
+          {% for inc in item.incidents %}
+          <div class="flex items-start space-x-2 text-xs">
+            <span class="w-2 h-2 rounded-full mt-0.5 flex-shrink-0" style="background-color:{{ inc.incident_type.color }}"></span>
+            <div class="min-w-0">
+              <span class="font-medium" style="color:{{ inc.incident_type.color }}">{{ inc.incident_type.name }}</span>
+              {% if inc.delay_minutes %}<span class="text-slate-400 ml-1">+{{ inc.delay_minutes }} min</span>{% endif %}
+              {% if inc.eta %}<span class="text-blue-400 ml-1">ETA {{ fmt_time(inc.eta, cfg.time_format) }}</span>{% endif %}
+              {% if inc.schedule_type %}<span class="text-slate-400 ml-1">· {{ inc.schedule_type.name }}</span>{% endif %}
+              {% if inc.delay_reason_id and inc.delay_reason %}<p class="text-slate-400 truncate">{{ inc.delay_reason.reason }}</p>
+              {% elif inc.delay_reason_text %}<p class="text-slate-400 truncate">{{ inc.delay_reason_text }}</p>{% endif %}
+              {% if inc.notes %}<p class="text-slate-400 truncate">{{ inc.notes }}</p>{% endif %}
+            </div>
+            <span class="ml-auto text-slate-300 flex-shrink-0">{{ fmt_time(inc.created_at.strftime('%H:%M'), cfg.time_format) }}</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="text-xs opacity-40 pt-1"><i class="fas fa-check mr-1"></i>{{ t('no_incidents') }}</p>
+        {% endif %}
+      </div>
+
+      <!-- Footer -->
+      {% if bus.capacity %}
+      <div class="px-4 py-2 border-t border-slate-50 flex items-center space-x-1.5 text-xs opacity-40">
+        <i class="fas fa-users text-xs"></i>
+        <span>{{ bus.capacity }} {{ t('capacity') }}</span>
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  <!-- No results -->
+  <div id="no-results" class="hidden py-20 text-center opacity-40">
+    <i class="fas fa-search text-4xl mb-3 block"></i>
+    <p>No buses match your filters</p>
+  </div>
+
+  {% else %}
+  <div class="py-20 text-center opacity-40">
+    <i class="fas fa-bus text-5xl mb-3 block"></i>
+    <p>No buses registered yet</p>
+  </div>
+  {% endif %}
+</div>
+
+<!-- ── FOOTER ── -->
+<footer class="c-nav border-t border-white/10 py-4 mt-4">
+  <div class="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between text-xs opacity-40" style="color:var(--nav-text)">
+    <p>{{ cfg.app_name }} · {{ cfg.app_subtitle }}</p>
+    <p>Updated: {{ today.strftime('%B %d, %Y') }}</p>
+  </div>
+</footer>
+
+{% endif %} {# /operational #}
+
+<script>
+// ── Date display ──
+document.getElementById('nav-date').textContent =
+  new Date().toLocaleDateString('en-US', {weekday:'short',month:'short',day:'numeric'});
+
+// ── Dark mode ──
+const THEME_KEY = 'bustrack_theme';
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const icon = document.getElementById('theme-icon');
+  if (icon) {
+    icon.className = theme === 'dark' ? 'fas fa-sun text-sm' : 'fas fa-moon text-sm';
+  }
+  // Adjust filter input borders for dark mode (inline style override)
+  document.querySelectorAll('[style*="border-color:rgba(0,0,0,.1)"]').forEach(el => {
+    el.style.borderColor = theme === 'dark' ? 'rgba(255,255,255,.12)' : 'rgba(0,0,0,.1)';
+  });
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme') || 'light';
+  const next = current === 'dark' ? 'light' : 'dark';
+  localStorage.setItem(THEME_KEY, next);
+  applyTheme(next);
+}
+
+// Apply saved theme on load (before page paint)
+(function() {
+  const saved = localStorage.getItem(THEME_KEY) || 'light';
+  applyTheme(saved);
+})();
+
+// ── Favorites (localStorage) ──
+let favs = new Set(JSON.parse(localStorage.getItem('bus_favs') || '[]').map(String));
+let showFavsOnly = false;
+
+function initStars() {
+  favs.forEach(id => {
+    const star = document.getElementById('star-' + id);
+    if (star) star.className = 'fas fa-star text-amber-300 text-xs';
+  });
+}
+initStars();
+
+function toggleFavorite(busId, btn) {
+  const id = String(busId);
+  const star = document.getElementById('star-' + id);
+  if (favs.has(id)) {
+    favs.delete(id);
+    star.className = 'fas fa-star text-white text-xs';
+  } else {
+    favs.add(id);
+    star.className = 'fas fa-star text-amber-300 text-xs';
+  }
+  localStorage.setItem('bus_favs', JSON.stringify([...favs]));
+  applyFilters();
+}
+
+function toggleFavs() {
+  showFavsOnly = !showFavsOnly;
+  const btn = document.getElementById('btn-favs');
+  btn.classList.toggle('bg-amber-50', showFavsOnly);
+  btn.classList.toggle('border-amber-300', showFavsOnly);
+  applyFilters();
+}
+
+// ── Filters ──
+function applyFilters() {
+  const search   = document.getElementById('filter-search').value.toLowerCase();
+  const status   = document.getElementById('filter-status').value.toLowerCase();
+  const schedule = document.getElementById('filter-schedule').value.toLowerCase();
+  const cards    = document.querySelectorAll('.bus-card');
+  let visible = 0;
+
+  const grid = document.getElementById('bus-grid');
+  const cardArr = [...cards];
+  if (!showFavsOnly && favs.size > 0) {
+    cardArr.sort((a, b) => {
+      const aFav = favs.has(a.id.replace('card-',''));
+      const bFav = favs.has(b.id.replace('card-',''));
+      return (bFav ? 1 : 0) - (aFav ? 1 : 0);
+    });
+    cardArr.forEach(c => grid.appendChild(c));
+  }
+
+  cards.forEach(card => {
+    const busId    = card.id.replace('card-','');
+    const name     = (card.dataset.name + ' ' + card.dataset.id + ' ' + card.dataset.route).toLowerCase();
+    const cardStat = card.dataset.status.toLowerCase();
+    const cardSch  = card.dataset.schedules.toLowerCase();
+
+    const matchSearch   = !search   || name.includes(search);
+    const matchStatus   = !status   || cardStat.includes(status);
+    const matchSchedule = !schedule || cardSch.includes(schedule);
+    const matchFav      = !showFavsOnly || favs.has(busId);
+
+    const show = matchSearch && matchStatus && matchSchedule && matchFav;
+    card.classList.toggle('hidden-card', !show);
+    if (show) visible++;
+  });
+
+  const count = document.getElementById('result-count');
+  if (count) count.textContent = visible + ' bus' + (visible !== 1 ? 'es' : '');
+
+  const noRes = document.getElementById('no-results');
+  if (noRes) noRes.classList.toggle('hidden', visible > 0);
+}
+
+applyFilters();
+</script>
+</body>
+</html>

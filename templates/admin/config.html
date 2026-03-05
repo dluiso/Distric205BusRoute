@@ -1,0 +1,938 @@
+{% extends "admin/base.html" %}
+{% block title %}Configuration{% endblock %}
+{% block page_title %}Configuration{% endblock %}
+{% block page_subtitle %}System settings and preferences{% endblock %}
+
+{% block content %}
+<!-- Tab nav -->
+<div class="flex flex-wrap gap-1 mb-6 bg-white rounded-2xl shadow-sm border border-slate-100 p-1.5">
+  {% for tab_id, label, icon in [
+    ('general',     'General',    'fa-cog'),
+    ('theme',       'Theme',      'fa-palette'),
+    ('operational', 'Operational','fa-clock'),
+    ('language',    'Language',   'fa-language'),
+    ('email',       'Email',      'fa-envelope'),
+    ('data',        'Data',       'fa-database'),
+  ] %}
+  <button onclick="showTab('{{ tab_id }}')" id="tab-btn-{{ tab_id }}"
+          class="flex items-center space-x-1.5 px-4 py-2 rounded-xl text-sm font-medium transition-all
+          {% if active_tab == tab_id %}bg-blue-600 text-white shadow-sm{% else %}text-slate-600 hover:bg-slate-50{% endif %}">
+    <i class="fas {{ icon }} text-xs"></i><span>{{ label }}</span>
+  </button>
+  {% endfor %}
+</div>
+
+<!-- ══ GENERAL ══ -->
+<div id="tab-general" {% if active_tab != 'general' %}class="hidden"{% endif %}>
+  <form method="POST" enctype="multipart/form-data">
+    <input type="hidden" name="section" value="general">
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+      <!-- App identity -->
+      <div class="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+        <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
+          <i class="fas fa-id-card text-blue-500"></i><span>Application Identity</span>
+        </h3>
+        <div class="space-y-4">
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Application Name</label>
+            <input type="text" name="app_name" value="{{ cfg.app_name }}" required
+                   class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Subtitle / District Name</label>
+            <input type="text" name="app_subtitle" value="{{ cfg.app_subtitle }}"
+                   class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+          <!-- Time format -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-2">
+              Time Display Format <span class="text-slate-400 font-normal">(shown on public page)</span>
+            </label>
+            <div class="flex gap-3" id="tf-group">
+              {% for val, label, example in [('12h','12-hour','7:30 AM / 3:45 PM'),('24h','24-hour','07:30 / 15:45')] %}
+              <label class="tf-opt flex items-center space-x-2.5 cursor-pointer px-4 py-2.5 rounded-xl border-2 transition-all
+                            {% if (cfg.time_format or '12h') == val %}border-blue-500 bg-blue-50{% else %}border-slate-200 hover:border-slate-300{% endif %}">
+                <input type="radio" name="time_format" value="{{ val }}"
+                       {% if (cfg.time_format or '12h') == val %}checked{% endif %}
+                       class="w-4 h-4 text-blue-600" onchange="tfSelect(this)">
+                <div>
+                  <p class="text-sm font-semibold text-slate-700">{{ label }}</p>
+                  <p class="text-xs text-slate-400">{{ example }}</p>
+                </div>
+              </label>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+        {% if can_write %}
+        <div class="mt-5 pt-4 border-t border-slate-100">
+          <button type="submit" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+            <i class="fas fa-save mr-1"></i>Save General
+          </button>
+        </div>
+        {% endif %}
+      </div>
+      <!-- Logo upload -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+        <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
+          <i class="fas fa-image text-blue-500"></i><span>Logo & Icon</span>
+        </h3>
+        {% if cfg.logo_path %}
+        <img src="{{ cfg.logo_path }}" class="w-20 h-20 rounded-xl object-contain bg-slate-100 p-2 mb-3 border border-slate-200" alt="Current logo">
+        {% else %}
+        <div class="w-20 h-20 rounded-xl bg-slate-100 flex items-center justify-center mb-3 border border-slate-200">
+          <i class="fas fa-bus text-slate-300 text-2xl"></i>
+        </div>
+        {% endif %}
+        <form method="POST" action="{{ url_for('upload_logo') }}" enctype="multipart/form-data" class="space-y-2">
+          <input type="hidden" name="field" value="logo">
+          <input type="file" name="file" accept=".png,.jpg,.jpeg,.gif,.svg,.ico"
+                 class="w-full text-xs text-slate-500 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer">
+          <button type="submit" class="w-full px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-xs font-medium transition-colors">
+            Upload Logo
+          </button>
+        </form>
+      </div>
+    </div>
+  </form>
+</div>
+
+<!-- ══ THEME ══ -->
+<div id="tab-theme" {% if active_tab != 'theme' %}class="hidden"{% endif %}>
+  <form method="POST">
+    <input type="hidden" name="section" value="theme">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+      <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
+        <i class="fas fa-palette text-blue-500"></i><span>Public Page Theme</span>
+      </h3>
+      <div class="mb-4">
+        <label class="block text-xs font-semibold text-slate-600 mb-2">Theme Mode</label>
+        <div class="flex space-x-2">
+          {% for mode, label in [('light','Light'),('dark','Dark'),('custom','Custom')] %}
+          <label class="flex items-center space-x-2 px-4 py-2.5 rounded-xl border cursor-pointer transition-all hover:border-blue-300">
+            <input type="radio" name="theme_mode" value="{{ mode }}" {% if cfg.theme_mode == mode %}checked{% endif %}
+                   class="w-4 h-4 text-blue-600">
+            <span class="text-sm font-medium text-slate-700">{{ label }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
+        {% for field, label in [
+          ('color_bg','Background'),('color_nav','Navigation'),('color_card','Card'),
+          ('color_text','Text'),('color_accent','Accent'),('color_nav_text','Nav Text'),
+        ] %}
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">{{ label }}</label>
+          <div class="flex items-center space-x-2">
+            <input type="color" name="{{ field }}" value="{{ cfg | attr(field) }}"
+                   id="color-{{ field }}"
+                   class="w-10 h-10 rounded-lg border border-slate-200 cursor-pointer p-0.5"
+                   oninput="document.getElementById('hex-{{ field }}').value=this.value">
+            <input type="text" id="hex-{{ field }}" value="{{ cfg | attr(field) }}" maxlength="7"
+                   class="flex-1 px-2 py-2 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+                   oninput="document.getElementById('color-{{ field }}').value=this.value; document.querySelector('[name={{ field }}]').value=this.value">
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% if can_write %}
+      <div class="mt-5 pt-4 border-t border-slate-100">
+        <button type="submit" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+          <i class="fas fa-save mr-1"></i>Save Theme
+        </button>
+      </div>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+<!-- ══ OPERATIONAL ══ -->
+<div id="tab-operational" {% if active_tab != 'operational' %}class="hidden"{% endif %}>
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+    <!-- Settings -->
+    <div class="space-y-5">
+      <form method="POST">
+        <input type="hidden" name="section" value="operational">
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+          <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
+            <i class="fas fa-sliders-h text-blue-500"></i><span>Operational Settings</span>
+          </h3>
+          <div class="space-y-4">
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1.5">Timezone</label>
+              <select name="timezone" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+                {% for tz in timezones %}
+                <option value="{{ tz }}" {% if cfg.timezone == tz %}selected{% endif %}>{{ tz }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-xs font-semibold text-slate-600 mb-1.5">Daily Reset Time</label>
+                <input type="time" name="daily_reset_time" value="{{ cfg.daily_reset_time }}"
+                       class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-slate-600 mb-1.5">Commit Delay (min)</label>
+                <input type="number" name="commit_delay_min" value="{{ cfg.commit_delay_min }}" min="0" max="60"
+                       class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+              </div>
+            </div>
+            <label class="flex items-center space-x-2 cursor-pointer">
+              <input type="checkbox" name="show_always" {% if cfg.show_always %}checked{% endif %}
+                     class="w-4 h-4 rounded border-slate-300 text-blue-600">
+              <span class="text-sm text-slate-600">Show public page always (ignore schedules)</span>
+            </label>
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1.5">Offline Message</label>
+              <textarea name="offline_message" rows="2"
+                        class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none">{{ cfg.offline_message }}</textarea>
+            </div>
+          </div>
+          {% if can_write %}
+          <div class="mt-4 flex items-center space-x-2">
+            <button type="submit" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+              <i class="fas fa-save mr-1"></i>Save Settings
+            </button>
+            <!-- Manual commit -->
+            <form method="POST" action="{{ url_for('manual_commit') }}" style="display:inline">
+              <button type="submit" class="px-5 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-xl text-sm font-medium">
+                <i class="fas fa-bolt mr-1"></i>Commit Pending Now
+              </button>
+            </form>
+          </div>
+          {% endif %}
+        </div>
+      </form>
+
+      <!-- Operational schedules -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+        <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+          <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+            <i class="fas fa-calendar-alt text-blue-500"></i><span>Operational Schedules</span>
+          </h3>
+        </div>
+        {% if schedules %}
+        <table class="w-full text-sm">
+          <thead><tr class="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider">
+            <th class="px-4 py-2.5 text-left">Name</th>
+            <th class="px-4 py-2.5 text-left">Days</th>
+            <th class="px-4 py-2.5 text-left">Hours</th>
+            {% if can_write %}<th class="px-4 py-2.5"></th>{% endif %}
+          </tr></thead>
+          <tbody class="divide-y divide-slate-50">
+            {% for s in schedules %}
+            <tr class="hover:bg-slate-50">
+              <td class="px-4 py-2.5 font-medium text-slate-700 text-sm">{{ s.name }}</td>
+              <td class="px-4 py-2.5 text-xs text-slate-500">{{ s.days }}</td>
+              <td class="px-4 py-2.5 text-xs text-slate-500">{{ s.start_time }} – {{ s.end_time }}</td>
+              {% if can_write %}
+              <td class="px-4 py-2.5 text-right">
+                <form method="POST" action="{{ url_for('delete_schedule', sid=s.id) }}"
+                      onsubmit="return confirm('Remove schedule?')">
+                  <button type="submit" class="text-red-400 hover:text-red-600 text-xs">
+                    <i class="fas fa-trash"></i>
+                  </button>
+                </form>
+              </td>
+              {% endif %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="px-5 py-4 text-sm text-slate-400">No schedules defined.</p>
+        {% endif %}
+        {% if can_write %}
+        <form method="POST" action="{{ url_for('add_schedule') }}" class="px-5 py-3 bg-slate-50 border-t border-slate-100">
+          <div class="flex flex-wrap gap-2 items-end">
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">Name</label>
+              <input type="text" name="name" placeholder="Weekday Service" required
+                     class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-36">
+            </div>
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">Days</label>
+              <select name="days" class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+                <option value="mon-fri">Mon–Fri</option>
+                <option value="all">All Days</option>
+                <option value="weekend">Weekend</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">Start</label>
+              <input type="time" name="start_time" value="07:00"
+                     class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">End</label>
+              <input type="time" name="end_time" value="17:00"
+                     class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Add</button>
+          </div>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Holidays -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+      <div class="px-5 py-4 border-b border-slate-100">
+        <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+          <i class="fas fa-umbrella-beach text-blue-500"></i><span>Holidays & No-Service Days</span>
+        </h3>
+      </div>
+      {% if holidays %}
+      <div class="max-h-72 overflow-y-auto">
+        <table class="w-full text-sm">
+          <thead class="sticky top-0"><tr class="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider">
+            <th class="px-4 py-2.5 text-left">Date</th>
+            <th class="px-4 py-2.5 text-left">Name</th>
+            <th class="px-4 py-2.5 text-left">Type</th>
+            {% if can_write %}<th class="px-4 py-2.5"></th>{% endif %}
+          </tr></thead>
+          <tbody class="divide-y divide-slate-50">
+            {% for h in holidays %}
+            <tr class="hover:bg-slate-50">
+              <td class="px-4 py-2.5 text-xs font-medium text-slate-700">{{ h.holiday_date.strftime('%b %d, %Y') }}</td>
+              <td class="px-4 py-2.5 text-sm text-slate-700">{{ h.name }}</td>
+              <td class="px-4 py-2.5">
+                <span class="text-xs bg-slate-100 text-slate-500 px-2 py-0.5 rounded-full">{{ h.holiday_type }}</span>
+              </td>
+              {% if can_write %}
+              <td class="px-4 py-2.5 text-right">
+                <form method="POST" action="{{ url_for('delete_holiday', hid=h.id) }}"
+                      onsubmit="return confirm('Remove holiday?')">
+                  <button type="submit" class="text-red-400 hover:text-red-600 text-xs"><i class="fas fa-trash"></i></button>
+                </form>
+              </td>
+              {% endif %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="px-5 py-4 text-sm text-slate-400">No holidays defined.</p>
+      {% endif %}
+      {% if can_write %}
+      <form method="POST" action="{{ url_for('add_holiday') }}" class="px-5 py-3 bg-slate-50 border-t border-slate-100">
+        <div class="flex flex-wrap gap-2 items-end">
+          <div>
+            <label class="block text-xs text-slate-500 mb-1">Date</label>
+            <input type="date" name="holiday_date" required
+                   class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+          <div>
+            <label class="block text-xs text-slate-500 mb-1">Name</label>
+            <input type="text" name="name" placeholder="Labor Day" required
+                   class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-36">
+          </div>
+          <div>
+            <label class="block text-xs text-slate-500 mb-1">Type</label>
+            <select name="holiday_type" class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+              <option value="school">School</option>
+              <option value="federal">Federal</option>
+              <option value="state">State</option>
+              <option value="local">Local</option>
+            </select>
+          </div>
+          <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Add</button>
+        </div>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<!-- ══ LANGUAGE ══ -->
+<div id="tab-language" {% if active_tab != 'language' %}class="hidden"{% endif %}>
+  <form method="POST">
+    <input type="hidden" name="section" value="language">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 max-w-lg">
+      <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
+        <i class="fas fa-language text-blue-500"></i><span>Language Settings</span>
+      </h3>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-2">Public Page Language</label>
+          <div class="flex space-x-2">
+            {% for code, label in [('en','English'),('es','Español')] %}
+            <label class="flex items-center space-x-2 px-4 py-2.5 rounded-xl border cursor-pointer transition-all hover:border-blue-300">
+              <input type="radio" name="lang_frontend" value="{{ code }}" {% if cfg.lang_frontend == code %}checked{% endif %}
+                     class="w-4 h-4 text-blue-600">
+              <span class="text-sm font-medium text-slate-700">{{ label }}</span>
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-2">Admin Backend Language</label>
+          <div class="flex space-x-2">
+            {% for code, label in [('en','English'),('es','Español')] %}
+            <label class="flex items-center space-x-2 px-4 py-2.5 rounded-xl border cursor-pointer transition-all hover:border-blue-300">
+              <input type="radio" name="lang_backend" value="{{ code }}" {% if cfg.lang_backend == code %}checked{% endif %}
+                     class="w-4 h-4 text-blue-600">
+              <span class="text-sm font-medium text-slate-700">{{ label }}</span>
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+      {% if can_write %}
+      <div class="mt-5 pt-4 border-t border-slate-100">
+        <button type="submit" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+          <i class="fas fa-save mr-1"></i>Save Language
+        </button>
+      </div>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+<!-- ══ EMAIL ══ -->
+<div id="tab-email" {% if active_tab != 'email' %}class="hidden"{% endif %}>
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+
+    <!-- Main form -->
+    <div class="lg:col-span-2">
+      <form method="POST" id="email-form">
+        <input type="hidden" name="section" value="email">
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 space-y-5">
+          <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+            <i class="fas fa-server text-blue-500"></i><span>SMTP Settings</span>
+          </h3>
+
+          <!-- Provider selector -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-2">Email Provider</label>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              {% for val, iconclass, label in [
+                ('custom',    'fas fa-server',    'Custom SMTP'),
+                ('google',    'fab fa-google',    'Gmail / Google'),
+                ('office365', 'fab fa-microsoft', 'Microsoft 365'),
+              ] %}
+              <label id="provider-card-{{ val }}"
+                     class="flex items-center space-x-3 p-3 rounded-xl border-2 cursor-pointer transition-all
+                     {% if cfg.mail_provider == val %}border-blue-500 bg-blue-50{% else %}border-slate-200 hover:border-blue-300{% endif %}">
+                <input type="radio" name="mail_provider" value="{{ val }}"
+                       {% if cfg.mail_provider == val %}checked{% endif %}
+                       onchange="onProviderChange('{{ val }}')"
+                       class="w-4 h-4 text-blue-600 sr-only">
+                <i class="{{ iconclass }} text-lg {% if cfg.mail_provider == val %}text-blue-600{% else %}text-slate-400{% endif %}"></i>
+                <span class="text-sm font-medium text-slate-700">{{ label }}</span>
+              </label>
+              {% endfor %}
+            </div>
+          </div>
+
+          <!-- Preset server info (hidden for custom) -->
+          <div id="smtp-preset-banner" class="{% if cfg.mail_provider == 'custom' %}hidden{% endif %}
+               rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-xs text-blue-700 space-y-1">
+            <p id="preset-server-line" class="font-semibold"></p>
+            <p id="preset-note-line" class="text-blue-600"></p>
+          </div>
+
+          <!-- SMTP Server + Port (always shown; read-only for presets) -->
+          <div class="grid grid-cols-3 gap-3">
+            <div class="col-span-2">
+              <label class="block text-xs font-semibold text-slate-600 mb-1.5">SMTP Server</label>
+              <input type="text" name="mail_server" id="mail_server" value="{{ cfg.mail_server }}"
+                     placeholder="smtp.example.com"
+                     class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1.5">Port</label>
+              <input type="number" name="mail_port" id="mail_port" value="{{ cfg.mail_port }}"
+                     placeholder="587" min="1" max="65535"
+                     class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+          </div>
+
+          <!-- Security -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-2">Connection Security</label>
+            <div class="flex flex-wrap gap-3">
+              <label class="flex items-center space-x-2 cursor-pointer">
+                <input type="checkbox" name="mail_use_tls" id="mail_use_tls"
+                       {% if cfg.mail_use_tls %}checked{% endif %}
+                       onchange="onSecurityChange('tls', this.checked)"
+                       class="w-4 h-4 rounded border-slate-300 text-blue-600">
+                <span class="text-sm text-slate-700">STARTTLS <span class="text-xs text-slate-400">(port 587)</span></span>
+              </label>
+              <label class="flex items-center space-x-2 cursor-pointer">
+                <input type="checkbox" name="mail_use_ssl" id="mail_use_ssl"
+                       {% if cfg.mail_use_ssl %}checked{% endif %}
+                       onchange="onSecurityChange('ssl', this.checked)"
+                       class="w-4 h-4 rounded border-slate-300 text-blue-600">
+                <span class="text-sm text-slate-700">SSL/TLS <span class="text-xs text-slate-400">(port 465)</span></span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Credentials -->
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1.5">Username / Email</label>
+              <input type="text" name="mail_username" id="mail_username" value="{{ cfg.mail_username }}"
+                     autocomplete="username"
+                     class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1.5">
+                Password
+                {% if cfg.mail_password %}<span class="ml-1 text-emerald-600 font-normal text-xs">(saved)</span>{% endif %}
+              </label>
+              <div class="relative">
+                <input type="password" name="mail_password" id="mail_password"
+                       placeholder="Leave blank to keep current"
+                       autocomplete="new-password"
+                       class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 pr-9">
+                <button type="button" onclick="togglePwd()"
+                        class="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs">
+                  <i class="fas fa-eye" id="pwd-eye"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Sender identity -->
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1.5">From Email</label>
+              <input type="email" name="mail_from_email" id="mail_from_email" value="{{ cfg.mail_from_email }}"
+                     placeholder="noreply@school.org"
+                     class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-600 mb-1.5">From Name</label>
+              <input type="text" name="mail_from_name" id="mail_from_name" value="{{ cfg.mail_from_name }}"
+                     placeholder="D205 Bus Tracker"
+                     class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+          </div>
+
+          {% if can_write %}
+          <div class="pt-4 border-t border-slate-100">
+            <button type="submit" class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+              <i class="fas fa-save mr-1"></i>Save Email Config
+            </button>
+          </div>
+          {% endif %}
+        </div>
+      </form>
+
+      <!-- Check Connection + Test Email card -->
+      {% if can_write %}
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 mt-5 space-y-5">
+
+        <!-- Check Connection -->
+        <div>
+          <h3 class="font-bold text-slate-700 mb-1 flex items-center space-x-2">
+            <i class="fas fa-plug text-blue-500"></i><span>Check Connection</span>
+          </h3>
+          <p class="text-xs text-slate-500 mb-3">
+            Tests TCP, SMTP handshake, STARTTLS/SSL and authentication step by step
+            — without sending any email. Uses the values currently in the form.
+          </p>
+          <button type="button" id="btn-check" onclick="checkSmtp()"
+                  class="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+            <i class="fas fa-network-wired mr-1"></i>Run Diagnostics
+          </button>
+          <div id="check-steps" class="mt-3 space-y-1.5 hidden"></div>
+        </div>
+
+        <div class="border-t border-slate-100"></div>
+
+        <!-- Send Test Email -->
+        <div>
+          <h3 class="font-bold text-slate-700 mb-1 flex items-center space-x-2">
+            <i class="fas fa-paper-plane text-emerald-500"></i><span>Send Test Email</span>
+          </h3>
+          <p class="text-xs text-slate-500 mb-3">
+            Sends a real email using the form values.
+            If the password field is blank, the saved password is used.
+          </p>
+          <div class="flex items-center space-x-2">
+            <input type="email" id="test_email_to" placeholder="recipient@example.com"
+                   value="{{ current_user.email or '' }}"
+                   class="flex-1 px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+            <button type="button" id="btn-test" onclick="testEmailLive()"
+                    class="px-4 py-2.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl text-sm font-medium whitespace-nowrap">
+              <i class="fas fa-paper-plane mr-1"></i>Send Test
+            </button>
+          </div>
+          <p id="test-result" class="text-sm mt-2 hidden"></p>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Right sidebar: provider guides -->
+    <div class="space-y-4">
+
+      <!-- Status indicator -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
+        <h4 class="font-semibold text-slate-600 text-xs uppercase tracking-wider mb-3">Configuration Status</h4>
+        <div class="space-y-2 text-sm">
+          {% set has_server = cfg.mail_server or cfg.mail_provider != 'custom' %}
+          {% set has_creds = cfg.mail_username and cfg.mail_password %}
+          {% set has_from = cfg.mail_from_email %}
+          <div class="flex items-center space-x-2">
+            <i class="fas {% if has_server %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <span class="text-slate-600">SMTP Server</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <i class="fas {% if has_creds %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <span class="text-slate-600">Credentials</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <i class="fas {% if has_from %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <span class="text-slate-600">From Address</span>
+          </div>
+          {% if has_server and has_creds and has_from %}
+          <p class="mt-2 text-xs text-emerald-600 font-medium"><i class="fas fa-check mr-1"></i>Ready to send</p>
+          {% else %}
+          <p class="mt-2 text-xs text-amber-600 font-medium"><i class="fas fa-exclamation-triangle mr-1"></i>Setup incomplete</p>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- Provider setup guides -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
+        <h4 class="font-semibold text-slate-600 text-xs uppercase tracking-wider mb-3">Setup Guide</h4>
+
+        <div id="guide-custom" class="{% if cfg.mail_provider != 'custom' %}hidden{% endif %} text-xs text-slate-600 space-y-2">
+          <p class="font-semibold text-slate-700">Custom SMTP</p>
+          <p>Enter your mail server hostname and port. Common settings:</p>
+          <ul class="space-y-1 ml-2">
+            <li><span class="font-mono bg-slate-100 px-1 rounded">Port 587</span> — STARTTLS (recommended)</li>
+            <li><span class="font-mono bg-slate-100 px-1 rounded">Port 465</span> — SSL/TLS</li>
+            <li><span class="font-mono bg-slate-100 px-1 rounded">Port 25</span> — No encryption</li>
+          </ul>
+        </div>
+
+        <div id="guide-google" class="{% if cfg.mail_provider != 'google' %}hidden{% endif %} text-xs text-slate-600 space-y-2">
+          <p class="font-semibold text-slate-700">Gmail / Google Workspace</p>
+          <div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-amber-700">
+            <p class="font-semibold mb-1"><i class="fas fa-key mr-1"></i>App Password required</p>
+            <ol class="list-decimal ml-3 space-y-1">
+              <li>Enable 2-Step Verification on your Google account</li>
+              <li>Go to Google Account → Security → App Passwords</li>
+              <li>Generate a password for "Mail"</li>
+              <li>Use that 16-character code as the password here</li>
+            </ol>
+          </div>
+          <p class="font-semibold text-slate-700 pt-1">Connection options:</p>
+          <div class="flex gap-2">
+            <button type="button" onclick="setGmailPort(587)"
+                    class="flex-1 px-2 py-1.5 rounded-lg border border-slate-200 hover:border-blue-400 hover:bg-blue-50 text-center transition-colors">
+              <span class="font-mono font-bold">587</span><br>STARTTLS
+            </button>
+            <button type="button" onclick="setGmailPort(465)"
+                    class="flex-1 px-2 py-1.5 rounded-lg border border-slate-200 hover:border-blue-400 hover:bg-blue-50 text-center transition-colors">
+              <span class="font-mono font-bold">465</span><br>SSL/TLS
+            </button>
+          </div>
+          <p class="text-slate-400">If port 587 fails with WinError 10061, try port 465.</p>
+        </div>
+
+        <div id="guide-office365" class="{% if cfg.mail_provider != 'office365' %}hidden{% endif %} text-xs text-slate-600 space-y-2">
+          <p class="font-semibold text-slate-700">Microsoft 365</p>
+          <p>Server auto-set to <span class="font-mono bg-slate-100 px-1 rounded">smtp.office365.com:587</span></p>
+          <div class="bg-blue-50 border border-blue-200 rounded-lg p-2 text-blue-700">
+            <p class="font-semibold mb-1"><i class="fas fa-info-circle mr-1"></i>Requirements</p>
+            <ol class="list-decimal ml-3 space-y-1">
+              <li>SMTP AUTH must be enabled in your Microsoft 365 admin center</li>
+              <li>Use your full email address as username</li>
+              <li>Use your Microsoft 365 password (or App Password if MFA is on)</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ DATA ══ -->
+<div id="tab-data" {% if active_tab != 'data' %}class="hidden"{% endif %}>
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 max-w-lg">
+    <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
+      <i class="fas fa-database text-blue-500"></i><span>Database & Backups</span>
+    </h3>
+    <p class="text-sm text-slate-500 mb-5">Export a full copy of the SQLite database for backup or migration.</p>
+    <div class="space-y-3">
+      <a href="{{ url_for('export_db') }}"
+         class="flex items-center space-x-3 p-4 bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-300 rounded-xl transition-colors group">
+        <div class="w-10 h-10 bg-blue-500 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:scale-110 transition-transform">
+          <i class="fas fa-download text-white text-sm"></i>
+        </div>
+        <div>
+          <p class="text-sm font-medium text-slate-800">Download Database Backup</p>
+          <p class="text-xs text-slate-500">Downloads bustrack.db SQLite file</p>
+        </div>
+        <i class="fas fa-chevron-right text-slate-300 ml-auto text-xs"></i>
+      </a>
+    </div>
+    <div class="mt-5 pt-4 border-t border-slate-100">
+      <p class="text-xs text-slate-400">
+        <i class="fas fa-info-circle mr-1"></i>
+        Database stores all buses, incidents, users, and configuration. Back up regularly for disaster recovery.
+      </p>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const TABS = ['general','theme','operational','language','email','data'];
+function showTab(id) {
+  TABS.forEach(t => {
+    document.getElementById('tab-' + t).classList.toggle('hidden', t !== id);
+    const btn = document.getElementById('tab-btn-' + t);
+    btn.className = btn.className.replace(/bg-blue-600 text-white shadow-sm|text-slate-600 hover:bg-slate-50/g, '').trim();
+    btn.className += ' ' + (t === id ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50');
+  });
+  history.replaceState(null, '', '?tab=' + id);
+}
+
+// Time format selector visual
+function tfSelect(radio) {
+  document.querySelectorAll('.tf-opt').forEach(lbl => {
+    const active = lbl.querySelector('input') === radio;
+    lbl.classList.toggle('border-blue-500', active);
+    lbl.classList.toggle('bg-blue-50', active);
+    lbl.classList.toggle('border-slate-200', !active);
+  });
+}
+
+// Sync color picker <-> hex text inputs
+document.querySelectorAll('input[type=color]').forEach(picker => {
+  const field = picker.name;
+  const hex = document.getElementById('hex-' + field);
+  if (hex) {
+    hex.addEventListener('input', () => { picker.value = hex.value; });
+    picker.addEventListener('input', () => { hex.value = picker.value; });
+  }
+});
+
+// ── EMAIL TAB ─────────────────────────────────────────────────────────────────
+const SMTP_PRESETS = {
+  google:    { server: 'smtp.gmail.com',     port: 587, tls: true,  ssl: false,
+               banner: 'Server: smtp.gmail.com — Port: 587 — STARTTLS',
+               note:   'Requires a Google App Password (not your regular password).' },
+  office365: { server: 'smtp.office365.com', port: 587, tls: true,  ssl: false,
+               banner: 'Server: smtp.office365.com — Port: 587 — STARTTLS',
+               note:   'Enable SMTP AUTH in Microsoft 365 admin center first.' },
+};
+
+function onProviderChange(val) {
+  // Update card styles
+  ['custom','google','office365'].forEach(p => {
+    const card = document.getElementById('provider-card-' + p);
+    if (!card) return;
+    const isActive = p === val;
+    if (isActive) {
+      card.classList.remove('border-slate-200','hover:border-blue-300');
+      card.classList.add('border-blue-500','bg-blue-50');
+    } else {
+      card.classList.remove('border-blue-500','bg-blue-50');
+      card.classList.add('border-slate-200','hover:border-blue-300');
+    }
+    const icon = card.querySelector('i');
+    if (icon) {
+      icon.classList.toggle('text-blue-600', isActive);
+      icon.classList.toggle('text-slate-400', !isActive);
+    }
+  });
+
+  const preset = SMTP_PRESETS[val];
+  const banner = document.getElementById('smtp-preset-banner');
+
+  if (preset) {
+    // Auto-fill fields
+    document.getElementById('mail_server').value = preset.server;
+    document.getElementById('mail_port').value   = preset.port;
+    document.getElementById('mail_use_tls').checked = preset.tls;
+    document.getElementById('mail_use_ssl').checked  = preset.ssl;
+    // Make server/port read-only
+    document.getElementById('mail_server').readOnly = true;
+    document.getElementById('mail_port').readOnly   = true;
+    document.getElementById('mail_server').classList.add('bg-slate-50', 'text-slate-500');
+    document.getElementById('mail_port').classList.add('bg-slate-50', 'text-slate-500');
+    // Show banner
+    document.getElementById('preset-server-line').textContent = preset.banner;
+    document.getElementById('preset-note-line').textContent   = preset.note;
+    banner.classList.remove('hidden');
+  } else {
+    document.getElementById('mail_server').readOnly = false;
+    document.getElementById('mail_port').readOnly   = false;
+    document.getElementById('mail_server').classList.remove('bg-slate-50', 'text-slate-500');
+    document.getElementById('mail_port').classList.remove('bg-slate-50', 'text-slate-500');
+    banner.classList.add('hidden');
+  }
+
+  // Show/hide guide
+  ['custom','google','office365'].forEach(p => {
+    const g = document.getElementById('guide-' + p);
+    if (g) g.classList.toggle('hidden', p !== val);
+  });
+}
+
+function setGmailPort(port) {
+  // Switch Gmail between port 587 (STARTTLS) and 465 (SSL)
+  document.getElementById('mail_port').readOnly = false;
+  document.getElementById('mail_port').value = port;
+  document.getElementById('mail_port').readOnly = true;
+  if (port === 465) {
+    document.getElementById('mail_use_tls').checked = false;
+    document.getElementById('mail_use_ssl').checked = true;
+    SMTP_PRESETS.google.port = 465;
+    SMTP_PRESETS.google.tls  = false;
+    SMTP_PRESETS.google.ssl  = true;
+    SMTP_PRESETS.google.banner = 'Server: smtp.gmail.com — Port: 465 — SSL/TLS';
+  } else {
+    document.getElementById('mail_use_tls').checked = true;
+    document.getElementById('mail_use_ssl').checked = false;
+    SMTP_PRESETS.google.port = 587;
+    SMTP_PRESETS.google.tls  = true;
+    SMTP_PRESETS.google.ssl  = false;
+    SMTP_PRESETS.google.banner = 'Server: smtp.gmail.com — Port: 587 — STARTTLS';
+  }
+  document.getElementById('preset-server-line').textContent = SMTP_PRESETS.google.banner;
+}
+
+function onSecurityChange(type, checked) {
+  // TLS and SSL are mutually exclusive
+  if (checked) {
+    if (type === 'tls') document.getElementById('mail_use_ssl').checked = false;
+    if (type === 'ssl') {
+      document.getElementById('mail_use_tls').checked = false;
+      if (document.getElementById('mail_port').value == 587)
+        document.getElementById('mail_port').value = 465;
+    }
+  }
+}
+
+function togglePwd() {
+  const inp = document.getElementById('mail_password');
+  const eye = document.getElementById('pwd-eye');
+  if (inp.type === 'password') {
+    inp.type = 'text';
+    eye.className = 'fas fa-eye-slash';
+  } else {
+    inp.type = 'password';
+    eye.className = 'fas fa-eye';
+  }
+}
+
+function smtpFormData() {
+  return {
+    provider:   document.querySelector('[name=mail_provider]:checked')?.value || 'custom',
+    server:     document.getElementById('mail_server').value,
+    port:       document.getElementById('mail_port').value,
+    use_tls:    document.getElementById('mail_use_tls').checked,
+    use_ssl:    document.getElementById('mail_use_ssl').checked,
+    username:   document.getElementById('mail_username').value,
+    password:   document.getElementById('mail_password').value,
+    from_email: document.getElementById('mail_from_email').value,
+    from_name:  document.getElementById('mail_from_name').value,
+  };
+}
+
+async function checkSmtp() {
+  const btn   = document.getElementById('btn-check');
+  const steps = document.getElementById('check-steps');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>Checking…';
+  steps.innerHTML = '';
+  steps.classList.remove('hidden');
+
+  try {
+    const resp = await fetch('/admin/config/check-smtp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(smtpFormData()),
+    });
+    const json = await resp.json();
+    steps.innerHTML = '';
+    (json.steps || []).forEach(s => {
+      const ok = s.ok === true ? 'text-emerald-600' : s.ok === false ? 'text-red-600' : 'text-slate-400';
+      const icon = s.ok === true ? 'fa-check-circle' : s.ok === false ? 'fa-times-circle' : 'fa-minus-circle';
+      const row = document.createElement('div');
+      row.className = 'flex items-start space-x-2 text-xs ' + ok;
+      row.innerHTML = `<i class="fas ${icon} mt-0.5 flex-shrink-0"></i>
+        <div><span class="font-medium">${s.label}</span>
+        ${s.detail ? `<p class="text-xs opacity-80 mt-0.5">${s.detail}</p>` : ''}</div>`;
+      steps.appendChild(row);
+    });
+    if (json.ok) {
+      const fin = document.createElement('p');
+      fin.className = 'text-xs font-semibold text-emerald-600 mt-1';
+      fin.innerHTML = '<i class="fas fa-check mr-1"></i>All checks passed — connection is working.';
+      steps.appendChild(fin);
+    }
+  } catch (e) {
+    steps.innerHTML = `<p class="text-xs text-red-600">Network error: ${e.message}</p>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-network-wired mr-1"></i>Run Diagnostics';
+  }
+}
+
+async function testEmailLive() {
+  const btn    = document.getElementById('btn-test');
+  const result = document.getElementById('test-result');
+  const testTo = document.getElementById('test_email_to').value.trim();
+  if (!testTo) {
+    result.textContent = 'Enter a recipient email address.';
+    result.className = 'text-sm mt-2 text-red-600';
+    result.classList.remove('hidden');
+    return;
+  }
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>Sending…';
+  result.classList.add('hidden');
+
+  const data = { ...smtpFormData(), test_to: testTo };
+
+  try {
+    const resp = await fetch('/admin/config/test-email-live', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const json = await resp.json();
+    result.textContent = json.message;
+    result.className = 'text-sm mt-2 font-medium ' + (json.ok ? 'text-emerald-600' : 'text-red-600');
+    result.classList.remove('hidden');
+  } catch (e) {
+    result.textContent = 'Network error: ' + e.message;
+    result.className = 'text-sm mt-2 text-red-600';
+    result.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-paper-plane mr-1"></i>Send Test';
+  }
+}
+
+// Init provider state on page load
+(function() {
+  const checked = document.querySelector('[name=mail_provider]:checked');
+  if (checked && checked.value !== 'custom') {
+    const preset = SMTP_PRESETS[checked.value];
+    if (preset) {
+      document.getElementById('mail_server').readOnly = true;
+      document.getElementById('mail_port').readOnly   = true;
+      document.getElementById('mail_server').classList.add('bg-slate-50', 'text-slate-500');
+      document.getElementById('mail_port').classList.add('bg-slate-50', 'text-slate-500');
+      document.getElementById('preset-server-line').textContent = preset.banner;
+      document.getElementById('preset-note-line').textContent   = preset.note;
+    }
+  }
+})();
+</script>
+{% endblock %}

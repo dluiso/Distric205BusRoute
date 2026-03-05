@@ -1,0 +1,60 @@
+version: '3.9'
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Bus Tracker — Docker Compose
+#
+#  Quick start:
+#    1. Copy .env.example → .env and set a strong SECRET_KEY
+#    2. docker-compose up -d
+#    3. Open http://localhost:5000 → follow the setup wizard
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Flask application ──────────────────────────────────────────────────────
+  web:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${PORT:-5000}:5000"
+    environment:
+      FLASK_ENV: production
+      SECRET_KEY: "${SECRET_KEY:-changeme-set-in-env}"
+      DATABASE_URL: "postgresql://${DB_USER:-bususer}:${DB_PASS:-buspass}@db:5432/${DB_NAME:-bustrack}"
+    volumes:
+      - ./instance:/app/instance          # wizard lock file + instance .env
+      - ./static/uploads:/app/static/uploads  # logos / icons
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ── PostgreSQL database ────────────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       "${DB_NAME:-bustrack}"
+      POSTGRES_USER:     "${DB_USER:-bususer}"
+      POSTGRES_PASSWORD: "${DB_PASS:-buspass}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-bususer} -d ${DB_NAME:-bustrack}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SQLite-only alternative (no database service needed):
+#  Comment out the 'db' service and volumes, and change DATABASE_URL to:
+#    DATABASE_URL: "sqlite:////app/instance/bustrack.db"
+# ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,12 @@
+Flask>=2.3.0
+Flask-SQLAlchemy>=3.0.0
+Flask-Login>=0.6.0
+Flask-Mail>=0.9.1
+Werkzeug>=2.3.0
+APScheduler>=3.10.0
+fpdf2>=2.7.0
+python-docx>=0.8.11
+pytz>=2023.3
+psycopg2-binary>=2.9.0
+python-dotenv>=1.0.0
+gunicorn>=21.2.0

@@ -1,0 +1,530 @@
+{% extends "admin/base.html" %}
+{% block title %}Buses{% endblock %}
+{% block page_title %}Bus Management{% endblock %}
+{% block page_subtitle %}Register buses and assign daily incident status{% endblock %}
+
+{% block content %}
+<!-- Toolbar -->
+<div class="flex flex-col sm:flex-row sm:items-center gap-3 mb-5">
+  <div class="relative flex-1 max-w-sm">
+    <i class="fas fa-search absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
+    <input id="bus-search" type="text" placeholder="Search bus, route, status…"
+           class="w-full pl-10 pr-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white shadow-sm">
+  </div>
+  <select id="status-filter" class="px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <option value="">All Status</option>
+    {% for it in incident_types %}<option value="{{ it.name }}">{{ it.name }}</option>{% endfor %}
+  </select>
+  <select id="sched-filter" class="px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <option value="">All Schedules</option>
+    {% for s in schedule_types %}<option value="{{ s.name }}">{{ s.name }}</option>{% endfor %}
+  </select>
+  {% if can_write %}
+  <button onclick="openModal('modal-add-bus')"
+          class="flex-shrink-0 flex items-center space-x-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2.5 rounded-xl text-sm font-semibold shadow-sm transition-colors">
+    <i class="fas fa-plus"></i><span>Add Bus</span>
+  </button>
+  {% endif %}
+</div>
+<p class="text-xs text-slate-400 mb-4"><span id="bus-count">{{ buses_data|length }}</span> buses</p>
+
+<!-- Grid -->
+<div id="buses-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+  {% for item in buses_data %}
+  {% set bus = item.bus %}
+  {% set status = item.status %}
+  {% set delay = item.delay %}
+  {% set color = status.color if status else '#10b981' %}
+  {% set status_name = status.name if status else 'On Time' %}
+  {% set schedules_str = item.schedules|map(attribute='name')|join(', ') %}
+
+  <div class="bus-card bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden"
+       data-id="{{ bus.id }}"
+       data-number="{{ bus.identifier|lower }} {{ bus.name|lower }}"
+       data-route="{{ (bus.route or '')|lower }}"
+       data-status="{{ status_name }}"
+       data-schedule="{{ schedules_str|lower }}">
+
+    <!-- Header -->
+    <div class="px-4 py-3 flex items-center justify-between" style="background-color:{{ color }}">
+      <div class="flex items-center space-x-2.5">
+        <div class="w-9 h-9 bg-white/20 rounded-xl flex items-center justify-center">
+          <i class="fas fa-bus text-white"></i>
+        </div>
+        <div>
+          <div class="flex items-center space-x-1.5 flex-wrap">
+            <span class="text-white font-extrabold text-lg leading-none">{{ bus.identifier }}</span>
+            {% if delay and delay > 0 %}
+            <span class="bg-white/20 text-white text-xs px-1.5 py-0.5 rounded font-medium">+{{ delay }}min</span>
+            {% endif %}
+            {% if item.eta %}
+            <span class="bg-white/20 text-white text-xs px-1.5 py-0.5 rounded font-medium">ETA {{ item.eta }}</span>
+            {% endif %}
+          </div>
+          <p class="text-white/80 text-xs leading-none mt-0.5">{{ bus.name[:28] }}</p>
+        </div>
+      </div>
+      <span class="bg-white/15 border border-white/25 text-white text-xs px-2.5 py-1.5 rounded-xl font-semibold flex items-center space-x-1.5 backdrop-blur-sm">
+        <i class="fas {{ status.icon if status else 'fa-check-circle' }} text-xs"></i>
+        <span>{{ status_name }}</span>
+      </span>
+    </div>
+
+    <!-- Body -->
+    <div class="p-4 space-y-1.5">
+      {% if bus.route %}
+      <div class="flex items-center space-x-2 text-xs text-slate-500">
+        <i class="fas fa-route text-slate-300 w-4 text-center"></i><span>{{ bus.route }}</span>
+      </div>
+      {% endif %}
+      {% if bus.capacity %}
+      <div class="flex items-center space-x-2 text-xs text-slate-400">
+        <i class="fas fa-users text-slate-300 w-4 text-center"></i><span>{{ bus.capacity }} seats</span>
+      </div>
+      {% endif %}
+      {% if bus.schedule_assignments %}
+      <div class="flex items-start space-x-2 text-xs text-slate-400">
+        <i class="fas fa-clock text-slate-300 w-4 text-center mt-0.5"></i>
+        <span>{% for a in bus.schedule_assignments %}{{ a.schedule_type.name }}{% if a.departure_time %} <span class="text-blue-400 font-medium">{{ a.departure_time }}</span>{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}</span>
+      </div>
+      {% endif %}
+      {% if item.delay_reason %}
+      <div class="flex items-center space-x-2 text-xs text-slate-400">
+        <i class="fas fa-comment-alt text-slate-300 w-4 text-center"></i>
+        <span class="truncate">{{ item.delay_reason }}</span>
+      </div>
+      {% endif %}
+
+      <!-- Today's incidents -->
+      <div class="border-t border-slate-100 pt-2.5 mt-2.5">
+        {% if item.incidents %}
+        <p class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Today's Incidents</p>
+        <div class="space-y-1.5 max-h-28 overflow-y-auto pr-1">
+          {% for rec in item.incidents %}
+          <div class="flex items-center justify-between group">
+            <div class="flex items-center space-x-1.5 flex-1 min-w-0">
+              <span class="w-2 h-2 rounded-full flex-shrink-0" style="background-color:{{ rec.incident_type.color }}"></span>
+              <span class="text-xs font-medium text-slate-700 truncate">{{ rec.incident_type.name }}</span>
+              {% if rec.delay_minutes %}<span class="text-xs text-amber-500 flex-shrink-0">+{{ rec.delay_minutes }}min</span>{% endif %}
+              {% if rec.eta %}<span class="text-xs text-blue-400 flex-shrink-0">ETA {{ rec.eta }}</span>{% endif %}
+              {% if rec.delay_reason_id and rec.delay_reason %}<span class="text-xs text-slate-400 flex-shrink-0 truncate max-w-20" title="{{ rec.delay_reason.reason }}">· {{ rec.delay_reason.reason }}</span>
+              {% elif rec.delay_reason_text %}<span class="text-xs text-slate-400 flex-shrink-0 truncate max-w-20" title="{{ rec.delay_reason_text }}">· {{ rec.delay_reason_text }}</span>{% endif %}
+              <span class="text-xs text-slate-400 flex-shrink-0">{{ rec.created_at.strftime('%H:%M') }}</span>
+              {% if rec.is_pending %}<span class="text-amber-400 text-xs flex-shrink-0" title="Pending commit">⏳</span>{% endif %}
+            </div>
+            {% if can_write %}
+            <form action="{{ url_for('delete_bus_incident', rec_id=rec.id) }}" method="POST"
+                  onsubmit="return confirm('Remove this incident?')"
+                  class="opacity-0 group-hover:opacity-100 transition-opacity ml-1 flex-shrink-0">
+              <button type="submit" class="text-red-400 hover:text-red-600 text-xs"><i class="fas fa-times"></i></button>
+            </form>
+            {% endif %}
+          </div>
+          {% if rec.notes %}<p class="text-xs text-slate-400 ml-3.5 truncate">{{ rec.notes }}</p>{% endif %}
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="flex items-center space-x-1.5 text-xs text-slate-400">
+          <i class="fas fa-check-circle text-emerald-400"></i><span>No incidents today</span>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Actions -->
+    {% if can_write %}
+    <div class="px-4 pb-4 flex items-center space-x-2">
+      <button onclick="openIncidentModal({{ bus.id }}, '{{ bus.identifier }}')"
+              class="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-xs py-2 rounded-xl flex items-center justify-center space-x-1.5 transition-colors font-medium">
+        <i class="fas fa-plus-circle"></i><span>Add Incident</span>
+      </button>
+      <button onclick='openEditModal({{ bus.id }}, {{ bus.identifier|tojson }}, {{ bus.name|tojson }}, {{ (bus.route or "")|tojson }}, {{ bus.capacity or 0 }}, {{ (bus.description or "")|tojson }}, {{ bus.active|tojson }}, {{ bus.schedule_assignments|map(attribute="schedule_type_id")|list|tojson }}, {{ bus.schedule_assignments|map(attribute="departure_time")|list|tojson }})'
+              class="p-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl transition-colors">
+        <i class="fas fa-pen text-xs"></i>
+      </button>
+      <form action="{{ url_for('delete_bus', bus_id=bus.id) }}" method="POST"
+            onsubmit="return confirm('Deactivate bus {{ bus.identifier }}?')">
+        <button type="submit" class="p-2 bg-red-50 hover:bg-red-100 text-red-400 hover:text-red-600 rounded-xl transition-colors">
+          <i class="fas fa-power-off text-xs"></i>
+        </button>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="col-span-full py-24 text-center">
+    <i class="fas fa-bus text-6xl text-slate-200 mb-4 block"></i>
+    <p class="text-slate-400 font-medium">No buses registered yet</p>
+    {% if can_write %}
+    <button onclick="openModal('modal-add-bus')" class="mt-3 text-blue-600 hover:text-blue-800 text-sm">
+      <i class="fas fa-plus-circle mr-1"></i>Add first bus
+    </button>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+<div id="no-buses-found" class="hidden py-20 text-center text-slate-300">
+  <i class="fas fa-search text-5xl mb-3 block"></i>
+  <p class="text-slate-400">No buses match that filter</p>
+</div>
+
+
+<!-- ── MODAL: Add Bus ─────────────────────────────────────────── -->
+<div id="modal-add-bus" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center p-4 backdrop-blur-sm">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-screen overflow-y-auto">
+    <div class="px-6 py-5 border-b border-slate-100 flex items-center justify-between sticky top-0 bg-white">
+      <h3 class="font-bold text-slate-800 flex items-center space-x-2">
+        <i class="fas fa-bus text-blue-500"></i><span>Register New Bus</span>
+      </h3>
+      <button onclick="closeModal('modal-add-bus')" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+    </div>
+    <form action="{{ url_for('add_bus') }}" method="POST" class="px-6 py-5 space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Identifier * <span class="font-normal text-slate-400">(TR, TRS…)</span></label>
+          <input type="text" name="identifier" required maxlength="20"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 uppercase"
+                 placeholder="e.g. TR01">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Name *</label>
+          <input type="text" name="name" required
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                 placeholder="Bus name / number">
+        </div>
+        <div class="col-span-2">
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Route</label>
+          <input type="text" name="route"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                 placeholder="Route description">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Capacity</label>
+          <input type="number" name="capacity" min="1" max="100"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                 placeholder="e.g. 72">
+        </div>
+        <div class="col-span-2">
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Schedule Periods <span class="font-normal text-slate-400">— set departure time per period</span></label>
+          <div class="space-y-2">
+            {% for s in schedule_types %}
+            <div>
+              <label class="flex items-center space-x-2 cursor-pointer">
+                <input type="checkbox" name="schedule_ids" value="{{ s.id }}"
+                       class="rounded border-slate-300 text-blue-500"
+                       onchange="toggleDepTime(this, '{{ s.id }}')">
+                <span class="text-sm text-slate-700">{{ s.name }} <span class="text-slate-400 text-xs">(default {{ s.time_label }})</span></span>
+              </label>
+              <div id="dep-add-{{ s.id }}" class="hidden ml-6 mt-1 flex items-center space-x-2">
+                <input type="time" name="departure_time_{{ s.id }}"
+                       class="px-2 py-1 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <span class="text-xs text-slate-400">Departure time for this bus</span>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="col-span-2">
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Description / Notes</label>
+          <textarea name="description" rows="2"
+                    class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+                    placeholder="Additional notes…"></textarea>
+        </div>
+      </div>
+      <div class="flex space-x-2 pt-1">
+        <button type="button" onclick="closeModal('modal-add-bus')"
+                class="flex-1 py-2.5 border border-slate-200 text-slate-600 rounded-xl text-sm hover:bg-slate-50">Cancel</button>
+        <button type="submit" class="flex-1 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-semibold hover:bg-blue-700">
+          <i class="fas fa-save mr-1"></i>Register Bus
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ── MODAL: Edit Bus ────────────────────────────────────────── -->
+<div id="modal-edit-bus" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center p-4 backdrop-blur-sm">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-screen overflow-y-auto">
+    <div class="px-6 py-5 border-b border-slate-100 flex items-center justify-between sticky top-0 bg-white">
+      <h3 class="font-bold text-slate-800 flex items-center space-x-2">
+        <i class="fas fa-pen text-blue-500"></i><span>Edit Bus</span>
+      </h3>
+      <button onclick="closeModal('modal-edit-bus')" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+    </div>
+    <form id="form-edit-bus" method="POST" class="px-6 py-5 space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Identifier *</label>
+          <input type="text" name="identifier" id="eb-id" required maxlength="20"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 uppercase">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Name *</label>
+          <input type="text" name="name" id="eb-name" required
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div class="col-span-2">
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Route</label>
+          <input type="text" name="route" id="eb-route"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Capacity</label>
+          <input type="number" name="capacity" id="eb-cap" min="1"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div class="flex items-center space-x-2 pt-5">
+          <input type="checkbox" name="active" id="eb-active" class="rounded border-slate-300 text-blue-500">
+          <label for="eb-active" class="text-sm text-slate-600">Active</label>
+        </div>
+        <div class="col-span-2">
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Schedule Periods <span class="font-normal text-slate-400">— departure time per period</span></label>
+          <div class="space-y-2">
+            {% for s in schedule_types %}
+            <div>
+              <label class="flex items-center space-x-2 cursor-pointer">
+                <input type="checkbox" name="schedule_ids" value="{{ s.id }}" class="eb-sched rounded border-slate-300 text-blue-500" data-sid="{{ s.id }}"
+                       onchange="toggleEditDepTime(this)">
+                <span class="text-sm text-slate-700">{{ s.name }}</span>
+              </label>
+              <div id="dep-edit-{{ s.id }}" class="hidden ml-6 mt-1 flex items-center space-x-2">
+                <input type="time" name="departure_time_{{ s.id }}" id="dep-edit-time-{{ s.id }}"
+                       class="px-2 py-1 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <span class="text-xs text-slate-400">Departure time</span>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="col-span-2">
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Description</label>
+          <textarea name="description" id="eb-desc" rows="2"
+                    class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"></textarea>
+        </div>
+      </div>
+      <div class="flex space-x-2 pt-1">
+        <button type="button" onclick="closeModal('modal-edit-bus')"
+                class="flex-1 py-2.5 border border-slate-200 text-slate-600 rounded-xl text-sm hover:bg-slate-50">Cancel</button>
+        <button type="submit" class="flex-1 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-semibold hover:bg-blue-700">
+          <i class="fas fa-save mr-1"></i>Save Changes
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ── MODAL: Add Incident ────────────────────────────────────── -->
+<div id="modal-incident" class="fixed inset-0 bg-black/50 z-50 hidden flex items-center justify-center p-4 backdrop-blur-sm">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md">
+    <div class="px-6 py-5 border-b border-slate-100 flex items-center justify-between">
+      <h3 class="font-bold text-slate-800 flex items-center space-x-2">
+        <i class="fas fa-exclamation-circle text-amber-500"></i>
+        <span>Record Incident — Bus <span id="inc-bus-label" class="text-blue-600"></span></span>
+      </h3>
+      <button onclick="closeModal('modal-incident')" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+    </div>
+    <form id="form-incident" method="POST" class="px-6 py-5 space-y-4">
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-2">Incident Type *</label>
+        <div class="grid grid-cols-2 gap-2 max-h-52 overflow-y-auto pr-1">
+          {% for it in incident_types %}
+          <label class="flex items-center space-x-2.5 p-2.5 border-2 border-slate-100 rounded-xl cursor-pointer hover:border-blue-300 transition-all has-[:checked]:border-blue-500 has-[:checked]:bg-blue-50">
+            <input type="radio" name="incident_type_id" value="{{ it.id }}" class="sr-only" required>
+            <span class="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0"
+                  style="background-color:{{ it.color }}20; color:{{ it.color }}">
+              <i class="fas {{ it.icon }} text-xs"></i>
+            </span>
+            <span class="text-xs font-medium text-slate-700 leading-tight">{{ it.name }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Schedule Period</label>
+          <select name="schedule_type_id" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="">Not specified</option>
+            {% for s in schedule_types %}
+            <option value="{{ s.id }}">{{ s.name }} ({{ s.time_label }})</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1">Delay (minutes)</label>
+          <input type="number" name="delay_minutes" id="inc-delay" min="0" max="999" value="0"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div class="col-span-2">
+          <label class="block text-xs font-semibold text-slate-600 mb-1">ETA <span class="font-normal text-slate-400">(estimated arrival time)</span></label>
+          <input type="time" name="eta" id="inc-eta"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+      </div>
+      <!-- Delay Reason -->
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1">Delay Reason <span class="font-normal text-slate-400">(optional)</span></label>
+        <div class="flex space-x-2">
+          <select name="delay_reason_id" id="inc-reason-select" onchange="toggleCustomReason()"
+                  class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="">No specific reason</option>
+            {% for dr in delay_reasons %}
+            <option value="{{ dr.id }}">{{ dr.reason }}</option>
+            {% endfor %}
+            <option value="custom">Write custom reason…</option>
+          </select>
+          <button type="button" onclick="showAddReason()"
+                  class="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm transition-colors" title="Add new reason to list">
+            <i class="fas fa-plus text-xs"></i>
+          </button>
+        </div>
+        <div id="inc-reason-custom" class="hidden mt-2">
+          <input type="text" name="delay_reason_text" id="inc-reason-text"
+                 placeholder="Describe the reason…"
+                 class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div id="add-reason-panel" class="hidden mt-2 flex space-x-2">
+          <input type="text" id="new-reason-input" placeholder="New reason to add to list…"
+                 class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          <button type="button" onclick="submitNewReason()"
+                  class="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium transition-colors">
+            <i class="fas fa-plus"></i>
+          </button>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1">Notes (optional)</label>
+        <textarea name="notes" rows="2"
+                  class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+                  placeholder="Additional details…"></textarea>
+      </div>
+      <div class="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700 flex items-start space-x-2">
+        <i class="fas fa-clock flex-shrink-0 mt-0.5"></i>
+        <span>This incident will be committed to statistics after the configured delay period.</span>
+      </div>
+      <div class="flex space-x-2">
+        <button type="button" onclick="closeModal('modal-incident')"
+                class="flex-1 py-2.5 border border-slate-200 text-slate-600 rounded-xl text-sm hover:bg-slate-50">Cancel</button>
+        <button type="submit" class="flex-1 py-2.5 bg-amber-500 text-white rounded-xl text-sm font-semibold hover:bg-amber-600">
+          <i class="fas fa-save mr-1"></i>Record Incident
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function openModal(id) { document.getElementById(id).classList.remove('hidden'); document.body.style.overflow='hidden'; }
+  function closeModal(id) { document.getElementById(id).classList.add('hidden'); document.body.style.overflow=''; }
+  document.querySelectorAll('[id^="modal-"]').forEach(m => m.addEventListener('click', e => { if(e.target===m) closeModal(m.id); }));
+
+  function openEditModal(id, identifier, name, route, cap, desc, active, schedIds, depTimes) {
+    document.getElementById('form-edit-bus').action = `/admin/buses/${id}/edit`;
+    document.getElementById('eb-id').value = identifier;
+    document.getElementById('eb-name').value = name;
+    document.getElementById('eb-route').value = route;
+    document.getElementById('eb-cap').value = cap || '';
+    document.getElementById('eb-desc').value = desc;
+    document.getElementById('eb-active').checked = active;
+    document.querySelectorAll('.eb-sched').forEach(cb => {
+      const i = schedIds.indexOf(parseInt(cb.dataset.sid));
+      cb.checked = i >= 0;
+      const div = document.getElementById(`dep-edit-${cb.dataset.sid}`);
+      const inp = document.getElementById(`dep-edit-time-${cb.dataset.sid}`);
+      if (i >= 0) {
+        if (div) div.classList.remove('hidden');
+        if (inp) inp.value = (depTimes && depTimes[i]) ? depTimes[i] : '';
+      } else {
+        if (div) div.classList.add('hidden');
+        if (inp) inp.value = '';
+      }
+    });
+    openModal('modal-edit-bus');
+  }
+  function toggleDepTime(cb, sid) {
+    const div = document.getElementById(`dep-add-${sid}`);
+    if (div) div.classList.toggle('hidden', !cb.checked);
+  }
+  function toggleEditDepTime(cb) {
+    const div = document.getElementById(`dep-edit-${cb.dataset.sid}`);
+    if (div) div.classList.toggle('hidden', !cb.checked);
+  }
+  function openIncidentModal(busId, identifier) {
+    document.getElementById('form-incident').action = `/admin/buses/${busId}/incident`;
+    document.getElementById('inc-bus-label').textContent = identifier;
+    document.querySelectorAll('#form-incident input[type=radio]').forEach(r => r.checked = false);
+    document.querySelector('#form-incident textarea').value = '';
+    document.getElementById('inc-delay').value = 0;
+    document.getElementById('inc-eta').value = '';
+    document.getElementById('inc-reason-select').value = '';
+    document.getElementById('inc-reason-custom').classList.add('hidden');
+    document.getElementById('inc-reason-text').value = '';
+    document.getElementById('add-reason-panel').classList.add('hidden');
+    openModal('modal-incident');
+  }
+  function toggleCustomReason() {
+    const sel = document.getElementById('inc-reason-select');
+    document.getElementById('inc-reason-custom').classList.toggle('hidden', sel.value !== 'custom');
+    if (sel.value !== 'custom') document.getElementById('inc-reason-text').value = '';
+  }
+  function showAddReason() {
+    document.getElementById('add-reason-panel').classList.remove('hidden');
+    document.getElementById('new-reason-input').focus();
+  }
+  function submitNewReason() {
+    const input = document.getElementById('new-reason-input');
+    const reason = input.value.trim();
+    if (!reason) return;
+    fetch('/admin/delay-reasons/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'reason=' + encodeURIComponent(reason)
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.success) {
+        const sel = document.getElementById('inc-reason-select');
+        const customOpt = sel.querySelector('option[value="custom"]');
+        const opt = document.createElement('option');
+        opt.value = data.id;
+        opt.textContent = data.reason;
+        sel.insertBefore(opt, customOpt);
+        sel.value = data.id;
+        document.getElementById('inc-reason-custom').classList.add('hidden');
+        document.getElementById('add-reason-panel').classList.add('hidden');
+        input.value = '';
+      }
+    });
+  }
+
+  // Filter
+  const search = document.getElementById('bus-search');
+  const stFlt  = document.getElementById('status-filter');
+  const scFlt  = document.getElementById('sched-filter');
+  const grid   = document.getElementById('buses-grid');
+  const noRes  = document.getElementById('no-buses-found');
+  const cnt    = document.getElementById('bus-count');
+
+  function filterBuses() {
+    const q = search.value.toLowerCase();
+    const st = stFlt.value;
+    const sc = scFlt.value.toLowerCase();
+    const cards = grid.querySelectorAll('.bus-card');
+    let vis = 0;
+    cards.forEach(c => {
+      const ok = (!q || c.dataset.number.includes(q) || c.dataset.route.includes(q)) &&
+                 (!st || c.dataset.status === st) &&
+                 (!sc || c.dataset.schedule.includes(sc));
+      c.style.display = ok ? '' : 'none';
+      if (ok) vis++;
+    });
+    cnt.textContent = vis;
+    noRes.classList.toggle('hidden', vis > 0 || cards.length === 0);
+    grid.classList.toggle('hidden', vis === 0 && cards.length > 0);
+  }
+  search.addEventListener('input', filterBuses);
+  stFlt.addEventListener('change', filterBuses);
+  scFlt.addEventListener('change', filterBuses);
+</script>
+{% endblock %}

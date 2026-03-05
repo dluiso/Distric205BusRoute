@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Setup Wizard — Bus Tracker</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    .step-panel { display: none; }
+    .step-panel.active { display: block; }
+    .step-dot { transition: all .3s; }
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-blue-950 flex items-center justify-center p-4">
+
+  <!-- Background blobs -->
+  <div class="fixed inset-0 overflow-hidden pointer-events-none">
+    <div class="absolute top-1/4 left-1/5 w-96 h-96 bg-blue-600 rounded-full opacity-5 blur-3xl"></div>
+    <div class="absolute bottom-1/4 right-1/4 w-80 h-80 bg-indigo-600 rounded-full opacity-5 blur-3xl"></div>
+  </div>
+
+  <div class="relative w-full max-w-2xl">
+
+    <!-- Header -->
+    <div class="text-center mb-8">
+      <div class="w-16 h-16 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg shadow-blue-900/40">
+        <i class="fas fa-bus text-white text-2xl"></i>
+      </div>
+      <h1 class="text-2xl font-bold text-white">Bus Tracker — Setup Wizard</h1>
+      <p class="text-slate-400 text-sm mt-1">Configure your application in a few simple steps</p>
+    </div>
+
+    <!-- Step indicators -->
+    <div class="flex items-center justify-center mb-8 space-x-2">
+      {% for n, lbl in [(1,'Database'),(2,'Admin User'),(3,'Install')] %}
+      <div class="flex items-center {% if not loop.last %}flex-1{% endif %}">
+        <div class="step-dot w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold border-2
+                    {% if loop.first %}border-blue-500 bg-blue-600 text-white{% else %}border-slate-600 bg-slate-800 text-slate-400{% endif %}"
+             id="dot-{{ n }}">
+          <span id="dot-lbl-{{ n }}">{{ n }}</span>
+        </div>
+        <span class="ml-2 text-xs font-medium {% if loop.first %}text-blue-400{% else %}text-slate-500{% endif %} hidden sm:inline"
+              id="dot-text-{{ n }}">{{ lbl }}</span>
+        {% if not loop.last %}
+        <div class="flex-1 h-px bg-slate-700 mx-3"></div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Card -->
+    <div class="bg-slate-800 rounded-2xl shadow-2xl border border-slate-700 overflow-hidden">
+
+      <!-- ── STEP 1: Database ── -->
+      <div class="step-panel active" id="panel-1">
+        <div class="px-8 py-6 border-b border-slate-700 bg-slate-750">
+          <h2 class="font-bold text-white text-lg flex items-center space-x-2">
+            <i class="fas fa-database text-blue-400"></i><span>Database Configuration</span>
+          </h2>
+          <p class="text-slate-400 text-sm mt-1">Choose the database engine for your installation.</p>
+        </div>
+        <div class="px-8 py-6 space-y-5">
+
+          <!-- DB type selector -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-300 mb-3">Database Type</label>
+            <div class="grid grid-cols-2 gap-3">
+              <label class="db-type-opt flex items-center space-x-3 p-4 rounded-xl border-2 border-blue-500 bg-blue-600/10 cursor-pointer">
+                <input type="radio" name="db_type" value="sqlite" checked class="w-4 h-4 text-blue-600" onchange="onDbType('sqlite')">
+                <div>
+                  <p class="font-semibold text-white text-sm">SQLite</p>
+                  <p class="text-xs text-slate-400">File-based · Simple setup</p>
+                </div>
+              </label>
+              <label class="db-type-opt flex items-center space-x-3 p-4 rounded-xl border-2 border-slate-600 cursor-pointer hover:border-slate-500">
+                <input type="radio" name="db_type" value="postgresql" class="w-4 h-4 text-blue-600" onchange="onDbType('postgresql')">
+                <div>
+                  <p class="font-semibold text-white text-sm">PostgreSQL</p>
+                  <p class="text-xs text-slate-400">Recommended for production</p>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- SQLite options -->
+          <div id="sqlite-opts" class="space-y-3">
+            <div class="bg-emerald-900/30 border border-emerald-700/50 rounded-xl p-4 text-sm text-emerald-300 flex items-start space-x-2">
+              <i class="fas fa-circle-check mt-0.5 flex-shrink-0"></i>
+              <span>SQLite requires no extra configuration. The database file <code class="bg-slate-900/50 px-1 rounded">bustrack.db</code> will be created automatically in the application directory.</span>
+            </div>
+          </div>
+
+          <!-- PostgreSQL options -->
+          <div id="pg-opts" class="hidden space-y-4">
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <label class="block text-xs font-semibold text-slate-300 mb-1.5">Host</label>
+                <input type="text" id="pg-host" value="localhost" placeholder="localhost"
+                       class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-slate-300 mb-1.5">Port</label>
+                <input type="number" id="pg-port" value="5432" placeholder="5432"
+                       class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+              </div>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Database Name</label>
+              <input type="text" id="pg-name" value="bustrack" placeholder="bustrack"
+                     class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+            </div>
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <label class="block text-xs font-semibold text-slate-300 mb-1.5">Username</label>
+                <input type="text" id="pg-user" placeholder="postgres"
+                       class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+              </div>
+              <div>
+                <label class="block text-xs font-semibold text-slate-300 mb-1.5">Password</label>
+                <div class="relative">
+                  <input type="password" id="pg-pass" placeholder="••••••••"
+                         class="w-full px-3 py-2.5 pr-10 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+                  <button type="button" onclick="toggleVis('pg-pass',this)" class="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
+                    <i class="fas fa-eye text-xs"></i>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <!-- Test result -->
+            <div id="db-test-result" class="hidden rounded-xl p-3 text-sm"></div>
+            <button type="button" onclick="testDb()"
+                    class="flex items-center space-x-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 border border-slate-600 text-slate-200 rounded-xl text-sm font-medium transition-colors">
+              <i class="fas fa-plug text-xs" id="test-icon"></i>
+              <span id="test-btn-lbl">Test Connection</span>
+            </button>
+          </div>
+
+          <!-- Nav -->
+          <div class="flex justify-end pt-2">
+            <button type="button" onclick="goStep(2)"
+                    class="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-semibold shadow-lg shadow-blue-900/30 flex items-center space-x-2">
+              <span>Continue</span><i class="fas fa-arrow-right text-xs"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── STEP 2: Admin User ── -->
+      <div class="step-panel" id="panel-2">
+        <div class="px-8 py-6 border-b border-slate-700">
+          <h2 class="font-bold text-white text-lg flex items-center space-x-2">
+            <i class="fas fa-user-shield text-blue-400"></i><span>Administrator Account</span>
+          </h2>
+          <p class="text-slate-400 text-sm mt-1">This will be the initial admin account. Choose a strong password.</p>
+        </div>
+        <div class="px-8 py-6 space-y-4">
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Username <span class="text-red-400">*</span></label>
+              <input type="text" id="adm-user" placeholder="admin" autocomplete="off"
+                     class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Email <span class="text-slate-500">(optional)</span></label>
+              <input type="email" id="adm-email" placeholder="admin@yourdomain.com" autocomplete="off"
+                     class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Password <span class="text-red-400">*</span></label>
+              <div class="relative">
+                <input type="password" id="adm-pass" placeholder="Min. 8 characters" autocomplete="new-password"
+                       oninput="checkPwdStrength()"
+                       class="w-full px-3 py-2.5 pr-10 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+                <button type="button" onclick="toggleVis('adm-pass',this)" class="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
+                  <i class="fas fa-eye text-xs"></i>
+                </button>
+              </div>
+              <!-- Strength bar -->
+              <div class="mt-2 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                <div id="pwd-bar" class="h-full rounded-full transition-all duration-300" style="width:0%"></div>
+              </div>
+              <p id="pwd-hint" class="text-xs text-slate-500 mt-1">Enter a password to check strength</p>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Confirm Password <span class="text-red-400">*</span></label>
+              <input type="password" id="adm-pass2" placeholder="Repeat password" autocomplete="new-password"
+                     class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+            </div>
+          </div>
+          <div id="step2-err" class="hidden bg-red-900/40 border border-red-700/60 rounded-xl p-3 text-sm text-red-300"></div>
+          <!-- Nav -->
+          <div class="flex justify-between pt-2">
+            <button type="button" onclick="goStep(1)"
+                    class="px-5 py-2.5 border border-slate-600 text-slate-300 rounded-xl text-sm font-medium hover:bg-slate-700 flex items-center space-x-2">
+              <i class="fas fa-arrow-left text-xs"></i><span>Back</span>
+            </button>
+            <button type="button" onclick="validateStep2()"
+                    class="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-semibold flex items-center space-x-2">
+              <span>Continue</span><i class="fas fa-arrow-right text-xs"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── STEP 3: Review & Install ── -->
+      <div class="step-panel" id="panel-3">
+        <div class="px-8 py-6 border-b border-slate-700">
+          <h2 class="font-bold text-white text-lg flex items-center space-x-2">
+            <i class="fas fa-rocket text-blue-400"></i><span>Review &amp; Install</span>
+          </h2>
+          <p class="text-slate-400 text-sm mt-1">Confirm your settings and run the installation.</p>
+        </div>
+        <div class="px-8 py-6 space-y-5">
+          <!-- Summary -->
+          <div class="bg-slate-900/60 rounded-xl border border-slate-700 divide-y divide-slate-700">
+            <div class="flex items-center justify-between px-4 py-3 text-sm">
+              <span class="text-slate-400 flex items-center space-x-2"><i class="fas fa-database text-blue-400 w-4"></i><span>Database</span></span>
+              <span class="text-white font-medium" id="sum-db">SQLite (default)</span>
+            </div>
+            <div class="flex items-center justify-between px-4 py-3 text-sm">
+              <span class="text-slate-400 flex items-center space-x-2"><i class="fas fa-user text-blue-400 w-4"></i><span>Admin Username</span></span>
+              <span class="text-white font-medium" id="sum-user">—</span>
+            </div>
+            <div class="flex items-center justify-between px-4 py-3 text-sm">
+              <span class="text-slate-400 flex items-center space-x-2"><i class="fas fa-envelope text-blue-400 w-4"></i><span>Admin Email</span></span>
+              <span class="text-slate-400 font-medium" id="sum-email">—</span>
+            </div>
+          </div>
+
+          <div class="bg-amber-900/30 border border-amber-700/50 rounded-xl p-4 text-sm text-amber-300 flex items-start space-x-2">
+            <i class="fas fa-triangle-exclamation mt-0.5 flex-shrink-0"></i>
+            <span>After a successful installation the setup wizard will be <strong>permanently disabled</strong> for security. Keep your credentials safe.</span>
+          </div>
+
+          <!-- Progress -->
+          <div id="install-progress" class="hidden space-y-3">
+            <div class="h-2 bg-slate-700 rounded-full overflow-hidden">
+              <div id="install-bar" class="h-full bg-blue-500 rounded-full transition-all duration-700" style="width:0%"></div>
+            </div>
+            <p id="install-msg" class="text-sm text-slate-300 text-center"></p>
+          </div>
+
+          <!-- Result -->
+          <div id="install-result" class="hidden rounded-xl p-4 text-sm"></div>
+
+          <!-- Nav -->
+          <div class="flex justify-between pt-2" id="install-nav">
+            <button type="button" onclick="goStep(2)"
+                    class="px-5 py-2.5 border border-slate-600 text-slate-300 rounded-xl text-sm font-medium hover:bg-slate-700 flex items-center space-x-2">
+              <i class="fas fa-arrow-left text-xs"></i><span>Back</span>
+            </button>
+            <button type="button" onclick="runInstall()" id="btn-install"
+                    class="px-8 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-sm font-bold shadow-lg shadow-emerald-900/40 flex items-center space-x-2">
+              <i class="fas fa-rocket text-xs"></i><span>Install Now</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /card -->
+
+    <p class="text-center text-slate-600 text-xs mt-6">Bus Tracker &mdash; Setup Wizard &mdash; This page is only accessible before installation</p>
+  </div>
+
+<script>
+let _step = 1;
+let _dbType = 'sqlite';
+let _pgTested = false;
+
+// ── Step navigation ──────────────────────────────────────────────────────────
+function goStep(n) {
+  document.querySelectorAll('.step-panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-' + n).classList.add('active');
+
+  for (let i = 1; i <= 3; i++) {
+    const dot = document.getElementById('dot-' + i);
+    const txt = document.getElementById('dot-text-' + i);
+    const lbl = document.getElementById('dot-lbl-' + i);
+    if (i < n) {
+      dot.className = dot.className.replace(/border-blue-500 bg-blue-600 text-white|border-slate-600 bg-slate-800 text-slate-400/g, 'border-emerald-500 bg-emerald-600 text-white');
+      lbl.innerHTML = '<i class="fas fa-check text-xs"></i>';
+      txt.className = txt.className.replace('text-blue-400','text-emerald-400').replace('text-slate-500','text-emerald-400');
+    } else if (i === n) {
+      dot.className = dot.className.replace(/border-emerald-500 bg-emerald-600 text-white|border-slate-600 bg-slate-800 text-slate-400/g, 'border-blue-500 bg-blue-600 text-white');
+      lbl.innerHTML = String(i);
+      txt.className = txt.className.replace('text-emerald-400','text-blue-400').replace('text-slate-500','text-blue-400');
+    } else {
+      dot.className = dot.className.replace(/border-emerald-500 bg-emerald-600 text-white|border-blue-500 bg-blue-600 text-white/g, 'border-slate-600 bg-slate-800 text-slate-400');
+      lbl.innerHTML = String(i);
+      txt.className = txt.className.replace('text-emerald-400','text-slate-500').replace('text-blue-400','text-slate-500');
+    }
+  }
+  _step = n;
+  if (n === 3) fillSummary();
+}
+
+// ── DB type toggle ───────────────────────────────────────────────────────────
+function onDbType(type) {
+  _dbType = type;
+  _pgTested = false;
+  document.getElementById('sqlite-opts').classList.toggle('hidden', type !== 'sqlite');
+  document.getElementById('pg-opts').classList.toggle('hidden', type !== 'postgresql');
+  document.querySelectorAll('.db-type-opt').forEach(l => {
+    const radio = l.querySelector('input');
+    const active = radio.value === type;
+    l.classList.toggle('border-blue-500', active);
+    l.classList.toggle('bg-blue-600/10', active);
+    l.classList.toggle('border-slate-600', !active);
+  });
+}
+
+// ── Test DB connection ────────────────────────────────────────────────────────
+async function testDb() {
+  const btn = document.getElementById('test-btn-lbl');
+  const icon = document.getElementById('test-icon');
+  const res = document.getElementById('db-test-result');
+  btn.textContent = 'Testing…';
+  icon.className = 'fas fa-spinner fa-spin text-xs';
+  res.className = 'hidden rounded-xl p-3 text-sm';
+
+  const payload = buildDbPayload();
+  try {
+    const r = await fetch('/install/test-db', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const j = await r.json();
+    res.classList.remove('hidden');
+    if (j.ok) {
+      res.className = 'rounded-xl p-3 text-sm bg-emerald-900/40 border border-emerald-700/50 text-emerald-300';
+      res.innerHTML = '<i class="fas fa-check-circle mr-2"></i>' + j.message;
+      _pgTested = true;
+    } else {
+      res.className = 'rounded-xl p-3 text-sm bg-red-900/40 border border-red-700/60 text-red-300';
+      res.innerHTML = '<i class="fas fa-exclamation-circle mr-2"></i>' + j.message;
+    }
+  } catch (e) {
+    res.classList.remove('hidden');
+    res.className = 'rounded-xl p-3 text-sm bg-red-900/40 border border-red-700/60 text-red-300';
+    res.innerHTML = '<i class="fas fa-exclamation-circle mr-2"></i>Network error: ' + e.message;
+  }
+  btn.textContent = 'Test Connection';
+  icon.className = 'fas fa-plug text-xs';
+}
+
+function buildDbPayload() {
+  if (_dbType === 'sqlite') return {type: 'sqlite'};
+  return {
+    type: 'postgresql',
+    host: document.getElementById('pg-host').value,
+    port: document.getElementById('pg-port').value,
+    name: document.getElementById('pg-name').value,
+    user: document.getElementById('pg-user').value,
+    password: document.getElementById('pg-pass').value,
+  };
+}
+
+// ── Password strength ─────────────────────────────────────────────────────────
+function checkPwdStrength() {
+  const v = document.getElementById('adm-pass').value;
+  let score = 0;
+  if (v.length >= 8)  score++;
+  if (v.length >= 12) score++;
+  if (/[A-Z]/.test(v)) score++;
+  if (/[0-9]/.test(v)) score++;
+  if (/[^A-Za-z0-9]/.test(v)) score++;
+  const colors = ['bg-red-500','bg-orange-500','bg-yellow-500','bg-lime-500','bg-emerald-500'];
+  const labels = ['Very weak','Weak','Fair','Strong','Very strong'];
+  const bar    = document.getElementById('pwd-bar');
+  const hint   = document.getElementById('pwd-hint');
+  bar.style.width = (score / 5 * 100) + '%';
+  bar.className = 'h-full rounded-full transition-all duration-300 ' + (colors[score-1] || 'bg-red-500');
+  hint.textContent = v.length === 0 ? 'Enter a password to check strength' : (labels[score-1] || 'Very weak');
+  hint.className = 'text-xs mt-1 ' + (['text-red-400','text-orange-400','text-yellow-400','text-lime-400','text-emerald-400'][score-1] || 'text-slate-500');
+}
+
+// ── Step 2 validation ────────────────────────────────────────────────────────
+function validateStep2() {
+  const err = document.getElementById('step2-err');
+  const u = document.getElementById('adm-user').value.trim();
+  const p = document.getElementById('adm-pass').value;
+  const p2 = document.getElementById('adm-pass2').value;
+  err.classList.add('hidden');
+  if (!u || u.length < 3)  { showErr(err, 'Username must be at least 3 characters.'); return; }
+  if (!/^[a-zA-Z0-9_.-]+$/.test(u)) { showErr(err, 'Username can only contain letters, numbers, underscores, dots and hyphens.'); return; }
+  if (!p || p.length < 8)  { showErr(err, 'Password must be at least 8 characters.'); return; }
+  if (p !== p2)             { showErr(err, 'Passwords do not match.'); return; }
+  goStep(3);
+}
+
+function showErr(el, msg) {
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+// ── Summary fill ─────────────────────────────────────────────────────────────
+function fillSummary() {
+  const db = _dbType === 'sqlite' ? 'SQLite (default)'
+    : `PostgreSQL — ${document.getElementById('pg-host').value}:${document.getElementById('pg-port').value}/${document.getElementById('pg-name').value}`;
+  document.getElementById('sum-db').textContent   = db;
+  document.getElementById('sum-user').textContent  = document.getElementById('adm-user').value || '—';
+  document.getElementById('sum-email').textContent = document.getElementById('adm-email').value || 'None';
+}
+
+// ── Run installation ─────────────────────────────────────────────────────────
+async function runInstall() {
+  document.getElementById('btn-install').disabled = true;
+  document.getElementById('btn-install').innerHTML = '<i class="fas fa-spinner fa-spin text-xs mr-2"></i>Installing…';
+  document.getElementById('install-progress').classList.remove('hidden');
+  document.getElementById('install-nav').querySelector('button').disabled = true;
+
+  const bar = document.getElementById('install-bar');
+  const msg = document.getElementById('install-msg');
+  const res = document.getElementById('install-result');
+
+  const steps = ['Connecting to database…','Creating tables…','Seeding defaults…','Creating admin user…','Finalizing…'];
+  let si = 0;
+  const ticker = setInterval(() => {
+    si = Math.min(si + 1, steps.length - 1);
+    bar.style.width = ((si + 1) / steps.length * 80) + '%';
+    msg.textContent = steps[si];
+  }, 600);
+
+  try {
+    const r = await fetch('/install/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        db: buildDbPayload(),
+        username: document.getElementById('adm-user').value.trim(),
+        email:    document.getElementById('adm-email').value.trim() || null,
+        password: document.getElementById('adm-pass').value,
+      })
+    });
+    const j = await r.json();
+    clearInterval(ticker);
+
+    if (j.ok) {
+      bar.style.width = '100%';
+      bar.className = 'h-full bg-emerald-500 rounded-full transition-all duration-700';
+      msg.textContent = j.message;
+      res.className = 'rounded-xl p-4 text-sm bg-emerald-900/40 border border-emerald-700/50 text-emerald-300';
+      res.innerHTML = '<i class="fas fa-circle-check mr-2 text-lg"></i><strong>Installation complete!</strong> Redirecting to login…';
+      res.classList.remove('hidden');
+      document.getElementById('install-nav').classList.add('hidden');
+      setTimeout(() => { window.location.href = '/admin/login'; }, 2500);
+    } else {
+      bar.style.width = '100%';
+      bar.className = 'h-full bg-red-500 rounded-full transition-all duration-700';
+      msg.textContent = '';
+      res.className = 'rounded-xl p-4 text-sm bg-red-900/40 border border-red-700/60 text-red-300';
+      res.innerHTML = '<i class="fas fa-circle-xmark mr-2"></i><strong>Error:</strong> ' + j.message;
+      res.classList.remove('hidden');
+      document.getElementById('btn-install').disabled = false;
+      document.getElementById('btn-install').innerHTML = '<i class="fas fa-redo text-xs mr-2"></i>Retry';
+      document.getElementById('install-nav').querySelector('button').disabled = false;
+    }
+  } catch (e) {
+    clearInterval(ticker);
+    res.className = 'rounded-xl p-4 text-sm bg-red-900/40 border border-red-700/60 text-red-300';
+    res.innerHTML = '<i class="fas fa-circle-xmark mr-2"></i>Network error: ' + e.message;
+    res.classList.remove('hidden');
+    document.getElementById('btn-install').disabled = false;
+    document.getElementById('btn-install').innerHTML = '<i class="fas fa-redo text-xs mr-2"></i>Retry';
+  }
+}
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+function toggleVis(id, btn) {
+  const inp = document.getElementById(id);
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+  btn.querySelector('i').className = inp.type === 'password' ? 'fas fa-eye text-xs' : 'fas fa-eye-slash text-xs';
+}
+</script>
+</body>
+</html>

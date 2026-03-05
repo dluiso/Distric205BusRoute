@@ -1,0 +1,52 @@
+# ── Secrets & runtime data ────────────────────────────────────────────────────
+instance/
+.env
+*.env
+
+# ── Database files ────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Uploaded media (add to a CDN / object storage in production) ──────────────
+static/uploads/
+static/exports/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+.env/
+ENV/
+
+# ── IDE / AI tools ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/

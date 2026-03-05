@@ -1,0 +1,784 @@
+{% extends "admin/base.html" %}
+{% block title %}Notifications{% endblock %}
+{% block page_title %}Notifications{% endblock %}
+{% block page_subtitle %}Subscribers, groups and broadcast messaging{% endblock %}
+
+{% block content %}
+{% set active_tab = request.args.get('tab', 'subscribers') %}
+
+<!-- Tab nav -->
+<div class="flex flex-wrap gap-1 mb-6 bg-white rounded-2xl shadow-sm border border-slate-100 p-1.5">
+  {% for tid, lbl, icon in [('subscribers','Subscribers','fa-users'),('groups','Groups','fa-layer-group'),('broadcast','Send Message','fa-paper-plane')] %}
+  <button onclick="showNTab('{{ tid }}')" id="ntab-btn-{{ tid }}"
+          class="flex items-center space-x-1.5 px-4 py-2 rounded-xl text-sm font-medium transition-all
+          {% if active_tab == tid %}bg-blue-600 text-white shadow-sm{% else %}text-slate-600 hover:bg-slate-50{% endif %}">
+    <i class="fas {{ icon }} text-xs"></i><span>{{ lbl }}</span>
+  </button>
+  {% endfor %}
+</div>
+
+<!-- Email config warning -->
+<div id="mail-warn" class="bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-5 flex items-start space-x-3">
+  <i class="fas fa-exclamation-triangle text-amber-500 mt-0.5"></i>
+  <div>
+    <p class="text-sm font-medium text-amber-800">Email notifications require mail server configuration</p>
+    <p class="text-xs text-amber-600 mt-0.5">Configure SMTP in <a href="{{ url_for('config_page', tab='email') }}" class="underline font-medium">Configuration &rarr; Email</a>.</p>
+  </div>
+</div>
+
+<!-- ══ SUBSCRIBERS TAB ══ -->
+<div id="ntab-subscribers" class="{% if active_tab != 'subscribers' %}hidden{% endif %}">
+  <div class="flex items-center justify-between mb-4">
+    <p class="text-sm text-slate-500">
+      {{ subscribers|length }} subscriber{{ 's' if subscribers|length != 1 }}
+      &middot;
+      {% set notif_count = namespace(v=0) %}
+      {% for u in admin_users if u.receive_notifications %}{% set notif_count.v = notif_count.v + 1 %}{% endfor %}
+      {{ notif_count.v }} admin user{{ 's' if notif_count.v != 1 }} receiving alerts
+    </p>
+    {% if can_write %}
+    <button onclick="document.getElementById('modal-add').classList.remove('hidden')"
+            class="inline-flex items-center space-x-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium shadow-sm">
+      <i class="fas fa-plus"></i><span>Add Subscriber</span>
+    </button>
+    {% endif %}
+  </div>
+
+  <!-- Admin users section -->
+  {% set notif_users = [] %}
+  {% for u in admin_users if u.receive_notifications %}{% set _ = notif_users.append(u) %}{% endfor %}
+  {% if notif_users %}
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden mb-4">
+    <div class="px-5 py-3 border-b border-slate-100 bg-slate-50 flex items-center space-x-2">
+      <i class="fas fa-user-shield text-blue-500 text-xs"></i>
+      <span class="font-semibold text-slate-600 text-sm">Admin Users</span>
+      <span class="ml-auto text-xs text-slate-400 bg-slate-200 px-2 py-0.5 rounded-full">{{ notif_users|length }}</span>
+    </div>
+    <div class="divide-y divide-slate-50">
+      {% for u in notif_users %}
+      <div class="px-5 py-3 flex items-center space-x-3 hover:bg-slate-50">
+        <div class="w-8 h-8 bg-gradient-to-br from-blue-400 to-indigo-600 rounded-full flex items-center justify-center flex-shrink-0">
+          <span class="text-white font-bold text-xs">{{ (u.first_name or u.username)[0].upper() }}</span>
+        </div>
+        <div class="flex-1 min-w-0">
+          <p class="font-medium text-slate-800 text-sm">{{ u.first_name or '' }} {{ u.last_name or '' }} <span class="text-slate-400 text-xs">(@{{ u.username }})</span></p>
+          {% if u.email %}<p class="text-xs text-slate-500"><i class="fas fa-envelope mr-1 text-slate-400"></i>{{ u.email }}</p>{% endif %}
+        </div>
+        <span class="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-medium">{{ u.group.name if u.group else 'Admin' }}</span>
+        <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-700">
+          <span class="w-1.5 h-1.5 rounded-full mr-1 bg-emerald-500"></span>Notified
+        </span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Ungrouped subscribers -->
+  {% set ungrouped = [] %}
+  {% for s in subscribers if s.group_id is none %}{% set _ = ungrouped.append(s) %}{% endfor %}
+  {% if ungrouped %}
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden mb-4">
+    <div class="px-5 py-3 border-b border-slate-100 bg-slate-50 flex items-center space-x-2">
+      <i class="fas fa-user text-slate-400 text-xs"></i>
+      <span class="font-semibold text-slate-600 text-sm">No Group</span>
+      <span class="ml-auto text-xs text-slate-400 bg-slate-200 px-2 py-0.5 rounded-full">{{ ungrouped|length }}</span>
+    </div>
+    <div class="divide-y divide-slate-50">
+    {% for s in ungrouped %}
+    <div class="px-5 py-3 flex items-center space-x-3 hover:bg-slate-50 transition-colors">
+      <div class="w-8 h-8 bg-gradient-to-br from-purple-400 to-indigo-600 rounded-full flex items-center justify-center flex-shrink-0">
+        <span class="text-white font-bold text-xs">{{ ((s.first_name or s.last_name or 'S')[0]).upper() }}</span>
+      </div>
+      <div class="flex-1 min-w-0">
+        <p class="font-medium text-slate-800 text-sm">{{ s.full_name or 'Unknown' }}</p>
+        <div class="flex flex-wrap gap-2 mt-0.5">
+          {% if s.email %}<span class="text-xs text-slate-500"><i class="fas fa-envelope mr-1 text-slate-400"></i>{{ s.email }}</span>{% endif %}
+          {% if s.phone %}<span class="text-xs text-slate-500"><i class="fas fa-phone mr-1 text-slate-400"></i>{{ s.phone }}</span>{% endif %}
+        </div>
+      </div>
+      <div class="flex flex-wrap gap-1 max-w-xs">
+        {% for a in s.bus_assignments %}
+        <span class="px-1.5 py-0.5 bg-blue-50 text-blue-700 text-xs font-medium rounded border border-blue-100">{{ a.bus.identifier }}</span>
+        {% else %}<span class="text-xs text-slate-400">No buses</span>{% endfor %}
+      </div>
+      <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium
+        {% if s.active %}bg-emerald-100 text-emerald-700{% else %}bg-red-100 text-red-600{% endif %}">
+        <span class="w-1.5 h-1.5 rounded-full mr-1 {% if s.active %}bg-emerald-500{% else %}bg-red-400{% endif %}"></span>
+        {{ 'Active' if s.active else 'Inactive' }}
+      </span>
+      {% if can_write %}
+      <div class="flex items-center space-x-1 flex-shrink-0">
+        <button onclick="openEdit({{ s.id }}, '{{ s.first_name or '' }}', '{{ s.last_name or '' }}', '{{ s.email or '' }}', '{{ s.phone or '' }}', {{ s.active|lower }}, [{{ s.bus_assignments|map(attribute='bus_id')|join(',') }}], {{ s.group_id or 'null' }})"
+                class="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors">
+          <i class="fas fa-edit text-sm"></i>
+        </button>
+        <form method="POST" action="{{ url_for('delete_subscriber', sid=s.id) }}"
+              onsubmit="return confirm('Remove {{ s.full_name or 'this subscriber' }}?')">
+          <button type="submit" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
+            <i class="fas fa-trash text-sm"></i>
+          </button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Grouped subscribers -->
+  {% for grp in groups %}
+  {% set grp_subs = [] %}
+  {% for s in subscribers if s.group_id == grp.id %}{% set _ = grp_subs.append(s) %}{% endfor %}
+  {% if grp_subs %}
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden mb-4">
+    <div class="px-5 py-3 border-b border-slate-100 bg-slate-50 flex items-center space-x-2">
+      <span class="w-3 h-3 rounded-full flex-shrink-0"
+            style="background-color: {{ {'blue':'#3b82f6','purple':'#8b5cf6','green':'#10b981','orange':'#f97316','red':'#ef4444','pink':'#ec4899','indigo':'#6366f1'}.get(grp.color,'#3b82f6') }}"></span>
+      <span class="font-semibold text-slate-600 text-sm">{{ grp.name }}</span>
+      {% if grp.description %}<span class="text-xs text-slate-400">— {{ grp.description }}</span>{% endif %}
+      <span class="ml-auto text-xs text-slate-400 bg-slate-200 px-2 py-0.5 rounded-full">{{ grp_subs|length }}</span>
+    </div>
+    <div class="divide-y divide-slate-50">
+    {% for s in grp_subs %}
+    <div class="px-5 py-3 flex items-center space-x-3 hover:bg-slate-50 transition-colors">
+      <div class="w-8 h-8 bg-gradient-to-br from-purple-400 to-indigo-600 rounded-full flex items-center justify-center flex-shrink-0">
+        <span class="text-white font-bold text-xs">{{ ((s.first_name or s.last_name or 'S')[0]).upper() }}</span>
+      </div>
+      <div class="flex-1 min-w-0">
+        <p class="font-medium text-slate-800 text-sm">{{ s.full_name or 'Unknown' }}</p>
+        <div class="flex flex-wrap gap-2 mt-0.5">
+          {% if s.email %}<span class="text-xs text-slate-500"><i class="fas fa-envelope mr-1 text-slate-400"></i>{{ s.email }}</span>{% endif %}
+          {% if s.phone %}<span class="text-xs text-slate-500"><i class="fas fa-phone mr-1 text-slate-400"></i>{{ s.phone }}</span>{% endif %}
+        </div>
+      </div>
+      <div class="flex flex-wrap gap-1 max-w-xs">
+        {% for a in s.bus_assignments %}
+        <span class="px-1.5 py-0.5 bg-blue-50 text-blue-700 text-xs font-medium rounded border border-blue-100">{{ a.bus.identifier }}</span>
+        {% else %}<span class="text-xs text-slate-400">No buses</span>{% endfor %}
+      </div>
+      <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium
+        {% if s.active %}bg-emerald-100 text-emerald-700{% else %}bg-red-100 text-red-600{% endif %}">
+        <span class="w-1.5 h-1.5 rounded-full mr-1 {% if s.active %}bg-emerald-500{% else %}bg-red-400{% endif %}"></span>
+        {{ 'Active' if s.active else 'Inactive' }}
+      </span>
+      {% if can_write %}
+      <div class="flex items-center space-x-1 flex-shrink-0">
+        <button onclick="openEdit({{ s.id }}, '{{ s.first_name or '' }}', '{{ s.last_name or '' }}', '{{ s.email or '' }}', '{{ s.phone or '' }}', {{ s.active|lower }}, [{{ s.bus_assignments|map(attribute='bus_id')|join(',') }}], {{ s.group_id or 'null' }})"
+                class="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors">
+          <i class="fas fa-edit text-sm"></i>
+        </button>
+        <form method="POST" action="{{ url_for('delete_subscriber', sid=s.id) }}"
+              onsubmit="return confirm('Remove {{ s.full_name or 'this subscriber' }}?')">
+          <button type="submit" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
+            <i class="fas fa-trash text-sm"></i>
+          </button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+  {% endfor %}
+
+  {% if not subscribers %}
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 py-16 text-center text-slate-300">
+    <i class="fas fa-bell-slash text-5xl mb-3 block"></i>
+    <p class="text-slate-400 mb-2">No subscribers yet</p>
+    {% if can_write %}
+    <button onclick="document.getElementById('modal-add').classList.remove('hidden')"
+            class="mt-2 px-4 py-2 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-700">
+      Add first subscriber
+    </button>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<!-- ══ GROUPS TAB ══ -->
+<div id="ntab-groups" class="{% if active_tab != 'groups' %}hidden{% endif %}">
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+    <!-- Groups list -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+      <div class="px-5 py-4 border-b border-slate-100">
+        <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+          <i class="fas fa-layer-group text-blue-500"></i><span>Subscriber Groups</span>
+        </h3>
+      </div>
+      {% if groups %}
+      <div class="divide-y divide-slate-50">
+        {% for grp in groups %}
+        {% set count = namespace(v=0) %}
+        {% for s in subscribers if s.group_id == grp.id %}{% set count.v = count.v + 1 %}{% endfor %}
+        <div class="px-5 py-3 flex items-center space-x-3">
+          <span class="w-4 h-4 rounded-full flex-shrink-0"
+                style="background-color: {{ {'blue':'#3b82f6','purple':'#8b5cf6','green':'#10b981','orange':'#f97316','red':'#ef4444','pink':'#ec4899','indigo':'#6366f1'}.get(grp.color,'#3b82f6') }}"></span>
+          <div class="flex-1">
+            <p class="font-medium text-slate-800 text-sm">{{ grp.name }}</p>
+            {% if grp.description %}<p class="text-xs text-slate-400">{{ grp.description }}</p>{% endif %}
+          </div>
+          <span class="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full">{{ count.v }} member{{ 's' if count.v != 1 }}</span>
+          {% if can_write %}
+          <button onclick="openEditGroup({{ grp.id }}, '{{ grp.name }}', '{{ grp.color }}', '{{ grp.description or '' }}')"
+                  class="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg text-sm transition-colors">
+            <i class="fas fa-edit"></i>
+          </button>
+          <form method="POST" action="{{ url_for('delete_subscriber_group', gid=grp.id) }}"
+                onsubmit="return confirm('Delete group {{ grp.name }}? Subscribers will be ungrouped.')">
+            <button type="submit" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg text-sm transition-colors">
+              <i class="fas fa-trash"></i>
+            </button>
+          </form>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="py-12 text-center text-slate-400">
+        <i class="fas fa-layer-group text-3xl mb-2 block text-slate-200"></i>
+        <p class="text-sm">No groups yet</p>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Add / Edit group forms -->
+    {% if can_write %}
+    <div class="space-y-4">
+      <!-- Add group -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+        <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
+          <i class="fas fa-plus text-blue-500"></i><span>New Group</span>
+        </h3>
+        <form method="POST" action="{{ url_for('add_subscriber_group') }}" class="space-y-3">
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Group Name</label>
+            <input type="text" name="name" required placeholder="Parents — Route A"
+                   class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Description (optional)</label>
+            <input type="text" name="description" placeholder="Brief description"
+                   class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Color</label>
+            <div class="flex flex-wrap gap-2">
+              {% for col, hex in [('blue','#3b82f6'),('purple','#8b5cf6'),('green','#10b981'),('orange','#f97316'),('red','#ef4444'),('pink','#ec4899'),('indigo','#6366f1')] %}
+              <label class="cursor-pointer">
+                <input type="radio" name="color" value="{{ col }}" {% if col=='blue' %}checked{% endif %} class="sr-only">
+                <span class="color-dot w-7 h-7 rounded-full block border-4 border-white ring-2 ring-transparent transition-all"
+                      style="background-color:{{ hex }}" data-color="{{ col }}"></span>
+              </label>
+              {% endfor %}
+            </div>
+          </div>
+          <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+            <i class="fas fa-plus mr-1"></i>Create Group
+          </button>
+        </form>
+      </div>
+
+      <!-- Edit group (hidden until openEditGroup called) -->
+      <div id="edit-group-card" class="hidden bg-white rounded-2xl shadow-sm border border-blue-200 p-5">
+        <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
+          <i class="fas fa-edit text-blue-500"></i><span>Edit Group</span>
+        </h3>
+        <form method="POST" id="form-edit-group" class="space-y-3">
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Group Name</label>
+            <input type="text" name="name" id="eg-name" required
+                   class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Description</label>
+            <input type="text" name="description" id="eg-desc"
+                   class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Color</label>
+            <div class="flex flex-wrap gap-2" id="eg-colors">
+              {% for col, hex in [('blue','#3b82f6'),('purple','#8b5cf6'),('green','#10b981'),('orange','#f97316'),('red','#ef4444'),('pink','#ec4899'),('indigo','#6366f1')] %}
+              <label class="cursor-pointer">
+                <input type="radio" name="color" value="{{ col }}" class="sr-only edit-color-radio">
+                <span class="color-dot w-7 h-7 rounded-full block border-4 border-white ring-2 ring-transparent transition-all"
+                      style="background-color:{{ hex }}" data-color="{{ col }}"></span>
+              </label>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="flex space-x-2">
+            <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+              <i class="fas fa-save mr-1"></i>Save
+            </button>
+            <button type="button" onclick="document.getElementById('edit-group-card').classList.add('hidden')"
+                    class="px-4 py-2 border border-slate-200 rounded-xl text-sm text-slate-600 hover:bg-slate-50">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- ══ BROADCAST TAB ══ -->
+<div id="ntab-broadcast" class="{% if active_tab != 'broadcast' %}hidden{% endif %}">
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+    <!-- Compose form -->
+    <div class="lg:col-span-2 space-y-4">
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 space-y-4">
+        <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+          <i class="fas fa-paper-plane text-blue-500"></i><span>Compose Message</span>
+        </h3>
+
+        <!-- Target selector -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-2">Recipients</label>
+          <div class="space-y-2">
+            {% for val, lbl in [('all','Everyone (subscribers + admin users)'),('subscribers','All Active Subscribers only'),('admins','All Admin Users only')] %}
+            <label class="flex items-center space-x-2 cursor-pointer p-2 rounded-xl hover:bg-slate-50">
+              <input type="radio" name="bc_target" value="{{ val }}" {% if val=='all' %}checked{% endif %}
+                     onchange="onTargetChange(this.value)" class="w-4 h-4 text-blue-600">
+              <span class="text-sm text-slate-700">{{ lbl }}</span>
+            </label>
+            {% endfor %}
+            <label class="flex items-center space-x-2 cursor-pointer p-2 rounded-xl hover:bg-slate-50">
+              <input type="radio" name="bc_target" value="group" onchange="onTargetChange('group')" class="w-4 h-4 text-blue-600">
+              <span class="text-sm text-slate-700">Subscriber Group(s)</span>
+            </label>
+            <!-- Group checkboxes -->
+            <div id="bc-groups" class="hidden ml-6 grid grid-cols-2 gap-2 mt-1">
+              {% for grp in groups %}
+              <label class="flex items-center space-x-2 p-2 rounded-xl border border-slate-100 hover:border-blue-300 cursor-pointer">
+                <input type="checkbox" name="bc_group_ids" value="{{ grp.id }}" class="w-4 h-4 rounded border-slate-300 text-blue-600">
+                <span class="w-3 h-3 rounded-full flex-shrink-0"
+                      style="background-color: {{ {'blue':'#3b82f6','purple':'#8b5cf6','green':'#10b981','orange':'#f97316','red':'#ef4444','pink':'#ec4899','indigo':'#6366f1'}.get(grp.color,'#3b82f6') }}"></span>
+                <span class="text-sm text-slate-700">{{ grp.name }}</span>
+              </label>
+              {% else %}
+              <p class="text-xs text-slate-400 col-span-2">No groups created yet</p>
+              {% endfor %}
+            </div>
+            <label class="flex items-center space-x-2 cursor-pointer p-2 rounded-xl hover:bg-slate-50">
+              <input type="radio" name="bc_target" value="individual_subscriber" onchange="onTargetChange('individual_subscriber')" class="w-4 h-4 text-blue-600">
+              <span class="text-sm text-slate-700">Individual Subscriber</span>
+            </label>
+            <div id="bc-sub" class="hidden ml-6">
+              <select id="bc-sub-select" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="">— select subscriber —</option>
+                {% for s in subscribers %}
+                <option value="{{ s.id }}">{{ s.full_name }} {% if s.email %}({{ s.email }}){% endif %}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <label class="flex items-center space-x-2 cursor-pointer p-2 rounded-xl hover:bg-slate-50">
+              <input type="radio" name="bc_target" value="individual_user" onchange="onTargetChange('individual_user')" class="w-4 h-4 text-blue-600">
+              <span class="text-sm text-slate-700">Individual Admin User</span>
+            </label>
+            <div id="bc-user" class="hidden ml-6">
+              <select id="bc-user-select" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="">— select user —</option>
+                {% for u in admin_users %}
+                {% if u.email %}
+                <option value="{{ u.id }}">{{ u.first_name or '' }} {{ u.last_name or '' }} (@{{ u.username }}) &mdash; {{ u.email }}</option>
+                {% endif %}
+                {% endfor %}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Subject + Body -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Subject</label>
+          <input type="text" id="bc-subject" placeholder="Bus Service Update — Today"
+                 class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Message Body</label>
+          <textarea id="bc-body" rows="6" placeholder="Write your message here…"
+                    class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"></textarea>
+        </div>
+
+        <!-- Interval -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">
+            Send Interval <span class="text-slate-400 font-normal">(delay between each email — anti-spam)</span>
+          </label>
+          <div class="flex items-center space-x-3">
+            <select id="bc-interval" class="px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    onchange="onIntervalChange(this.value)">
+              <option value="0">Immediate (no delay)</option>
+              <option value="2">2 seconds</option>
+              <option value="5" selected>5 seconds</option>
+              <option value="10">10 seconds</option>
+              <option value="30">30 seconds</option>
+              <option value="60">1 minute</option>
+              <option value="custom">Custom…</option>
+            </select>
+            <input type="number" id="bc-interval-custom" min="0" max="3600" value="5"
+                   placeholder="seconds"
+                   class="hidden w-28 px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <span id="bc-interval-label" class="text-xs text-slate-400">~5s between each email</span>
+          </div>
+        </div>
+
+        <div class="pt-2">
+          <button type="button" id="btn-broadcast" onclick="sendBroadcast()"
+                  class="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-semibold shadow-sm">
+            <i class="fas fa-paper-plane mr-2"></i>Send Message
+          </button>
+        </div>
+      </div>
+
+      <!-- Progress panel -->
+      <div id="bc-progress-card" class="hidden bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+        <h3 class="font-bold text-slate-700 mb-3 flex items-center space-x-2">
+          <i class="fas fa-spinner fa-spin text-blue-500" id="bc-prog-icon"></i>
+          <span id="bc-prog-title">Sending…</span>
+        </h3>
+        <div class="relative h-3 bg-slate-100 rounded-full overflow-hidden mb-2">
+          <div id="bc-prog-bar" class="h-full bg-blue-500 rounded-full transition-all duration-500" style="width:0%"></div>
+        </div>
+        <p id="bc-prog-label" class="text-xs text-slate-500 mb-3"></p>
+        <div id="bc-errors" class="space-y-1 hidden"></div>
+        <p id="bc-done-msg" class="hidden text-sm font-medium text-emerald-600"><i class="fas fa-check-circle mr-1"></i>Done!</p>
+      </div>
+    </div>
+
+    <!-- Sidebar: recipient summary -->
+    <div class="space-y-4">
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
+        <h4 class="font-semibold text-slate-600 text-xs uppercase tracking-wider mb-3">Recipients Overview</h4>
+        <div class="space-y-2 text-sm">
+          <div class="flex items-center justify-between">
+            <span class="text-slate-600">Active Subscribers</span>
+            {% set active_sub_count = namespace(v=0) %}
+            {% for s in subscribers if s.active %}{% set active_sub_count.v = active_sub_count.v + 1 %}{% endfor %}
+            <span class="font-bold text-slate-800">{{ active_sub_count.v }}</span>
+          </div>
+          <div class="flex items-center justify-between">
+            <span class="text-slate-600">Admin Users (notified)</span>
+            {% set notif_admin_count = namespace(v=0) %}
+            {% for u in admin_users if u.receive_notifications %}{% set notif_admin_count.v = notif_admin_count.v + 1 %}{% endfor %}
+            <span class="font-bold text-slate-800">{{ notif_admin_count.v }}</span>
+          </div>
+          <div class="border-t border-slate-100 pt-2 flex items-center justify-between">
+            <span class="text-slate-700 font-medium">Total (Everyone)</span>
+            <span class="font-bold text-blue-600">{{ active_sub_count.v + notif_admin_count.v }}</span>
+          </div>
+        </div>
+      </div>
+      {% if groups %}
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
+        <h4 class="font-semibold text-slate-600 text-xs uppercase tracking-wider mb-3">Groups</h4>
+        <div class="space-y-2">
+          {% for grp in groups %}
+          {% set grp_active_count = namespace(v=0) %}
+          {% for s in subscribers if s.group_id == grp.id and s.active %}{% set grp_active_count.v = grp_active_count.v + 1 %}{% endfor %}
+          <div class="flex items-center space-x-2 text-sm">
+            <span class="w-3 h-3 rounded-full flex-shrink-0"
+                  style="background-color: {{ {'blue':'#3b82f6','purple':'#8b5cf6','green':'#10b981','orange':'#f97316','red':'#ef4444','pink':'#ec4899','indigo':'#6366f1'}.get(grp.color,'#3b82f6') }}"></span>
+            <span class="text-slate-600 flex-1">{{ grp.name }}</span>
+            <span class="font-semibold text-slate-800">{{ grp_active_count.v }}</span>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+      <div class="bg-amber-50 border border-amber-100 rounded-2xl p-4 text-xs text-amber-700 space-y-1">
+        <p class="font-semibold"><i class="fas fa-info-circle mr-1"></i>Anti-spam tip</p>
+        <p>Set a send interval to avoid hitting rate limits. Gmail allows ~100 emails/day on free accounts; Office 365 allows 10,000/day.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── MODAL: Add Subscriber ── -->
+<div id="modal-add" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100 sticky top-0 bg-white">
+      <h2 class="font-bold text-slate-800">Add Subscriber</h2>
+      <button onclick="document.getElementById('modal-add').classList.add('hidden')" class="text-slate-400 hover:text-slate-600">
+        <i class="fas fa-times"></i>
+      </button>
+    </div>
+    <form method="POST" action="{{ url_for('add_subscriber') }}" class="px-6 py-5 space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">First Name</label>
+          <input type="text" name="first_name" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Last Name</label>
+          <input type="text" name="last_name" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Email</label>
+        <input type="email" name="email" placeholder="parent@example.com"
+               class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Phone (optional)</label>
+        <input type="tel" name="phone" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Group (optional)</label>
+        <select name="group_id" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+          <option value="">— No Group —</option>
+          {% for grp in groups %}
+          <option value="{{ grp.id }}">{{ grp.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-2">Notify for Buses</label>
+        <div class="grid grid-cols-2 gap-1.5 max-h-40 overflow-y-auto p-1">
+          {% for bus in all_buses %}
+          <label class="flex items-center space-x-2 p-2 rounded-lg border border-slate-100 hover:border-blue-300 hover:bg-blue-50 cursor-pointer">
+            <input type="checkbox" name="bus_ids" value="{{ bus.id }}" class="w-4 h-4 rounded border-slate-300 text-blue-600">
+            <span class="text-sm font-medium text-slate-700">{{ bus.identifier }}</span>
+            <span class="text-xs text-slate-400 truncate">{{ bus.name[:14] }}</span>
+          </label>
+          {% else %}
+          <p class="col-span-2 text-sm text-slate-400 text-center py-4">No active buses</p>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="flex justify-end space-x-2 pt-2 border-t border-slate-100">
+        <button type="button" onclick="document.getElementById('modal-add').classList.add('hidden')"
+                class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
+        <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Add Subscriber</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ── MODAL: Edit Subscriber ── -->
+<div id="modal-edit" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100 sticky top-0 bg-white">
+      <h2 class="font-bold text-slate-800">Edit Subscriber</h2>
+      <button onclick="document.getElementById('modal-edit').classList.add('hidden')" class="text-slate-400 hover:text-slate-600">
+        <i class="fas fa-times"></i>
+      </button>
+    </div>
+    <form method="POST" id="form-edit" class="px-6 py-5 space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">First Name</label>
+          <input type="text" name="first_name" id="e-first" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Last Name</label>
+          <input type="text" name="last_name" id="e-last" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Email</label>
+        <input type="email" name="email" id="e-email" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Phone</label>
+        <input type="tel" name="phone" id="e-phone" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Group</label>
+        <select name="group_id" id="e-group" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+          <option value="">— No Group —</option>
+          {% for grp in groups %}
+          <option value="{{ grp.id }}">{{ grp.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <label class="flex items-center space-x-2 cursor-pointer">
+        <input type="checkbox" name="active" id="e-active" class="w-4 h-4 rounded border-slate-300 text-blue-600">
+        <span class="text-sm text-slate-600 font-medium">Active (receives notifications)</span>
+      </label>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-2">Notify for Buses</label>
+        <div class="grid grid-cols-2 gap-1.5 max-h-40 overflow-y-auto p-1" id="e-buses">
+          {% for bus in all_buses %}
+          <label class="flex items-center space-x-2 p-2 rounded-lg border border-slate-100 hover:border-blue-300 hover:bg-blue-50 cursor-pointer">
+            <input type="checkbox" name="bus_ids" value="{{ bus.id }}" data-bus-id="{{ bus.id }}" class="edit-bus-cb w-4 h-4 rounded border-slate-300 text-blue-600">
+            <span class="text-sm font-medium text-slate-700">{{ bus.identifier }}</span>
+            <span class="text-xs text-slate-400 truncate">{{ bus.name[:14] }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="flex justify-end space-x-2 pt-2 border-t border-slate-100">
+        <button type="button" onclick="document.getElementById('modal-edit').classList.add('hidden')"
+                class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
+        <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Save Changes</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Tab switching
+const NTABS = ['subscribers','groups','broadcast'];
+function showNTab(id) {
+  NTABS.forEach(t => {
+    document.getElementById('ntab-' + t).classList.toggle('hidden', t !== id);
+    const btn = document.getElementById('ntab-btn-' + t);
+    if (t === id) {
+      btn.classList.remove('text-slate-600','hover:bg-slate-50');
+      btn.classList.add('bg-blue-600','text-white','shadow-sm');
+    } else {
+      btn.classList.remove('bg-blue-600','text-white','shadow-sm');
+      btn.classList.add('text-slate-600','hover:bg-slate-50');
+    }
+  });
+  history.replaceState(null, '', '?tab=' + id);
+}
+
+// Subscriber edit modal
+function openEdit(id, first, last, email, phone, active, busIds, groupId) {
+  document.getElementById('form-edit').action = `/admin/notifications/${id}/edit`;
+  document.getElementById('e-first').value  = first;
+  document.getElementById('e-last').value   = last;
+  document.getElementById('e-email').value  = email;
+  document.getElementById('e-phone').value  = phone;
+  document.getElementById('e-active').checked = active;
+  document.getElementById('e-group').value  = groupId || '';
+  document.querySelectorAll('.edit-bus-cb').forEach(cb => {
+    cb.checked = busIds.includes(parseInt(cb.dataset.busId));
+  });
+  document.getElementById('modal-edit').classList.remove('hidden');
+}
+
+// Group edit card
+function openEditGroup(id, name, color, desc) {
+  document.getElementById('form-edit-group').action = `/admin/notifications/groups/${id}/edit`;
+  document.getElementById('eg-name').value = name;
+  document.getElementById('eg-desc').value = desc;
+  document.querySelectorAll('.edit-color-radio').forEach(r => {
+    r.checked = (r.value === color);
+    updateColorDot(r.nextElementSibling, r.checked);
+  });
+  document.getElementById('edit-group-card').classList.remove('hidden');
+  document.getElementById('edit-group-card').scrollIntoView({behavior:'smooth'});
+}
+
+// Color dot ring on select
+document.querySelectorAll('input[type=radio][name=color], input[type=radio].edit-color-radio').forEach(r => {
+  r.addEventListener('change', () => {
+    r.closest('.flex.flex-wrap').querySelectorAll('.color-dot').forEach(d => {
+      d.style.boxShadow = '';
+    });
+    updateColorDot(r.nextElementSibling, true);
+  });
+});
+function updateColorDot(dot, active) {
+  dot.style.boxShadow = active ? '0 0 0 3px white, 0 0 0 5px ' + getComputedStyle(dot).backgroundColor : '';
+}
+// Init color dots for checked radios
+document.querySelectorAll('input[type=radio][name=color]:checked, input[type=radio].edit-color-radio:checked').forEach(r => {
+  if (r.nextElementSibling) updateColorDot(r.nextElementSibling, true);
+});
+
+// Broadcast target toggle
+function onTargetChange(val) {
+  ['bc-groups','bc-sub','bc-user'].forEach(id => document.getElementById(id)?.classList.add('hidden'));
+  if (val === 'group')                   document.getElementById('bc-groups').classList.remove('hidden');
+  if (val === 'individual_subscriber')   document.getElementById('bc-sub').classList.remove('hidden');
+  if (val === 'individual_user')         document.getElementById('bc-user').classList.remove('hidden');
+}
+
+// Broadcast interval
+function onIntervalChange(val) {
+  const custom = document.getElementById('bc-interval-custom');
+  const label  = document.getElementById('bc-interval-label');
+  if (val === 'custom') {
+    custom.classList.remove('hidden');
+    label.textContent = '';
+  } else {
+    custom.classList.add('hidden');
+    label.textContent = val === '0' ? 'No delay — sends immediately' : `~${val}s between each email`;
+  }
+}
+
+// Broadcast send
+let pollTimer = null;
+async function sendBroadcast() {
+  const target   = document.querySelector('[name=bc_target]:checked')?.value || 'all';
+  const subject  = document.getElementById('bc-subject').value.trim();
+  const body     = document.getElementById('bc-body').value.trim();
+  const intSel   = document.getElementById('bc-interval').value;
+  const interval = intSel === 'custom'
+    ? parseInt(document.getElementById('bc-interval-custom').value || '0')
+    : parseInt(intSel);
+
+  if (!subject || !body) {
+    alert('Subject and message body are required.');
+    return;
+  }
+
+  const groupIds  = [...document.querySelectorAll('[name=bc_group_ids]:checked')].map(c => c.value);
+  const subId     = document.getElementById('bc-sub-select')?.value || null;
+  const userId    = document.getElementById('bc-user-select')?.value || null;
+
+  const btn = document.getElementById('btn-broadcast');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Starting…';
+
+  const resp = await fetch('/admin/notifications/broadcast', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({target, group_ids: groupIds, subscriber_id: subId,
+                          user_id: userId, subject, body, interval}),
+  });
+  const json = await resp.json();
+
+  if (!json.ok) {
+    alert(json.message);
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-paper-plane mr-2"></i>Send Message';
+    return;
+  }
+
+  // Show progress card
+  const card = document.getElementById('bc-progress-card');
+  card.classList.remove('hidden');
+  document.getElementById('bc-prog-title').textContent = `Sending to ${json.total} recipient${json.total !== 1 ? 's' : ''}…`;
+  document.getElementById('bc-done-msg').classList.add('hidden');
+  document.getElementById('bc-errors').classList.add('hidden');
+
+  pollTimer = setInterval(() => pollBroadcast(json.job_id, json.total), 1500);
+}
+
+async function pollBroadcast(jobId, total) {
+  const resp = await fetch(`/admin/notifications/broadcast/${jobId}/status`);
+  const job  = await resp.json();
+
+  const pct = total > 0 ? Math.round((job.sent + job.failed) / total * 100) : 100;
+  document.getElementById('bc-prog-bar').style.width = pct + '%';
+  document.getElementById('bc-prog-label').textContent =
+    `${job.sent} sent · ${job.failed} failed · ${total - job.sent - job.failed} remaining`;
+
+  if (job.done) {
+    clearInterval(pollTimer);
+    document.getElementById('bc-prog-icon').className = 'fas fa-check-circle text-emerald-500';
+    document.getElementById('bc-prog-title').textContent = `Completed — ${job.sent} sent, ${job.failed} failed`;
+    document.getElementById('bc-done-msg').classList.remove('hidden');
+    document.getElementById('bc-prog-bar').classList.replace('bg-blue-500', job.failed > 0 ? 'bg-amber-500' : 'bg-emerald-500');
+    if (job.errors?.length) {
+      const errDiv = document.getElementById('bc-errors');
+      errDiv.classList.remove('hidden');
+      errDiv.innerHTML = '<p class="text-xs font-semibold text-red-600 mb-1">Errors:</p>' +
+        job.errors.map(e => `<p class="text-xs text-red-500">${e}</p>`).join('');
+    }
+    const btn = document.getElementById('btn-broadcast');
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-paper-plane mr-2"></i>Send Message';
+  }
+}
+</script>
+{% endblock %}

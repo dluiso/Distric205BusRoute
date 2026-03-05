@@ -1,0 +1,319 @@
+{% extends "admin/base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
+{% block page_subtitle %}Overview for {{ today.strftime('%B %d, %Y') }}{% endblock %}
+{% block head %}<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>{% endblock %}
+
+{% block content %}
+<!-- Period Filter -->
+<div class="flex flex-wrap items-center gap-2 mb-5">
+  <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Period:</span>
+  {% for p, label in [('today','Today'),('week','This Week'),('month','This Month'),('year','This Year'),('custom','Custom')] %}
+  <a href="{{ url_for('dashboard', period=p) }}"
+     class="px-3 py-1.5 rounded-lg text-xs font-medium transition-all
+     {% if period==p %}bg-blue-600 text-white shadow-sm{% else %}bg-white text-slate-600 border border-slate-200 hover:border-blue-300{% endif %}">
+    {{ label }}
+  </a>
+  {% endfor %}
+  {% if period == 'custom' %}
+  <form method="GET" class="flex items-center space-x-2 ml-2">
+    <input type="hidden" name="period" value="custom">
+    <input type="date" name="date_from" value="{{ date_from }}" class="px-2 py-1.5 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <span class="text-slate-400 text-xs">to</span>
+    <input type="date" name="date_to" value="{{ date_to }}" class="px-2 py-1.5 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <button type="submit" class="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-medium">Apply</button>
+  </form>
+  {% endif %}
+</div>
+
+<!-- Stats Cards -->
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-3">
+  {% for icon, label, value, color, bg in [
+    ('fa-bus','Total Buses', total_buses, 'text-blue-600', 'bg-blue-100'),
+    ('fa-check-circle','On Time Today', on_time_count, 'text-emerald-600', 'bg-emerald-100'),
+    ('fa-exclamation-triangle','With Incidents', with_incidents, 'text-amber-600', 'bg-amber-100'),
+    ('fa-list-alt','Period Incidents', period_incidents, 'text-purple-600', 'bg-purple-100'),
+  ] %}
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 flex items-center space-x-4">
+    <div class="{{ bg }} {{ color }} w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0">
+      <i class="fas {{ icon }} text-xl"></i>
+    </div>
+    <div>
+      <p class="text-2xl font-extrabold text-slate-800">{{ value }}</p>
+      <p class="text-xs text-slate-500 font-medium">{{ label }}</p>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{% if pending_count %}
+<p class="text-xs text-amber-600 mb-4 flex items-center space-x-1">
+  <i class="fas fa-clock"></i>
+  <span>{{ pending_count }} incident{{ 's' if pending_count != 1 else '' }} pending confirmation — will commit automatically.</span>
+</p>
+{% else %}
+<div class="mb-4"></div>
+{% endif %}
+
+<!-- Live Bus Status Grid -->
+<div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden mb-6">
+  <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
+    <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+      <i class="fas fa-satellite-dish text-emerald-500 text-sm"></i>
+      <span>Live Status — Today</span>
+    </h3>
+    <span class="text-xs text-slate-400">{{ today.strftime('%A, %b %d') }}</span>
+  </div>
+  <div class="p-4">
+    {% if buses_today %}
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-3">
+      {% for item in buses_today %}
+      <div class="rounded-xl border p-3 text-center
+                  {% if item.status and not item.status.is_default %}border-amber-200 bg-amber-50{% else %}border-emerald-100 bg-emerald-50{% endif %}">
+        <div class="font-bold text-slate-800 text-sm">{{ item.bus.identifier }}</div>
+        <div class="text-xs text-slate-400 truncate mb-1.5">{{ item.bus.name[:18] }}</div>
+        {% if item.status %}
+        <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold text-white"
+              style="background-color:{{ item.status.color }}">{{ item.status.name }}</span>
+        {% else %}
+        <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-500 text-white">On Time</span>
+        {% endif %}
+        {% if item.eta %}
+        <div class="text-xs text-blue-600 mt-1 font-medium">ETA {{ item.eta }}</div>
+        {% endif %}
+        {% if item.delay and item.delay > 0 %}
+        <div class="text-xs text-amber-600 font-medium">+{{ item.delay }} min</div>
+        {% endif %}
+        {% if item.incidents and item.incidents[0].is_pending %}
+        <div class="text-xs text-slate-400 mt-0.5">⏳ pending</div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="text-center text-slate-400 text-sm py-6">No active buses configured</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-6">
+
+  <!-- Main Chart -->
+  <div class="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+        <i class="fas fa-chart-bar text-blue-500"></i><span>Incidents by Type</span>
+      </h3>
+      <div class="flex space-x-1" id="chart-type-btns">
+        {% for t, icon in [('bar','fa-chart-bar'),('doughnut','fa-circle-notch'),('pie','fa-chart-pie'),('line','fa-chart-line')] %}
+        <button onclick="switchChart('{{ t }}')" data-type="{{ t }}"
+                class="p-1.5 rounded-lg text-xs transition-all border border-slate-200 hover:border-blue-400 hover:text-blue-600 {% if t=='bar' %}bg-blue-50 border-blue-400 text-blue-600{% endif %}">
+          <i class="fas {{ icon }}"></i>
+        </button>
+        {% endfor %}
+      </div>
+    </div>
+    {% if by_type_json != '{}' %}
+    <div class="h-56">
+      <canvas id="mainChart"></canvas>
+    </div>
+    {% else %}
+    <div class="h-56 flex flex-col items-center justify-center text-slate-200">
+      <i class="fas fa-chart-bar text-5xl mb-3"></i>
+      <p class="text-slate-400 text-sm">No data for this period</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- By Bus Chart -->
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+    <h3 class="font-bold text-slate-700 flex items-center space-x-2 mb-4">
+      <i class="fas fa-bus text-blue-500"></i><span>By Bus</span>
+    </h3>
+    {% if by_bus_json != '{}' %}
+    <div class="h-56">
+      <canvas id="busChart"></canvas>
+    </div>
+    {% else %}
+    <div class="h-56 flex flex-col items-center justify-center text-slate-200">
+      <i class="fas fa-bus text-5xl mb-3"></i>
+      <p class="text-slate-400 text-sm">No data</p>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Trend + Quick Actions -->
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-6">
+  <!-- Trend -->
+  <div class="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+    <h3 class="font-bold text-slate-700 flex items-center space-x-2 mb-4">
+      <i class="fas fa-chart-line text-blue-500"></i><span>Incidents Over Time</span>
+    </h3>
+    {% if by_day_json != '{}' %}
+    <div class="h-40">
+      <canvas id="trendChart"></canvas>
+    </div>
+    {% else %}
+    <div class="h-40 flex flex-col items-center justify-center text-slate-200">
+      <p class="text-slate-400 text-sm">No trend data</p>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Quick actions -->
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+    <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
+      <i class="fas fa-bolt text-amber-500"></i><span>Quick Actions</span>
+    </h3>
+    <div class="space-y-2">
+      {% if current_user.has_access('buses','full') %}
+      <a href="{{ url_for('buses') }}" class="flex items-center space-x-3 p-3 bg-blue-50 hover:bg-blue-100 rounded-xl transition-colors group">
+        <div class="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:scale-110 transition-transform">
+          <i class="fas fa-bus text-white text-xs"></i></div>
+        <div><p class="text-sm font-medium text-blue-700">Record Incident</p><p class="text-xs text-blue-500">Assign bus status</p></div>
+        <i class="fas fa-chevron-right text-blue-400 ml-auto text-xs"></i>
+      </a>
+      {% endif %}
+      {% if current_user.has_access('statistics','limited') %}
+      <a href="{{ url_for('statistics') }}" class="flex items-center space-x-3 p-3 bg-purple-50 hover:bg-purple-100 rounded-xl transition-colors group">
+        <div class="w-8 h-8 bg-purple-500 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:scale-110 transition-transform">
+          <i class="fas fa-chart-bar text-white text-xs"></i></div>
+        <div><p class="text-sm font-medium text-purple-700">Statistics</p><p class="text-xs text-purple-500">Reports & exports</p></div>
+        <i class="fas fa-chevron-right text-purple-400 ml-auto text-xs"></i>
+      </a>
+      {% endif %}
+      <a href="{{ url_for('index') }}" target="_blank" class="flex items-center space-x-3 p-3 bg-emerald-50 hover:bg-emerald-100 rounded-xl transition-colors group">
+        <div class="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:scale-110 transition-transform">
+          <i class="fas fa-globe text-white text-xs"></i></div>
+        <div><p class="text-sm font-medium text-emerald-700">Public View</p><p class="text-xs text-emerald-500">Student/parent portal</p></div>
+        <i class="fas fa-external-link-alt text-emerald-400 ml-auto text-xs"></i>
+      </a>
+    </div>
+  </div>
+</div>
+
+<!-- Recent Incidents Table -->
+<div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+  <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
+    <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+      <i class="fas fa-history text-blue-500"></i>
+      <span>Recent Incidents</span>
+      {% if pending_count %}<span class="ml-2 px-2 py-0.5 bg-amber-100 text-amber-600 rounded-full text-xs font-semibold">{{ pending_count }} pending</span>{% endif %}
+    </h3>
+    <a href="{{ url_for('statistics') }}" class="text-xs text-blue-600 hover:text-blue-800">View all →</a>
+  </div>
+  {% if recent %}
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead><tr class="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider">
+        <th class="px-5 py-3 text-left">Date</th>
+        <th class="px-5 py-3 text-left">Bus</th>
+        <th class="px-5 py-3 text-left">Status</th>
+        <th class="px-5 py-3 text-left">Delay</th>
+        <th class="px-5 py-3 text-left">Schedule</th>
+        <th class="px-5 py-3 text-left">Recorded By</th>
+        <th class="px-5 py-3 text-left">Time</th>
+      </tr></thead>
+      <tbody class="divide-y divide-slate-50">
+        {% for r in recent %}
+        <tr class="transition-colors {% if r.is_pending %}bg-amber-50 hover:bg-amber-100{% else %}hover:bg-slate-50{% endif %}">
+          <td class="px-5 py-3 text-slate-500 text-xs">{{ r.incident_date.strftime('%b %d') }}</td>
+          <td class="px-5 py-3"><span class="font-bold text-slate-800">{{ r.bus.identifier }}</span> <span class="text-slate-500 text-xs">{{ r.bus.name[:20] }}</span></td>
+          <td class="px-5 py-3">
+            <span class="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-semibold text-white"
+                  style="background-color:{{ r.incident_type.color }}">
+              <i class="fas {{ r.incident_type.icon }} text-xs"></i>
+              <span>{{ r.incident_type.name }}</span>
+            </span>
+          </td>
+          <td class="px-5 py-3 text-slate-600">{% if r.delay_minutes %}<span class="text-amber-600 font-medium">{{ r.delay_minutes }} min</span>{% else %}—{% endif %}</td>
+          <td class="px-5 py-3 text-slate-500 text-xs">{{ r.schedule_type.name if r.schedule_type else '—' }}</td>
+          <td class="px-5 py-3 text-slate-500 text-xs">{{ r.created_by.username if r.created_by else '—' }}</td>
+          <td class="px-5 py-3 text-slate-400 text-xs">{{ r.created_at.strftime('%H:%M') }}{% if r.is_pending %}<span class="ml-1 text-amber-500 font-semibold" title="Pending confirmation">⏳ pending</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="py-16 text-center text-slate-300">
+    <i class="fas fa-check-circle text-5xl mb-3 block text-emerald-200"></i>
+    <p class="text-slate-400">No incidents for this period</p>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const byType   = {{ by_type_json|safe }};
+const byTypeCl = {{ by_type_colors_json|safe }};
+const byBus    = {{ by_bus_json|safe }};
+const byDay    = {{ by_day_json|safe }};
+
+let mainChart = null;
+
+function switchChart(type) {
+  document.querySelectorAll('#chart-type-btns button').forEach(b => {
+    b.classList.toggle('bg-blue-50', b.dataset.type === type);
+    b.classList.toggle('border-blue-400', b.dataset.type === type);
+    b.classList.toggle('text-blue-600', b.dataset.type === type);
+  });
+  if (mainChart) mainChart.destroy();
+  const ctx = document.getElementById('mainChart');
+  if (!ctx) return;
+  mainChart = new Chart(ctx, {
+    type: type,
+    data: {
+      labels: Object.keys(byType),
+      datasets: [{
+        label: 'Incidents',
+        data: Object.values(byType),
+        backgroundColor: byTypeCl.length ? byTypeCl : Object.keys(byType).map((_,i) => `hsl(${i*47},70%,55%)`),
+        borderColor: '#fff', borderWidth: 2,
+      }]
+    },
+    options: { responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: type !== 'bar', position: 'right' } },
+      scales: type === 'bar' || type === 'line' ? { y: { beginAtZero: true } } : {},
+    }
+  });
+}
+
+// Init main chart
+if (Object.keys(byType).length) switchChart('bar');
+
+// Bus chart
+if (Object.keys(byBus).length) {
+  new Chart(document.getElementById('busChart'), {
+    type: 'doughnut',
+    data: {
+      labels: Object.keys(byBus),
+      datasets: [{ data: Object.values(byBus), borderWidth: 2, borderColor: '#fff',
+        backgroundColor: Object.keys(byBus).map((_,i) => `hsl(${200+i*30},70%,55%)`) }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, cutout: '60%',
+      plugins: { legend: { position: 'right', labels: { boxWidth: 10, font: { size: 11 } } } } }
+  });
+}
+
+// Trend chart
+if (Object.keys(byDay).length) {
+  const sorted = Object.entries(byDay).sort();
+  new Chart(document.getElementById('trendChart'), {
+    type: 'line',
+    data: {
+      labels: sorted.map(([d]) => d),
+      datasets: [{ label: 'Incidents', data: sorted.map(([,v]) => v),
+        borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,.1)',
+        fill: true, tension: 0.4, pointRadius: 3 }]
+    },
+    options: { responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
+    }
+  });
+}
+</script>
+{% endblock %}

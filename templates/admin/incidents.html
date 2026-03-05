@@ -1,0 +1,249 @@
+{% extends "admin/base.html" %}
+{% block title %}Status Types{% endblock %}
+{% block page_title %}Status Types{% endblock %}
+{% block page_subtitle %}Manage incident and status categories{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-5">
+  <p class="text-sm text-slate-500">{{ incident_types|length }} status type{{ 's' if incident_types|length != 1 }}</p>
+  {% if can_write %}
+  <button onclick="document.getElementById('modal-add').classList.remove('hidden')"
+          class="inline-flex items-center space-x-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium shadow-sm transition-colors">
+    <i class="fas fa-plus"></i><span>New Status Type</span>
+  </button>
+  {% endif %}
+</div>
+
+<!-- Grid of status type cards -->
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+  {% for it in incident_types %}
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden flex flex-col">
+    <!-- Color header -->
+    <div class="h-2" style="background-color:{{ it.color }}"></div>
+    <div class="p-4 flex-1">
+      <div class="flex items-center space-x-3 mb-3">
+        <div class="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+             style="background-color:{{ it.color }}">
+          <i class="fas {{ it.icon }} text-white text-sm"></i>
+        </div>
+        <div class="min-w-0">
+          <p class="font-bold text-slate-800 truncate">{{ it.name }}</p>
+          <div class="flex items-center space-x-1 mt-0.5">
+            {% if it.is_default %}
+            <span class="text-xs bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full font-medium">Default</span>
+            {% endif %}
+            {% if it.is_system %}
+            <span class="text-xs bg-slate-100 text-slate-500 px-2 py-0.5 rounded-full font-medium">System</span>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      {% if it.description %}
+      <p class="text-xs text-slate-500 mb-3">{{ it.description }}</p>
+      {% endif %}
+      <div class="flex items-center space-x-2 text-xs text-slate-400">
+        <span class="font-mono bg-slate-50 px-2 py-0.5 rounded-lg border border-slate-100">{{ it.color }}</span>
+        <span class="font-mono bg-slate-50 px-2 py-0.5 rounded-lg border border-slate-100 truncate">{{ it.icon }}</span>
+      </div>
+    </div>
+    {% if can_write %}
+    <div class="px-4 py-3 bg-slate-50 border-t border-slate-100 flex items-center justify-end space-x-2">
+      <button onclick="openEdit({{ it.id }}, '{{ it.name|e }}', '{{ it.color }}', '{{ it.icon }}', '{{ it.description or '' }}')"
+              class="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:border-blue-400 hover:text-blue-600 transition-colors">
+        <i class="fas fa-edit mr-1"></i>Edit
+      </button>
+      {% if not it.is_system %}
+      <form method="POST" action="{{ url_for('delete_incident_type', type_id=it.id) }}"
+            onsubmit="return confirm('Delete \'{{ it.name }}\' ?')">
+        <button type="submit" class="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-red-500 hover:border-red-300 hover:bg-red-50 transition-colors">
+          <i class="fas fa-trash mr-1"></i>Delete
+        </button>
+      </form>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  {% if not incident_types %}
+  <div class="col-span-4 py-20 text-center text-slate-300">
+    <i class="fas fa-exclamation-circle text-5xl mb-3 block"></i>
+    <p class="text-slate-400">No status types found</p>
+  </div>
+  {% endif %}
+</div>
+
+<!-- Icon reference panel -->
+<div class="mt-6 bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+  <h3 class="font-bold text-slate-700 mb-3 flex items-center space-x-2">
+    <i class="fas fa-icons text-blue-500"></i><span>Common Icons Reference</span>
+  </h3>
+  <p class="text-xs text-slate-500 mb-3">Copy an icon class name for use when creating or editing status types.</p>
+  <div class="flex flex-wrap gap-2">
+    {% for ico in ['fa-check-circle','fa-clock','fa-ban','fa-exclamation-triangle','fa-laptop','fa-link',
+                   'fa-redo','fa-bus','fa-tools','fa-snowflake','fa-sun','fa-moon','fa-bolt',
+                   'fa-star','fa-flag','fa-bell','fa-info-circle','fa-times-circle','fa-question-circle',
+                   'fa-ambulance','fa-car-crash','fa-road','fa-traffic-light','fa-map-marker-alt'] %}
+    <button onclick="copyIcon('{{ ico }}')" title="{{ ico }}"
+            class="w-9 h-9 flex items-center justify-center bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-400 rounded-lg text-slate-600 hover:text-blue-600 transition-all text-sm"
+            id="ico-{{ ico|replace('fa-','') }}">
+      <i class="fas {{ ico }}"></i>
+    </button>
+    {% endfor %}
+  </div>
+  <p class="text-xs text-slate-400 mt-2">Click an icon to copy its class name to clipboard.</p>
+</div>
+
+<!-- ── MODAL: Add ── -->
+<div id="modal-add" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100">
+      <h2 class="font-bold text-slate-800">New Status Type</h2>
+      <button onclick="document.getElementById('modal-add').classList.add('hidden')" class="text-slate-400 hover:text-slate-600">
+        <i class="fas fa-times"></i>
+      </button>
+    </div>
+    <form method="POST" action="{{ url_for('add_incident_type') }}" class="px-6 py-5 space-y-4">
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Name <span class="text-red-500">*</span></label>
+        <input type="text" name="name" required placeholder="e.g. Mechanical Delay"
+               class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Color</label>
+          <div class="flex items-center space-x-2">
+            <input type="color" name="color" value="#6b7280" id="add-color-picker"
+                   class="w-10 h-10 rounded-lg border border-slate-200 cursor-pointer p-0.5"
+                   oninput="document.getElementById('add-color-hex').value=this.value">
+            <input type="text" id="add-color-hex" value="#6b7280" maxlength="7"
+                   class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+                   oninput="document.getElementById('add-color-picker').value=this.value">
+            <input type="hidden" name="color" id="add-color-final">
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Icon Class</label>
+          <div class="flex items-center space-x-2">
+            <div id="add-icon-preview" class="w-10 h-10 bg-slate-100 rounded-lg flex items-center justify-center text-slate-500">
+              <i class="fas fa-circle"></i>
+            </div>
+            <input type="text" name="icon" id="add-icon-input" value="fa-circle" placeholder="fa-circle"
+                   class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+                   oninput="updateIconPreview('add-icon-preview', this.value)">
+          </div>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Description</label>
+        <input type="text" name="description" placeholder="Optional description"
+               class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div class="flex justify-end space-x-2 pt-2">
+        <button type="button" onclick="document.getElementById('modal-add').classList.add('hidden')"
+                class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
+        <button type="submit" onclick="syncColor('add')"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Create</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ── MODAL: Edit ── -->
+<div id="modal-edit" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100">
+      <h2 class="font-bold text-slate-800">Edit Status Type</h2>
+      <button onclick="document.getElementById('modal-edit').classList.add('hidden')" class="text-slate-400 hover:text-slate-600">
+        <i class="fas fa-times"></i>
+      </button>
+    </div>
+    <form method="POST" id="form-edit" class="px-6 py-5 space-y-4">
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Name <span class="text-red-500">*</span></label>
+        <input type="text" name="name" id="edit-name" required
+               class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Color</label>
+          <div class="flex items-center space-x-2">
+            <input type="color" id="edit-color-picker"
+                   class="w-10 h-10 rounded-lg border border-slate-200 cursor-pointer p-0.5"
+                   oninput="document.getElementById('edit-color-hex').value=this.value">
+            <input type="text" id="edit-color-hex" maxlength="7"
+                   class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+                   oninput="document.getElementById('edit-color-picker').value=this.value">
+            <input type="hidden" name="color" id="edit-color-final">
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Icon Class</label>
+          <div class="flex items-center space-x-2">
+            <div id="edit-icon-preview" class="w-10 h-10 bg-slate-100 rounded-lg flex items-center justify-center text-slate-500">
+              <i class="fas fa-circle"></i>
+            </div>
+            <input type="text" name="icon" id="edit-icon-input" placeholder="fa-circle"
+                   class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+                   oninput="updateIconPreview('edit-icon-preview', this.value)">
+          </div>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Description</label>
+        <input type="text" name="description" id="edit-description"
+               class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div class="flex justify-end space-x-2 pt-2">
+        <button type="button" onclick="document.getElementById('modal-edit').classList.add('hidden')"
+                class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
+        <button type="submit" onclick="syncColor('edit')"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Save Changes</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function openEdit(id, name, color, icon, desc) {
+  document.getElementById('form-edit').action = `/admin/incidents/${id}/edit`;
+  document.getElementById('edit-name').value = name;
+  document.getElementById('edit-description').value = desc;
+  document.getElementById('edit-color-picker').value = color;
+  document.getElementById('edit-color-hex').value = color;
+  document.getElementById('edit-icon-input').value = icon;
+  updateIconPreview('edit-icon-preview', icon);
+  document.getElementById('modal-edit').classList.remove('hidden');
+}
+
+function updateIconPreview(previewId, iconClass) {
+  const el = document.getElementById(previewId);
+  el.innerHTML = `<i class="fas ${iconClass}"></i>`;
+}
+
+function syncColor(prefix) {
+  document.getElementById(`${prefix}-color-final`).value =
+    document.getElementById(`${prefix}-color-hex`).value;
+}
+
+// Fix: the color input needs to be the one submitted, sync on add form
+document.querySelector('#modal-add form').addEventListener('submit', function() {
+  syncColor('add');
+});
+document.getElementById('form-edit').addEventListener('submit', function() {
+  syncColor('edit');
+});
+
+function copyIcon(icon) {
+  navigator.clipboard.writeText(icon).then(() => {
+    const btn = document.getElementById('ico-' + icon.replace('fa-',''));
+    if (btn) {
+      btn.classList.add('bg-blue-100', 'border-blue-400', 'text-blue-600');
+      setTimeout(() => btn.classList.remove('bg-blue-100', 'border-blue-400', 'text-blue-600'), 1200);
+    }
+  });
+}
+</script>
+{% endblock %}

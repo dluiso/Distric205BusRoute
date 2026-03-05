@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Admin{% endblock %} — {{ get_config().app_name }}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+  {% block head %}{% endblock %}
+  <style>
+    [x-cloak]{display:none!important}
+    .sidebar-link {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.625rem 0.75rem;
+      border-radius: 0.75rem;
+      transition: background-color .15s, color .15s;
+      color: rgb(148 163 184);
+      font-size: 0.875rem;
+      font-weight: 500;
+      text-decoration: none;
+    }
+    .sidebar-link:hover {
+      background-color: rgb(30 41 59);
+      color: #fff;
+    }
+    .sidebar-link.active {
+      background-color: rgb(37 99 235);
+      color: #fff;
+      box-shadow: 0 4px 6px -1px rgb(0 0 0/.25);
+    }
+    .sidebar-link .icon {
+      width: 1.25rem;
+      text-align: center;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body class="bg-slate-100 h-full" x-data="{ sidebar: window.innerWidth >= 1024 }">
+
+<!-- Mobile overlay -->
+<div x-show="sidebar && window.innerWidth < 1024" x-cloak @click="sidebar=false"
+     class="fixed inset-0 bg-black/50 z-20 lg:hidden backdrop-blur-sm"></div>
+
+<!-- ── SIDEBAR ──────────────────────────────────────────────────── -->
+<aside x-cloak
+       :class="sidebar ? 'translate-x-0' : '-translate-x-full'"
+       class="fixed top-0 left-0 h-full w-64 bg-slate-900 flex flex-col z-30 transform transition-transform duration-200 ease-in-out lg:translate-x-0">
+
+  <!-- Brand -->
+  <div class="flex items-center space-x-3 px-5 py-5 border-b border-slate-700/50">
+    {% set cfg = get_config() %}
+    {% if cfg.logo_path %}
+    <img src="{{ cfg.logo_path }}" class="w-9 h-9 rounded-xl object-contain bg-white p-0.5" alt="logo">
+    {% else %}
+    <div class="w-9 h-9 bg-gradient-to-br from-blue-500 to-blue-700 rounded-xl flex items-center justify-center flex-shrink-0">
+      <i class="fas fa-bus text-white text-sm"></i>
+    </div>
+    {% endif %}
+    <div class="min-w-0">
+      <p class="text-white font-bold text-sm leading-tight truncate">{{ cfg.app_name }}</p>
+      <p class="text-slate-500 text-xs truncate">{{ cfg.app_subtitle }}</p>
+    </div>
+  </div>
+
+  <!-- Nav -->
+  <nav class="flex-1 px-3 py-4 space-y-0.5 overflow-y-auto">
+    <p class="text-slate-600 text-xs font-semibold uppercase tracking-widest px-3 mb-3">Main Menu</p>
+
+    <a href="{{ url_for('dashboard') }}"
+       class="sidebar-link {% if request.endpoint == 'dashboard' %}active{% endif %}">
+      <i class="fas fa-chart-pie icon"></i><span>Dashboard</span>
+    </a>
+
+    {% for mod in current_user.accessible_modules() %}
+    {% set ep_map = {'buses':'buses','incidents':'incidents','statistics':'statistics','users':'users','notifications':'notifications','config':'config_page'} %}
+    {% set ep = ep_map.get(mod.key, mod.key) %}
+    <a href="{{ url_for(ep) }}"
+       class="sidebar-link {% if request.endpoint == ep %}active{% endif %}">
+      <i class="fas {{ mod.icon }} icon"></i><span>{{ mod.label }}</span>
+    </a>
+    {% endfor %}
+
+    <div class="border-t border-slate-700/50 my-3"></div>
+    <p class="text-slate-600 text-xs font-semibold uppercase tracking-widest px-3 mb-2">Account</p>
+
+    <a href="{{ url_for('profile') }}"
+       class="sidebar-link {% if request.endpoint == 'profile' %}active{% endif %}">
+      <i class="fas fa-user-circle icon"></i><span>My Profile</span>
+    </a>
+    <a href="{{ url_for('index') }}" target="_blank" class="sidebar-link">
+      <i class="fas fa-external-link-alt icon"></i><span>Public View</span>
+    </a>
+    <a href="{{ url_for('logout') }}" class="sidebar-link text-red-400 hover:bg-red-900/30 hover:text-red-300">
+      <i class="fas fa-sign-out-alt icon"></i><span>Sign Out</span>
+    </a>
+  </nav>
+
+  <!-- User -->
+  <div class="px-4 py-4 border-t border-slate-700/50">
+    <div class="flex items-center space-x-3">
+      <div class="w-9 h-9 bg-gradient-to-br from-blue-400 to-indigo-600 rounded-full flex items-center justify-center flex-shrink-0">
+        <span class="text-white font-bold text-sm">{{ current_user.full_name[0].upper() if current_user.full_name else 'U' }}</span>
+      </div>
+      <div class="min-w-0">
+        <p class="text-white text-sm font-medium truncate">{{ current_user.full_name }}</p>
+        <p class="text-slate-500 text-xs truncate">{{ current_user.group.name if current_user.group else 'No group' }}</p>
+      </div>
+    </div>
+  </div>
+</aside>
+
+<!-- ── MAIN ─────────────────────────────────────────────────────── -->
+<div class="lg:ml-64 min-h-screen flex flex-col">
+
+  <!-- Top bar -->
+  <header class="bg-white border-b border-slate-200 shadow-sm sticky top-0 z-10">
+    <div class="flex items-center justify-between px-5 py-3.5">
+      <div class="flex items-center space-x-3">
+        <button @click="sidebar=!sidebar" class="lg:hidden text-slate-500 hover:text-slate-700 p-1">
+          <i class="fas fa-bars text-lg"></i>
+        </button>
+        <div>
+          <h1 class="text-lg font-bold text-slate-800">{% block page_title %}{% endblock %}</h1>
+          <p class="text-xs text-slate-400">{% block page_subtitle %}{% endblock %}</p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-3">
+        {% if current_user.group and current_user.group.is_admin %}
+        <span class="bg-amber-100 text-amber-700 text-xs px-2 py-1 rounded-full font-medium hidden sm:inline">
+          <i class="fas fa-shield-alt mr-1"></i>Administrator
+        </span>
+        {% endif %}
+        <span class="text-xs text-slate-400 hidden md:inline" id="topbar-date"></span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Flash messages -->
+  <div class="px-5 pt-4 space-y-2" id="flash-box">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    {% for cat, msg in messages %}
+    <div class="flex items-center space-x-2 px-4 py-3 rounded-xl border text-sm font-medium
+      {% if cat=='error' %}bg-red-50 text-red-700 border-red-200
+      {% elif cat=='success' %}bg-emerald-50 text-emerald-700 border-emerald-200
+      {% else %}bg-blue-50 text-blue-700 border-blue-200{% endif %}">
+      <i class="fas {% if cat=='error' %}fa-times-circle{% elif cat=='success' %}fa-check-circle{% else %}fa-info-circle{% endif %}"></i>
+      <span class="flex-1">{{ msg }}</span>
+      <button onclick="this.parentElement.remove()" class="opacity-40 hover:opacity-100 ml-2"><i class="fas fa-times text-xs"></i></button>
+    </div>
+    {% endfor %}
+    {% endif %}
+    {% endwith %}
+  </div>
+
+  <!-- Content -->
+  <main class="flex-1 px-5 py-5">
+    {% block content %}{% endblock %}
+  </main>
+</div>
+
+<meta name="csrf-token" content="{{ csrf_token() }}">
+<script>
+  document.getElementById('topbar-date').textContent =
+    new Date().toLocaleDateString('en-US', {weekday:'short',year:'numeric',month:'short',day:'numeric'});
+  setTimeout(() => {
+    document.querySelectorAll('#flash-box > div').forEach(el => {
+      el.style.transition = 'opacity .4s'; el.style.opacity = '0';
+      setTimeout(() => el.remove(), 400);
+    });
+  }, 6000);
+  // Auto-inject CSRF hidden field into every POST form
+  const _CSRF = document.querySelector('meta[name="csrf-token"]').content;
+  document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('form').forEach(function(f) {
+      if (f.method.toLowerCase() === 'post' && !f.querySelector('[name="_csrf"]')) {
+        const h = document.createElement('input');
+        h.type = 'hidden'; h.name = '_csrf'; h.value = _CSRF;
+        f.appendChild(h);
+      }
+    });
+  });
+  // Attach CSRF header to all non-GET fetch() calls
+  const _origFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    opts = opts || {};
+    if (opts.method && opts.method.toUpperCase() !== 'GET') {
+      opts.headers = Object.assign({}, opts.headers, {'X-CSRF-Token': _CSRF});
+    }
+    return _origFetch.call(this, url, opts);
+  };
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>
