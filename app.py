@@ -1388,6 +1388,64 @@ def statistics():
     period_bus_data = {k: v for k, v in period_bus_data.items() if v}
     record_buses = sorted({r.bus.identifier for r in records})
 
+    # ── Bus Audit ─────────────────────────────────────────────────────────
+    default_type = IncidentType.query.filter_by(is_default=True).first()
+    audit_buses_q = Bus.query.filter_by(active=True).order_by(Bus.identifier)
+    if bus_id:
+        audit_buses_q = audit_buses_q.filter_by(id=bus_id)
+    audit_buses_list = audit_buses_q.all()
+
+    total_days_in_range = (d_to - d_from).days + 1
+
+    # Days per bus that had at least one non-default incident
+    bus_incident_dates = {}
+    for r in records:
+        if not r.incident_type.is_default:
+            bus_incident_dates.setdefault(r.bus_id, set()).add(r.incident_date)
+
+    on_time_by_bus = {}
+    bus_audit      = {}
+    for bus in audit_buses_list:
+        inc_days = len(bus_incident_dates.get(bus.id, set()))
+        ot_days  = max(0, total_days_in_range - inc_days)
+        on_time_by_bus[bus.identifier] = ot_days
+        bus_delays = [r.delay_minutes for r in records
+                      if r.bus_id == bus.id and r.delay_minutes and r.delay_minutes > 0]
+        avg_d = round(sum(bus_delays) / len(bus_delays), 1) if bus_delays else 0.0
+        tot_d = sum(bus_delays)
+        rate  = round(ot_days / total_days_in_range * 100, 1) if total_days_in_range else 100.0
+        bus_audit[bus.identifier] = {
+            'name': bus.name, 'route': bus.route or '',
+            'total_days': total_days_in_range,
+            'on_time_days': ot_days, 'incident_days': inc_days,
+            'on_time_rate': rate, 'avg_delay': avg_d, 'total_delay': tot_d,
+        }
+
+    # Include On Time in the by_type chart (only when not filtered to a specific type)
+    on_time_total = sum(on_time_by_bus.values())
+    if on_time_total > 0 and default_type and not type_id:
+        by_type[default_type.name]        = on_time_total
+        by_type_colors[default_type.name] = default_type.color
+
+    # Stacked datasets for audit chart: {status_name: {data:[...], color:hex}}
+    audit_bus_order = [b.identifier for b in audit_buses_list]
+    audit_datasets  = {}
+    if default_type:
+        audit_datasets[default_type.name] = {
+            'data':  [on_time_by_bus.get(bid, 0) for bid in audit_bus_order],
+            'color': default_type.color,
+        }
+    for r in records:
+        if not r.incident_type.is_default:
+            n = r.incident_type.name
+            if n not in audit_datasets:
+                audit_datasets[n] = {
+                    'data':  [0] * len(audit_bus_order),
+                    'color': r.incident_type.color,
+                }
+            if r.bus.identifier in audit_bus_order:
+                audit_datasets[n]['data'][audit_bus_order.index(r.bus.identifier)] += 1
+
     all_buses  = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
     all_types  = IncidentType.query.order_by(IncidentType.sort_order).all()
     can_export = current_user.has_access('statistics', 'limited')
@@ -1403,6 +1461,11 @@ def statistics():
         avg_delay_json=json.dumps(avg_delay_final),
         period_bus_json=json.dumps(period_bus_data),
         record_buses_json=json.dumps(record_buses),
+        bus_audit_json=json.dumps(bus_audit),
+        audit_datasets_json=json.dumps(audit_datasets),
+        audit_bus_order_json=json.dumps(audit_bus_order),
+        default_type_name=(default_type.name if default_type else 'On Time'),
+        total_days_in_range=total_days_in_range,
         total=len(records), all_buses=all_buses, all_types=all_types,
         can_export=can_export, today=today,
     )
@@ -1448,11 +1511,39 @@ def export_statistics(fmt):
         r.notes or '', r.created_by.username if r.created_by else '',
     ] for r in records]
 
+    # ── Bus Audit for export ──────────────────────────────────────────────
+    default_type_exp = IncidentType.query.filter_by(is_default=True).first()
+    exp_buses_q = Bus.query.filter_by(active=True).order_by(Bus.identifier)
+    if bus_id:
+        exp_buses_q = exp_buses_q.filter_by(id=bus_id)
+    exp_buses_list = exp_buses_q.all()
+    total_days_exp = (d_to - d_from).days + 1
+    bus_inc_dates_exp = {}
+    for r in records:
+        if not r.incident_type.is_default:
+            bus_inc_dates_exp.setdefault(r.bus_id, set()).add(r.incident_date)
+    audit_headers = ['Bus ID','Bus Name','Route','Total Days','On-Time Days',
+                     'Incident Days','On-Time Rate (%)','Avg Delay (min)','Total Delay (min)']
+    audit_rows = []
+    for bus in exp_buses_list:
+        inc_d = len(bus_inc_dates_exp.get(bus.id, set()))
+        ot_d  = max(0, total_days_exp - inc_d)
+        bdel  = [r.delay_minutes for r in records
+                 if r.bus_id == bus.id and r.delay_minutes and r.delay_minutes > 0]
+        avg_d = round(sum(bdel)/len(bdel), 1) if bdel else 0.0
+        rate  = round(ot_d / total_days_exp * 100, 1) if total_days_exp else 100.0
+        audit_rows.append([bus.identifier, bus.name, bus.route or '',
+                           total_days_exp, ot_d, inc_d, rate, avg_d, sum(bdel)])
+
     if fmt == 'csv':
         output = io.StringIO()
         w = csv.writer(output)
         w.writerow(headers)
         w.writerows(rows)
+        w.writerow([])
+        w.writerow(['Bus Audit Summary'])
+        w.writerow(audit_headers)
+        w.writerows(audit_rows)
         resp = make_response(output.getvalue())
         resp.headers['Content-Type'] = 'text/csv'
         resp.headers['Content-Disposition'] = f'attachment; filename="bus_report_{d_from}_{d_to}.csv"'
@@ -1532,6 +1623,30 @@ def export_statistics(fmt):
             pdf.ln()
             alt = not alt
 
+        # ── Bus Audit table ──────────────────────────────────────────────
+        pdf.ln(6)
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_text_color(30, 64, 175)
+        pdf.cell(0, 6, 'Bus Audit Summary', ln=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(1)
+        a_widths = [22, 45, 38, 22, 22, 22, 28, 28, 28]
+        pdf.set_font('Helvetica', 'B', 7)
+        pdf.set_fill_color(30, 64, 175)
+        pdf.set_text_color(255, 255, 255)
+        for h, w in zip(audit_headers, a_widths):
+            pdf.cell(w, 7, _pdf_safe(h), border=0, fill=True, align='C')
+        pdf.ln()
+        pdf.set_font('Helvetica', '', 7)
+        pdf.set_text_color(15, 23, 42)
+        alt = False
+        for row in audit_rows:
+            pdf.set_fill_color(241, 245, 249) if alt else pdf.set_fill_color(255, 255, 255)
+            for val, w in zip(row, a_widths):
+                pdf.cell(w, 6, _pdf_safe(str(val))[:30], border=0, fill=True)
+            pdf.ln()
+            alt = not alt
+
         resp = make_response(bytes(pdf.output()))
         resp.headers['Content-Type'] = 'application/pdf'
         resp.headers['Content-Disposition'] = f'attachment; filename="bus_report_{d_from}_{d_to}.pdf"'
@@ -1546,6 +1661,15 @@ def export_statistics(fmt):
             table.rows[0].cells[i].text = h
         for row in rows:
             cells = table.add_row().cells
+            for i, val in enumerate(row):
+                cells[i].text = str(val)
+        doc.add_heading('Bus Audit Summary', level=2)
+        a_table = doc.add_table(rows=1, cols=len(audit_headers))
+        a_table.style = 'Table Grid'
+        for i, h in enumerate(audit_headers):
+            a_table.rows[0].cells[i].text = h
+        for row in audit_rows:
+            cells = a_table.add_row().cells
             for i, val in enumerate(row):
                 cells[i].text = str(val)
         buf = io.BytesIO()

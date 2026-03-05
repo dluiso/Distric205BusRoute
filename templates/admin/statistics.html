@@ -179,6 +179,87 @@
   {% endif %}
 </div>
 
+<!-- ══ Bus Audit / Auditoría del Bus ══════════════════════════════════════════ -->
+<div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 mb-5">
+  <!-- Section header -->
+  <div class="flex items-center justify-between mb-5">
+    <div>
+      <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+        <i class="fas fa-shield-alt text-emerald-500"></i>
+        <span>Bus Audit &mdash; Auditoría del Bus</span>
+      </h3>
+      <p class="text-xs text-slate-400 mt-0.5">On-time rates, delay averages, and efficiency metrics for the selected period</p>
+    </div>
+    <span class="text-xs px-3 py-1 bg-emerald-50 text-emerald-600 border border-emerald-200 rounded-full font-medium">
+      {{ total_days_in_range }} day{{ 's' if total_days_in_range != 1 else '' }} tracked
+    </span>
+  </div>
+
+  <!-- KPI cards — populated by JS -->
+  <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-5" id="audit-kpi-cards"></div>
+
+  <!-- Two-column charts -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
+    <!-- Stacked bar: status distribution per bus (2/3 width) -->
+    <div class="lg:col-span-2 bg-slate-50 rounded-xl p-4 border border-slate-100">
+      <p class="text-sm font-semibold text-slate-600 mb-3">
+        <i class="fas fa-chart-bar text-emerald-500 mr-1.5"></i>Status Distribution per Bus
+      </p>
+      <div class="h-64"><canvas id="auditStackedChart"></canvas></div>
+      <p class="text-xs text-slate-400 mt-2 text-center">
+        <i class="fas fa-info-circle mr-1"></i>Stacked days: On Time (green) + each incident type per bus
+      </p>
+    </div>
+    <!-- Horizontal bar: avg delay per bus (1/3 width) -->
+    <div class="bg-slate-50 rounded-xl p-4 border border-slate-100">
+      <p class="text-sm font-semibold text-slate-600 mb-3">
+        <i class="fas fa-stopwatch text-amber-500 mr-1.5"></i>Avg Delay by Bus (min)
+      </p>
+      <div class="h-64" id="audit-delay-wrap"><canvas id="auditDelayChart"></canvas></div>
+      <p class="text-xs text-slate-400 mt-2 text-center hidden" id="audit-delay-none">
+        <i class="fas fa-check-circle mr-1 text-emerald-400"></i>No delay data — all buses on time!
+      </p>
+    </div>
+  </div>
+
+  <!-- Efficiency table -->
+  <div>
+    <div class="flex items-center justify-between mb-3">
+      <p class="text-sm font-semibold text-slate-600">
+        <i class="fas fa-table text-slate-400 mr-1.5"></i>Bus Efficiency Summary
+      </p>
+      <p class="text-xs text-slate-400">
+        <i class="fas fa-sort mr-1"></i>Click column headers to sort &nbsp;·&nbsp;
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-0.5"></span>≥80%
+        <span class="inline-block w-2 h-2 rounded-full bg-yellow-400 mx-0.5"></span>60–79%
+        <span class="inline-block w-2 h-2 rounded-full bg-red-400 mx-0.5"></span>&lt;60%
+      </p>
+    </div>
+    <div class="overflow-x-auto rounded-xl border border-slate-100">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider">
+            <th class="px-4 py-3 text-left cursor-pointer hover:text-blue-600 select-none" onclick="sortAuditTable(0)">Bus ID <i class="fas fa-sort ml-1 opacity-40"></i></th>
+            <th class="px-4 py-3 text-left cursor-pointer hover:text-blue-600 select-none" onclick="sortAuditTable(1)">Name <i class="fas fa-sort ml-1 opacity-40"></i></th>
+            <th class="px-4 py-3 text-left">Route</th>
+            <th class="px-4 py-3 text-center cursor-pointer hover:text-blue-600 select-none" onclick="sortAuditTable(3)">Total Days <i class="fas fa-sort ml-1 opacity-40"></i></th>
+            <th class="px-4 py-3 text-center cursor-pointer hover:text-blue-600 select-none" onclick="sortAuditTable(4)">On-Time <i class="fas fa-sort ml-1 opacity-40"></i></th>
+            <th class="px-4 py-3 text-center cursor-pointer hover:text-blue-600 select-none" onclick="sortAuditTable(5)">Incidents <i class="fas fa-sort ml-1 opacity-40"></i></th>
+            <th class="px-4 py-3 text-center cursor-pointer hover:text-blue-600 select-none" onclick="sortAuditTable(6)">On-Time Rate <i class="fas fa-sort ml-1 opacity-40"></i></th>
+            <th class="px-4 py-3 text-center cursor-pointer hover:text-blue-600 select-none" onclick="sortAuditTable(7)">Avg Delay <i class="fas fa-sort ml-1 opacity-40"></i></th>
+            <th class="px-4 py-3 text-center cursor-pointer hover:text-blue-600 select-none" onclick="sortAuditTable(8)">Total Delay <i class="fas fa-sort ml-1 opacity-40"></i></th>
+          </tr>
+        </thead>
+        <tbody id="audit-tbody" class="divide-y divide-slate-50">
+          <tr><td colspan="9" class="px-4 py-8 text-center text-slate-300 text-sm" id="audit-table-loading">
+            <i class="fas fa-spinner fa-spin mr-2"></i>Loading…
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <!-- Export & Email -->
 {% if can_export %}
 <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 mb-5">
@@ -279,12 +360,17 @@
 
 {% block scripts %}
 <script>
-const byType       = {{ by_type_json|safe }};
-const byTypeCl     = {{ by_type_colors_json|safe }};
-const byBus        = {{ by_bus_json|safe }};
-const byDay        = {{ by_day_json|safe }};
+const byType        = {{ by_type_json|safe }};
+const byTypeCl      = {{ by_type_colors_json|safe }};
+const byBus         = {{ by_bus_json|safe }};
+const byDay         = {{ by_day_json|safe }};
 const periodBusData = {{ period_bus_json|safe }};
-const recordBuses  = {{ record_buses_json|safe }};
+const recordBuses   = {{ record_buses_json|safe }};
+const busAudit      = {{ bus_audit_json|safe }};
+const auditDatasets = {{ audit_datasets_json|safe }};
+const auditBusOrder = {{ audit_bus_order_json|safe }};
+const DEFAULT_TYPE  = '{{ default_type_name }}';
+const AUDIT_DAYS    = {{ total_days_in_range }};
 
 let mainChart = null;
 
@@ -413,6 +499,181 @@ function filterPeriodChart(active) {
 
 if (recordBuses.length && Object.keys(periodBusData).length) {
   filterPeriodChart('all');
+}
+
+// ── Bus Audit ─────────────────────────────────────────────────────────────────
+
+function _hexRgba(color, alpha) {
+  let c = (color || '#6b7280').trim();
+  if (!c.startsWith('#')) return color;
+  c = c.slice(1);
+  if (c.length === 3) c = c[0]+c[0]+c[1]+c[1]+c[2]+c[2];
+  if (c.length !== 6) return color;
+  const r = parseInt(c.slice(0,2),16), g = parseInt(c.slice(2,4),16), b = parseInt(c.slice(4,6),16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function _delayColor(min) {
+  if (min <= 5)  return '#22c55e';
+  if (min <= 20) return '#f59e0b';
+  return '#ef4444';
+}
+
+// KPI cards
+function initAuditKPIs() {
+  const keys = Object.keys(busAudit);
+  if (!keys.length) return;
+  const totalBusDays  = keys.length * AUDIT_DAYS;
+  const rates         = keys.map(k => busAudit[k].on_time_rate);
+  const overallRate   = (rates.reduce((a,b) => a+b, 0) / rates.length).toFixed(1);
+  const bestKey       = keys.reduce((a,b) => busAudit[a].on_time_rate >= busAudit[b].on_time_rate ? a : b);
+  const worstKey      = keys.reduce((a,b) => busAudit[a].incident_days >= busAudit[b].incident_days ? a : b);
+  const delayVals     = keys.filter(k => busAudit[k].avg_delay > 0).map(k => busAudit[k].avg_delay);
+  const avgDelayAll   = delayVals.length ? (delayVals.reduce((a,b) => a+b, 0)/delayVals.length).toFixed(1) : '0';
+  const cards = [
+    { icon:'fa-calendar-check', label:'Bus-Days Tracked',  value: totalBusDays,         color:'text-blue-600',    bg:'bg-blue-100'    },
+    { icon:'fa-check-circle',   label:'Avg On-Time Rate',  value: overallRate + '%',     color:'text-emerald-600', bg:'bg-emerald-100' },
+    { icon:'fa-star',           label:'Most Punctual Bus', value: bestKey,               color:'text-yellow-600',  bg:'bg-yellow-100'  },
+    { icon:'fa-clock',          label:'Avg Delay Overall', value: avgDelayAll + ' min',  color:'text-amber-600',   bg:'bg-amber-100'   },
+  ];
+  const el = document.getElementById('audit-kpi-cards');
+  if (el) el.innerHTML = cards.map(c => `
+    <div class="bg-slate-50 rounded-xl border border-slate-100 p-4 flex items-center space-x-3">
+      <div class="${c.bg} ${c.color} w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0">
+        <i class="fas ${c.icon}"></i>
+      </div>
+      <div>
+        <p class="text-xl font-extrabold text-slate-800">${c.value}</p>
+        <p class="text-xs text-slate-500">${c.label}</p>
+      </div>
+    </div>`).join('');
+}
+
+// Stacked bar: status distribution per bus
+function initAuditStackedChart() {
+  const ctx = document.getElementById('auditStackedChart');
+  if (!ctx || !auditBusOrder.length) return;
+  const datasets = Object.entries(auditDatasets).map(([name, ds]) => ({
+    label: name,
+    data: ds.data,
+    backgroundColor: _hexRgba(ds.color, 0.8),
+    borderColor: ds.color,
+    borderWidth: 1,
+    borderRadius: 3,
+  }));
+  new Chart(ctx, {
+    type: 'bar',
+    data: { labels: auditBusOrder, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'top', labels: { boxWidth: 12, padding: 14, font: { size: 11 } } },
+        tooltip: { callbacks: {
+          title: items => 'Bus ' + items[0].label,
+          label: item => ` ${item.dataset.label}: ${item.raw} day${item.raw !== 1 ? 's' : ''}`,
+        }},
+      },
+      scales: {
+        x: { stacked: true, grid: { display: false }, ticks: { font: { size: 11 } } },
+        y: { stacked: true, beginAtZero: true,
+             ticks: { stepSize: 1, font: { size: 11 } },
+             grid: { color: 'rgba(226,232,240,0.6)' } },
+      },
+    }
+  });
+}
+
+// Horizontal bar: avg delay per bus
+function initAuditDelayChart() {
+  const withDelay = auditBusOrder.filter(b => busAudit[b] && busAudit[b].avg_delay > 0);
+  if (!withDelay.length) {
+    const wrap = document.getElementById('audit-delay-wrap');
+    const none = document.getElementById('audit-delay-none');
+    if (wrap) wrap.style.display = 'none';
+    if (none) none.classList.remove('hidden');
+    return;
+  }
+  const ctx = document.getElementById('auditDelayChart');
+  if (!ctx) return;
+  const data = withDelay.map(b => busAudit[b].avg_delay);
+  new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: withDelay,
+      datasets: [{
+        label: 'Avg Delay (min)', data,
+        backgroundColor: data.map(v => _hexRgba(_delayColor(v), 0.75)),
+        borderColor: data.map(v => _delayColor(v)),
+        borderWidth: 1, borderRadius: 4,
+      }]
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: item => ` ${item.raw} min avg delay` } },
+      },
+      scales: {
+        x: { beginAtZero: true, ticks: { font: { size: 11 } }, grid: { color: 'rgba(226,232,240,0.6)' } },
+        y: { grid: { display: false }, ticks: { font: { size: 11 } } },
+      },
+    }
+  });
+}
+
+// Efficiency table (sortable)
+let _auditSort = { col: 6, asc: false };
+
+function buildAuditTable() {
+  const tbody = document.getElementById('audit-tbody');
+  if (!tbody) return;
+  const keys = Object.keys(busAudit);
+  if (!keys.length) {
+    tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-10 text-center text-slate-300 text-sm"><i class="fas fa-bus text-3xl block mb-2"></i>No bus data</td></tr>';
+    return;
+  }
+  const COLS = ['_id','name','route','total_days','on_time_days','incident_days','on_time_rate','avg_delay','total_delay'];
+  const sorted = [...keys].sort((a, b) => {
+    const col = COLS[_auditSort.col];
+    const va  = col === '_id' ? a : busAudit[a][col];
+    const vb  = col === '_id' ? b : busAudit[b][col];
+    const cmp = typeof va === 'string' ? va.localeCompare(vb) : (va - vb);
+    return _auditSort.asc ? cmp : -cmp;
+  });
+  tbody.innerHTML = sorted.map(bid => {
+    const d    = busAudit[bid];
+    const rate = d.on_time_rate;
+    const rateCls = rate >= 80 ? 'bg-emerald-100 text-emerald-700' : rate >= 60 ? 'bg-yellow-100 text-yellow-700' : 'bg-red-100 text-red-700';
+    const delayHtml = d.avg_delay > 0
+      ? `<span style="color:${_delayColor(d.avg_delay)}" class="font-semibold">${d.avg_delay} min</span>`
+      : '<span class="text-slate-300">—</span>';
+    return `<tr class="hover:bg-slate-50 transition-colors">
+      <td class="px-4 py-3 font-bold text-slate-800">${bid}</td>
+      <td class="px-4 py-3 text-slate-600 text-xs">${d.name}</td>
+      <td class="px-4 py-3 text-slate-400 text-xs">${d.route || '—'}</td>
+      <td class="px-4 py-3 text-center text-slate-500 text-xs">${d.total_days}</td>
+      <td class="px-4 py-3 text-center text-emerald-600 font-medium text-xs">${d.on_time_days}</td>
+      <td class="px-4 py-3 text-center text-red-500 text-xs">${d.incident_days}</td>
+      <td class="px-4 py-3 text-center"><span class="inline-block px-2 py-0.5 rounded-full text-xs font-bold ${rateCls}">${rate}%</span></td>
+      <td class="px-4 py-3 text-center">${delayHtml}</td>
+      <td class="px-4 py-3 text-center text-slate-500 text-xs">${d.total_delay > 0 ? d.total_delay + ' min' : '—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function sortAuditTable(col) {
+  _auditSort = { col, asc: _auditSort.col === col ? !_auditSort.asc : col <= 2 };
+  buildAuditTable();
+}
+
+if (Object.keys(busAudit).length) {
+  initAuditKPIs();
+  initAuditStackedChart();
+  initAuditDelayChart();
+  buildAuditTable();
+} else {
+  const el = document.getElementById('audit-table-loading');
+  if (el) el.innerHTML = '<i class="fas fa-bus text-3xl block mb-2 text-slate-200"></i>No active buses found';
 }
 </script>
 {% endblock %}
