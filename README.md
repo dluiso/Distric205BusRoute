@@ -307,4 +307,4 @@ This project is proprietary software developed for District 205.
 
 ---
 
-*Powered by [Avidity Technologies Inc](https://aviditytech.com)*
+*Powered by [SmartFiche](https://smartfiche.com)*
