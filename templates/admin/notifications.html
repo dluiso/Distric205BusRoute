@@ -28,21 +28,6 @@
 
 <!-- ══ SUBSCRIBERS TAB ══ -->
 <div id="ntab-subscribers" class="{% if active_tab != 'subscribers' %}hidden{% endif %}">
-  <div class="flex items-center justify-between mb-4">
-    <p class="text-sm text-slate-500">
-      {{ subscribers|length }} subscriber{{ 's' if subscribers|length != 1 }}
-      &middot;
-      {% set notif_count = namespace(v=0) %}
-      {% for u in admin_users if u.receive_notifications %}{% set notif_count.v = notif_count.v + 1 %}{% endfor %}
-      {{ notif_count.v }} admin user{{ 's' if notif_count.v != 1 }} receiving alerts
-    </p>
-    {% if can_write %}
-    <button onclick="document.getElementById('modal-add').classList.remove('hidden')"
-            class="inline-flex items-center space-x-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium shadow-sm">
-      <i class="fas fa-plus"></i><span>Add Subscriber</span>
-    </button>
-    {% endif %}
-  </div>
 
   <!-- Admin users section -->
   {% set notif_users = [] %}
@@ -51,7 +36,7 @@
   <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden mb-4">
     <div class="px-5 py-3 border-b border-slate-100 bg-slate-50 flex items-center space-x-2">
       <i class="fas fa-user-shield text-blue-500 text-xs"></i>
-      <span class="font-semibold text-slate-600 text-sm">Admin Users</span>
+      <span class="font-semibold text-slate-600 text-sm">Admin Users receiving alerts</span>
       <span class="ml-auto text-xs text-slate-400 bg-slate-200 px-2 py-0.5 rounded-full">{{ notif_users|length }}</span>
     </div>
     <div class="divide-y divide-slate-50">
@@ -74,128 +59,153 @@
   </div>
   {% endif %}
 
-  <!-- Ungrouped subscribers -->
-  {% set ungrouped = [] %}
-  {% for s in subscribers if s.group_id is none %}{% set _ = ungrouped.append(s) %}{% endfor %}
-  {% if ungrouped %}
-  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden mb-4">
-    <div class="px-5 py-3 border-b border-slate-100 bg-slate-50 flex items-center space-x-2">
-      <i class="fas fa-user text-slate-400 text-xs"></i>
-      <span class="font-semibold text-slate-600 text-sm">No Group</span>
-      <span class="ml-auto text-xs text-slate-400 bg-slate-200 px-2 py-0.5 rounded-full">{{ ungrouped|length }}</span>
+  <!-- ─ Toolbar ─ -->
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-3 mb-3 flex flex-wrap items-center gap-2">
+    <!-- Search -->
+    <div class="relative flex-1 min-w-48">
+      <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs"></i>
+      <input id="sub-search" type="text" placeholder="Search by name, email, phone…"
+             oninput="filterAndPage()"
+             class="w-full pl-8 pr-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
     </div>
-    <div class="divide-y divide-slate-50">
-    {% for s in ungrouped %}
-    <div class="px-5 py-3 flex items-center space-x-3 hover:bg-slate-50 transition-colors">
-      <div class="w-8 h-8 bg-gradient-to-br from-purple-400 to-indigo-600 rounded-full flex items-center justify-center flex-shrink-0">
-        <span class="text-white font-bold text-xs">{{ ((s.first_name or s.last_name or 'S')[0]).upper() }}</span>
-      </div>
-      <div class="flex-1 min-w-0">
-        <p class="font-medium text-slate-800 text-sm">{{ s.full_name or 'Unknown' }}</p>
-        <div class="flex flex-wrap gap-2 mt-0.5">
-          {% if s.email %}<span class="text-xs text-slate-500"><i class="fas fa-envelope mr-1 text-slate-400"></i>{{ s.email }}</span>{% endif %}
-          {% if s.phone %}<span class="text-xs text-slate-500"><i class="fas fa-phone mr-1 text-slate-400"></i>{{ s.phone }}</span>{% endif %}
-        </div>
-      </div>
-      <div class="flex flex-wrap gap-1 max-w-xs">
-        {% for a in s.bus_assignments %}
-        <span class="px-1.5 py-0.5 bg-blue-50 text-blue-700 text-xs font-medium rounded border border-blue-100">{{ a.bus.identifier }}</span>
-        {% else %}<span class="text-xs text-slate-400">No buses</span>{% endfor %}
-      </div>
-      <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium
-        {% if s.active %}bg-emerald-100 text-emerald-700{% else %}bg-red-100 text-red-600{% endif %}">
-        <span class="w-1.5 h-1.5 rounded-full mr-1 {% if s.active %}bg-emerald-500{% else %}bg-red-400{% endif %}"></span>
-        {{ 'Active' if s.active else 'Inactive' }}
-      </span>
+    <!-- Group filter -->
+    <select id="sub-group-filter" onchange="filterAndPage()"
+            class="px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+      <option value="">All Groups</option>
+      <option value="__none__">No Group</option>
+      {% for grp in groups %}
+      <option value="{{ grp.id }}">{{ grp.name }}</option>
+      {% endfor %}
+    </select>
+    <!-- Status filter -->
+    <select id="sub-status-filter" onchange="filterAndPage()"
+            class="px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+      <option value="">All Status</option>
+      <option value="active">Active only</option>
+      <option value="inactive">Inactive only</option>
+    </select>
+    <!-- Page size -->
+    <select id="sub-page-size" onchange="filterAndPage()"
+            class="px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+      <option value="20" selected>20 / page</option>
+      <option value="50">50 / page</option>
+      <option value="80">80 / page</option>
+      <option value="100">100 / page</option>
+      <option value="200">200 / page</option>
+      <option value="9999">All</option>
+    </select>
+    <!-- Actions -->
+    <div class="flex items-center gap-2 ml-auto">
+      <a href="{{ url_for('export_subscribers_csv') }}"
+         class="inline-flex items-center gap-1.5 px-3 py-2 border border-slate-200 hover:border-emerald-400 text-slate-600 hover:text-emerald-700 rounded-xl text-sm font-medium transition-colors">
+        <i class="fas fa-file-csv text-xs"></i>Export CSV
+      </a>
       {% if can_write %}
-      <div class="flex items-center space-x-1 flex-shrink-0">
-        <button onclick="openEdit({{ s.id }}, '{{ s.first_name or '' }}', '{{ s.last_name or '' }}', '{{ s.email or '' }}', '{{ s.phone or '' }}', {{ s.active|lower }}, [{{ s.bus_assignments|map(attribute='bus_id')|join(',') }}], {{ s.group_id or 'null' }})"
-                class="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors">
-          <i class="fas fa-edit text-sm"></i>
-        </button>
-        <form method="POST" action="{{ url_for('delete_subscriber', sid=s.id) }}"
-              onsubmit="return confirm('Remove {{ s.full_name or 'this subscriber' }}?')">
-          <button type="submit" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
-            <i class="fas fa-trash text-sm"></i>
-          </button>
-        </form>
-      </div>
+      <button onclick="document.getElementById('modal-import').classList.remove('hidden')"
+              class="inline-flex items-center gap-1.5 px-3 py-2 border border-slate-200 hover:border-blue-400 text-slate-600 hover:text-blue-700 rounded-xl text-sm font-medium transition-colors">
+        <i class="fas fa-file-import text-xs"></i>Import CSV
+      </button>
+      <button onclick="openAddModal()"
+              class="inline-flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium shadow-sm transition-colors">
+        <i class="fas fa-plus text-xs"></i>Add Subscriber
+      </button>
       {% endif %}
     </div>
-    {% endfor %}
+  </div>
+
+  <!-- ─ Bulk action bar (hidden until selection > 0) ─ -->
+  {% if can_write %}
+  <div id="bulk-bar" class="hidden bg-blue-50 border border-blue-200 rounded-2xl px-4 py-2.5 mb-3 flex flex-wrap items-center gap-3">
+    <span class="text-sm font-medium text-blue-800">
+      <span id="bulk-count">0</span> subscriber(s) selected
+    </span>
+    <div class="flex items-center gap-2 ml-auto flex-wrap">
+      <!-- Select by group quick buttons -->
+      <div class="flex items-center gap-1">
+        <span class="text-xs text-blue-600 font-medium">Select group:</span>
+        <button onclick="selectByGroup('')" title="Select all visible"
+                class="px-2 py-1 text-xs bg-blue-100 hover:bg-blue-200 text-blue-700 rounded-lg transition-colors font-medium">All visible</button>
+        {% for grp in groups %}
+        <button onclick="selectByGroup('{{ grp.id }}')"
+                class="px-2 py-1 text-xs bg-white border border-blue-200 hover:bg-blue-100 text-blue-700 rounded-lg transition-colors font-medium">
+          {{ grp.name }}
+        </button>
+        {% endfor %}
+      </div>
+      <button onclick="clearSelection()"
+              class="px-3 py-1.5 text-xs text-slate-600 hover:text-slate-800 border border-slate-200 rounded-lg transition-colors">
+        Clear
+      </button>
+      <form method="POST" action="{{ url_for('bulk_delete_subscribers') }}" id="bulk-delete-form"
+            onsubmit="return confirmBulkDelete()">
+        <div id="bulk-id-inputs"></div>
+        <button type="submit"
+                class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors">
+          <i class="fas fa-trash mr-1"></i>Delete Selected
+        </button>
+      </form>
     </div>
   </div>
   {% endif %}
 
-  <!-- Grouped subscribers -->
-  {% for grp in groups %}
-  {% set grp_subs = [] %}
-  {% for s in subscribers if s.group_id == grp.id %}{% set _ = grp_subs.append(s) %}{% endfor %}
-  {% if grp_subs %}
-  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden mb-4">
-    <div class="px-5 py-3 border-b border-slate-100 bg-slate-50 flex items-center space-x-2">
-      <span class="w-3 h-3 rounded-full flex-shrink-0"
-            style="background-color: {{ {'blue':'#3b82f6','purple':'#8b5cf6','green':'#10b981','orange':'#f97316','red':'#ef4444','pink':'#ec4899','indigo':'#6366f1'}.get(grp.color,'#3b82f6') }}"></span>
-      <span class="font-semibold text-slate-600 text-sm">{{ grp.name }}</span>
-      {% if grp.description %}<span class="text-xs text-slate-400">— {{ grp.description }}</span>{% endif %}
-      <span class="ml-auto text-xs text-slate-400 bg-slate-200 px-2 py-0.5 rounded-full">{{ grp_subs|length }}</span>
-    </div>
-    <div class="divide-y divide-slate-50">
-    {% for s in grp_subs %}
-    <div class="px-5 py-3 flex items-center space-x-3 hover:bg-slate-50 transition-colors">
-      <div class="w-8 h-8 bg-gradient-to-br from-purple-400 to-indigo-600 rounded-full flex items-center justify-center flex-shrink-0">
-        <span class="text-white font-bold text-xs">{{ ((s.first_name or s.last_name or 'S')[0]).upper() }}</span>
-      </div>
-      <div class="flex-1 min-w-0">
-        <p class="font-medium text-slate-800 text-sm">{{ s.full_name or 'Unknown' }}</p>
-        <div class="flex flex-wrap gap-2 mt-0.5">
-          {% if s.email %}<span class="text-xs text-slate-500"><i class="fas fa-envelope mr-1 text-slate-400"></i>{{ s.email }}</span>{% endif %}
-          {% if s.phone %}<span class="text-xs text-slate-500"><i class="fas fa-phone mr-1 text-slate-400"></i>{{ s.phone }}</span>{% endif %}
-        </div>
-      </div>
-      <div class="flex flex-wrap gap-1 max-w-xs">
-        {% for a in s.bus_assignments %}
-        <span class="px-1.5 py-0.5 bg-blue-50 text-blue-700 text-xs font-medium rounded border border-blue-100">{{ a.bus.identifier }}</span>
-        {% else %}<span class="text-xs text-slate-400">No buses</span>{% endfor %}
-      </div>
-      <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium
-        {% if s.active %}bg-emerald-100 text-emerald-700{% else %}bg-red-100 text-red-600{% endif %}">
-        <span class="w-1.5 h-1.5 rounded-full mr-1 {% if s.active %}bg-emerald-500{% else %}bg-red-400{% endif %}"></span>
-        {{ 'Active' if s.active else 'Inactive' }}
-      </span>
-      {% if can_write %}
-      <div class="flex items-center space-x-1 flex-shrink-0">
-        <button onclick="openEdit({{ s.id }}, '{{ s.first_name or '' }}', '{{ s.last_name or '' }}', '{{ s.email or '' }}', '{{ s.phone or '' }}', {{ s.active|lower }}, [{{ s.bus_assignments|map(attribute='bus_id')|join(',') }}], {{ s.group_id or 'null' }})"
-                class="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors">
-          <i class="fas fa-edit text-sm"></i>
-        </button>
-        <form method="POST" action="{{ url_for('delete_subscriber', sid=s.id) }}"
-              onsubmit="return confirm('Remove {{ s.full_name or 'this subscriber' }}?')">
-          <button type="submit" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
-            <i class="fas fa-trash text-sm"></i>
-          </button>
-        </form>
-      </div>
-      {% endif %}
-    </div>
-    {% endfor %}
-    </div>
-  </div>
-  {% endif %}
-  {% endfor %}
-
-  {% if not subscribers %}
-  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 py-16 text-center text-slate-300">
-    <i class="fas fa-bell-slash text-5xl mb-3 block"></i>
-    <p class="text-slate-400 mb-2">No subscribers yet</p>
+  <!-- ─ Column header ─ -->
+  <div class="bg-white rounded-t-2xl border border-slate-100 border-b-0 px-5 py-2.5 flex items-center gap-3">
     {% if can_write %}
-    <button onclick="document.getElementById('modal-add').classList.remove('hidden')"
-            class="mt-2 px-4 py-2 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-700">
-      Add first subscriber
-    </button>
+    <input type="checkbox" id="select-all-cb" onchange="toggleSelectAll(this.checked)"
+           class="w-4 h-4 rounded border-slate-300 text-blue-600 cursor-pointer">
+    {% endif %}
+    <span class="text-xs font-semibold text-slate-500 uppercase tracking-wide flex-1">Subscriber / Contacts</span>
+    <span class="text-xs font-semibold text-slate-500 uppercase tracking-wide w-28 hidden sm:block">Group</span>
+    <span class="text-xs font-semibold text-slate-500 uppercase tracking-wide w-20 text-center">Status</span>
+    {% if can_write %}
+    <span class="w-16"></span>
     {% endif %}
   </div>
-  {% endif %}
+
+  <!-- ─ Subscriber rows ─ -->
+  <div id="sub-list" class="bg-white rounded-b-2xl border border-slate-100 shadow-sm divide-y divide-slate-50 mb-3">
+    <!-- Rows injected here via JS -->
+
+    {% if not subscribers %}
+    <div class="py-16 text-center text-slate-300">
+      <i class="fas fa-bell-slash text-5xl mb-3 block"></i>
+      <p class="text-slate-400 mb-2">No subscribers yet</p>
+      {% if can_write %}
+      <button onclick="openAddModal()"
+              class="mt-2 px-4 py-2 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-700">
+        Add first subscriber
+      </button>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- ─ Pagination footer ─ -->
+  <div id="sub-pagination" class="flex items-center justify-between text-sm mb-6">
+    <span id="sub-page-info" class="text-slate-400 text-xs"></span>
+    <div id="sub-page-btns" class="flex items-center gap-1"></div>
+  </div>
+
+  <!-- Hidden subscriber data rendered by Jinja for JS to read -->
+  <div id="sub-data-source" class="hidden" aria-hidden="true">
+    {% for s in subscribers %}
+    {% set contacts_data = [] %}
+    {% for c in s.contacts %}{% set _ = contacts_data.append({"first_name": c.first_name or "", "last_name": c.last_name or "", "email": c.email or "", "phone": c.phone or "", "role": c.role or "parent"}) %}{% endfor %}
+    {% set search_text = ([s.full_name or '', s.notes or ''] + (s.contacts | map(attribute='email') | list) + (s.contacts | map(attribute='first_name') | list) + (s.contacts | map(attribute='last_name') | list) + (s.contacts | map(attribute='phone') | list) + [s.email or '', s.phone or '']) | join(' ') | lower %}
+    <div class="sub-data-item"
+         data-id="{{ s.id }}"
+         data-name="{{ s.full_name | lower }}"
+         data-group-id="{{ s.group_id or '' }}"
+         data-group-name="{{ (s.group.name if s.group else '') | lower }}"
+         data-active="{{ 'true' if s.active else 'false' }}"
+         data-search="{{ search_text }}"
+         data-delete-url="{{ url_for('delete_subscriber', sid=s.id) }}"
+         data-sub='{{ {"id": s.id, "notes": s.notes or "", "active": s.active, "group_id": s.group_id or "", "contacts": contacts_data} | tojson }}'
+         data-display='{{ {"id": s.id, "full_name": s.full_name or "Unnamed", "notes": s.notes or "", "active": s.active, "group_id": s.group_id or "", "group_name": s.group.name if s.group else "", "contacts": contacts_data, "legacy_email": s.email or "", "legacy_phone": s.phone or ""} | tojson }}'
+    ></div>
+    {% endfor %}
+  </div>
+
 </div>
 
 <!-- ══ GROUPS TAB ══ -->
@@ -213,16 +223,28 @@
         {% for grp in groups %}
         {% set count = namespace(v=0) %}
         {% for s in subscribers if s.group_id == grp.id %}{% set count.v = count.v + 1 %}{% endfor %}
+        {% set bus_ids_data = [] %}
+        {% for a in grp.bus_assignments %}{% set _ = bus_ids_data.append(a.bus_id) %}{% endfor %}
         <div class="px-5 py-3 flex items-center space-x-3">
           <span class="w-4 h-4 rounded-full flex-shrink-0"
                 style="background-color: {{ {'blue':'#3b82f6','purple':'#8b5cf6','green':'#10b981','orange':'#f97316','red':'#ef4444','pink':'#ec4899','indigo':'#6366f1'}.get(grp.color,'#3b82f6') }}"></span>
           <div class="flex-1">
             <p class="font-medium text-slate-800 text-sm">{{ grp.name }}</p>
             {% if grp.description %}<p class="text-xs text-slate-400">{{ grp.description }}</p>{% endif %}
+            {% if grp.bus_assignments %}
+            <div class="flex flex-wrap gap-1 mt-1">
+              {% for a in grp.bus_assignments %}
+              <span class="px-1.5 py-0.5 bg-blue-50 text-blue-700 text-[10px] font-semibold rounded border border-blue-100">
+                <i class="fas fa-bus mr-0.5 text-[9px]"></i>{{ a.bus.identifier }}
+              </span>
+              {% endfor %}
+            </div>
+            {% endif %}
           </div>
           <span class="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full">{{ count.v }} member{{ 's' if count.v != 1 }}</span>
           {% if can_write %}
-          <button onclick="openEditGroup({{ grp.id }}, '{{ grp.name }}', '{{ grp.color }}', '{{ grp.description or '' }}')"
+          <button onclick="openEditGroup(this)"
+                  data-group='{{ {"id": grp.id, "name": grp.name, "color": grp.color, "description": grp.description or "", "bus_ids": bus_ids_data} | tojson }}'
                   class="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg text-sm transition-colors">
             <i class="fas fa-edit"></i>
           </button>
@@ -244,7 +266,6 @@
       {% endif %}
     </div>
 
-    <!-- Add / Edit group forms -->
     {% if can_write %}
     <div class="space-y-4">
       <!-- Add group -->
@@ -275,13 +296,29 @@
               {% endfor %}
             </div>
           </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Assigned Buses</label>
+            {% if all_buses %}
+            <div class="grid grid-cols-2 gap-1.5 max-h-36 overflow-y-auto p-1 border border-slate-200 rounded-xl">
+              {% for bus in all_buses %}
+              <label class="flex items-center space-x-2 p-1.5 rounded-lg hover:bg-blue-50 cursor-pointer">
+                <input type="checkbox" name="bus_ids" value="{{ bus.id }}" class="w-4 h-4 rounded border-slate-300 text-blue-600">
+                <span class="text-sm font-medium text-slate-700">{{ bus.identifier }}</span>
+                <span class="text-xs text-slate-400 truncate">{{ bus.name[:14] }}</span>
+              </label>
+              {% endfor %}
+            </div>
+            {% else %}
+            <p class="text-xs text-slate-400">No buses available</p>
+            {% endif %}
+          </div>
           <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
             <i class="fas fa-plus mr-1"></i>Create Group
           </button>
         </form>
       </div>
 
-      <!-- Edit group (hidden until openEditGroup called) -->
+      <!-- Edit group -->
       <div id="edit-group-card" class="hidden bg-white rounded-2xl shadow-sm border border-blue-200 p-5">
         <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
           <i class="fas fa-edit text-blue-500"></i><span>Edit Group</span>
@@ -309,6 +346,23 @@
               {% endfor %}
             </div>
           </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Assigned Buses</label>
+            {% if all_buses %}
+            <div class="grid grid-cols-2 gap-1.5 max-h-36 overflow-y-auto p-1 border border-slate-200 rounded-xl">
+              {% for bus in all_buses %}
+              <label class="flex items-center space-x-2 p-1.5 rounded-lg hover:bg-blue-50 cursor-pointer">
+                <input type="checkbox" name="bus_ids" value="{{ bus.id }}" data-bus-id="{{ bus.id }}"
+                       class="eg-bus-cb w-4 h-4 rounded border-slate-300 text-blue-600">
+                <span class="text-sm font-medium text-slate-700">{{ bus.identifier }}</span>
+                <span class="text-xs text-slate-400 truncate">{{ bus.name[:14] }}</span>
+              </label>
+              {% endfor %}
+            </div>
+            {% else %}
+            <p class="text-xs text-slate-400">No buses available</p>
+            {% endif %}
+          </div>
           <div class="flex space-x-2">
             <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
               <i class="fas fa-save mr-1"></i>Save
@@ -326,14 +380,11 @@
 <!-- ══ BROADCAST TAB ══ -->
 <div id="ntab-broadcast" class="{% if active_tab != 'broadcast' %}hidden{% endif %}">
   <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
-    <!-- Compose form -->
     <div class="lg:col-span-2 space-y-4">
       <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 space-y-4">
         <h3 class="font-bold text-slate-700 flex items-center space-x-2">
           <i class="fas fa-paper-plane text-blue-500"></i><span>Compose Message</span>
         </h3>
-
-        <!-- Target selector -->
         <div>
           <label class="block text-xs font-semibold text-slate-600 mb-2">Recipients</label>
           <div class="space-y-2">
@@ -348,7 +399,6 @@
               <input type="radio" name="bc_target" value="group" onchange="onTargetChange('group')" class="w-4 h-4 text-blue-600">
               <span class="text-sm text-slate-700">Subscriber Group(s)</span>
             </label>
-            <!-- Group checkboxes -->
             <div id="bc-groups" class="hidden ml-6 grid grid-cols-2 gap-2 mt-1">
               {% for grp in groups %}
               <label class="flex items-center space-x-2 p-2 rounded-xl border border-slate-100 hover:border-blue-300 cursor-pointer">
@@ -369,7 +419,7 @@
               <select id="bc-sub-select" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
                 <option value="">— select subscriber —</option>
                 {% for s in subscribers %}
-                <option value="{{ s.id }}">{{ s.full_name }} {% if s.email %}({{ s.email }}){% endif %}</option>
+                <option value="{{ s.id }}">{{ s.full_name }}{% if s.contacts and s.contacts[0].email %} ({{ s.contacts[0].email }}){% elif s.email %} ({{ s.email }}){% endif %}</option>
                 {% endfor %}
               </select>
             </div>
@@ -380,17 +430,13 @@
             <div id="bc-user" class="hidden ml-6">
               <select id="bc-user-select" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
                 <option value="">— select user —</option>
-                {% for u in admin_users %}
-                {% if u.email %}
+                {% for u in admin_users %}{% if u.email %}
                 <option value="{{ u.id }}">{{ u.first_name or '' }} {{ u.last_name or '' }} (@{{ u.username }}) &mdash; {{ u.email }}</option>
-                {% endif %}
-                {% endfor %}
+                {% endif %}{% endfor %}
               </select>
             </div>
           </div>
         </div>
-
-        <!-- Subject + Body -->
         <div>
           <label class="block text-xs font-semibold text-slate-600 mb-1.5">Subject</label>
           <input type="text" id="bc-subject" placeholder="Bus Service Update — Today"
@@ -401,15 +447,13 @@
           <textarea id="bc-body" rows="6" placeholder="Write your message here…"
                     class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"></textarea>
         </div>
-
-        <!-- Interval -->
         <div>
           <label class="block text-xs font-semibold text-slate-600 mb-1.5">
             Send Interval <span class="text-slate-400 font-normal">(delay between each email — anti-spam)</span>
           </label>
           <div class="flex items-center space-x-3">
-            <select id="bc-interval" class="px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    onchange="onIntervalChange(this.value)">
+            <select id="bc-interval" onchange="onIntervalChange(this.value)"
+                    class="px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
               <option value="0">Immediate (no delay)</option>
               <option value="2">2 seconds</option>
               <option value="5" selected>5 seconds</option>
@@ -418,13 +462,11 @@
               <option value="60">1 minute</option>
               <option value="custom">Custom…</option>
             </select>
-            <input type="number" id="bc-interval-custom" min="0" max="3600" value="5"
-                   placeholder="seconds"
+            <input type="number" id="bc-interval-custom" min="0" max="3600" value="5" placeholder="seconds"
                    class="hidden w-28 px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
             <span id="bc-interval-label" class="text-xs text-slate-400">~5s between each email</span>
           </div>
         </div>
-
         <div class="pt-2">
           <button type="button" id="btn-broadcast" onclick="sendBroadcast()"
                   class="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-semibold shadow-sm">
@@ -432,8 +474,6 @@
           </button>
         </div>
       </div>
-
-      <!-- Progress panel -->
       <div id="bc-progress-card" class="hidden bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
         <h3 class="font-bold text-slate-700 mb-3 flex items-center space-x-2">
           <i class="fas fa-spinner fa-spin text-blue-500" id="bc-prog-icon"></i>
@@ -447,8 +487,6 @@
         <p id="bc-done-msg" class="hidden text-sm font-medium text-emerald-600"><i class="fas fa-check-circle mr-1"></i>Done!</p>
       </div>
     </div>
-
-    <!-- Sidebar: recipient summary -->
     <div class="space-y-4">
       <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
         <h4 class="font-semibold text-slate-600 text-xs uppercase tracking-wider mb-3">Recipients Overview</h4>
@@ -498,131 +536,213 @@
 
 <!-- ── MODAL: Add Subscriber ── -->
 <div id="modal-add" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto">
-    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100 sticky top-0 bg-white">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100 sticky top-0 bg-white z-10">
       <h2 class="font-bold text-slate-800">Add Subscriber</h2>
       <button onclick="document.getElementById('modal-add').classList.add('hidden')" class="text-slate-400 hover:text-slate-600">
         <i class="fas fa-times"></i>
       </button>
     </div>
-    <form method="POST" action="{{ url_for('add_subscriber') }}" class="px-6 py-5 space-y-4">
-      <div class="grid grid-cols-2 gap-3">
+    <div id="add-sub-alpine" x-data="{ contacts: [{first_name:'',last_name:'',email:'',phone:'',role:'parent'}] }">
+      <form method="POST" action="{{ url_for('add_subscriber') }}" class="px-6 py-5 space-y-4">
         <div>
-          <label class="block text-xs font-semibold text-slate-600 mb-1.5">First Name</label>
-          <input type="text" name="first_name" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-        </div>
-        <div>
-          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Last Name</label>
-          <input type="text" name="last_name" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-        </div>
-      </div>
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Email</label>
-        <input type="email" name="email" placeholder="parent@example.com"
-               class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-      </div>
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Phone (optional)</label>
-        <input type="tel" name="phone" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-      </div>
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Group (optional)</label>
-        <select name="group_id" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
-          <option value="">— No Group —</option>
-          {% for grp in groups %}
-          <option value="{{ grp.id }}">{{ grp.name }}</option>
-          {% endfor %}
-        </select>
-      </div>
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-2">Notify for Buses</label>
-        <div class="grid grid-cols-2 gap-1.5 max-h-40 overflow-y-auto p-1">
-          {% for bus in all_buses %}
-          <label class="flex items-center space-x-2 p-2 rounded-lg border border-slate-100 hover:border-blue-300 hover:bg-blue-50 cursor-pointer">
-            <input type="checkbox" name="bus_ids" value="{{ bus.id }}" class="w-4 h-4 rounded border-slate-300 text-blue-600">
-            <span class="text-sm font-medium text-slate-700">{{ bus.identifier }}</span>
-            <span class="text-xs text-slate-400 truncate">{{ bus.name[:14] }}</span>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">
+            Household Label <span class="text-slate-400 font-normal">(optional — e.g. "Smith Family")</span>
           </label>
-          {% else %}
-          <p class="col-span-2 text-sm text-slate-400 text-center py-4">No active buses</p>
-          {% endfor %}
+          <input type="text" name="notes" placeholder="Smith Family"
+                 class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
         </div>
-      </div>
-      <div class="flex justify-end space-x-2 pt-2 border-t border-slate-100">
-        <button type="button" onclick="document.getElementById('modal-add').classList.add('hidden')"
-                class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
-        <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Add Subscriber</button>
-      </div>
-    </form>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Group <span class="text-slate-400 font-normal">(optional)</span></label>
+          <select name="group_id" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="">— No Group —</option>
+            {% for grp in groups %}
+            <option value="{{ grp.id }}">{{ grp.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-2">
+            Contacts <span class="text-slate-400 font-normal">(parents and/or students)</span>
+          </label>
+          <div class="space-y-3">
+            <template x-for="(c, i) in contacts" :key="i">
+              <div class="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+                <div class="flex items-center justify-between">
+                  <select :name="'contact_' + i + '_role'" x-model="c.role"
+                          class="px-2 py-1.5 border border-slate-200 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <option value="parent">Parent / Guardian</option>
+                    <option value="student">Student</option>
+                  </select>
+                  <button type="button" @click="contacts.splice(i, 1)" x-show="contacts.length > 1"
+                          class="px-2 py-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors text-xs">
+                    <i class="fas fa-times"></i> Remove
+                  </button>
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                  <input :name="'contact_' + i + '_first_name'" x-model="c.first_name" type="text" placeholder="First name"
+                         class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <input :name="'contact_' + i + '_last_name'" x-model="c.last_name" type="text" placeholder="Last name"
+                         class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <input :name="'contact_' + i + '_email'" x-model="c.email" type="email" placeholder="Email address"
+                       class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <input :name="'contact_' + i + '_phone'" x-model="c.phone" type="tel" placeholder="Phone (optional)"
+                       class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+              </div>
+            </template>
+          </div>
+          <input type="hidden" name="contact_count" :value="contacts.length">
+          <button type="button"
+                  @click="contacts.push({first_name:'',last_name:'',email:'',phone:'',role:'parent'})"
+                  class="mt-2 text-sm text-blue-600 hover:text-blue-800 font-medium">
+            <i class="fas fa-plus mr-1"></i>Add Another Person
+          </button>
+        </div>
+        <div class="flex justify-end space-x-2 pt-2 border-t border-slate-100">
+          <button type="button" onclick="document.getElementById('modal-add').classList.add('hidden')"
+                  class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
+          <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Add Subscriber</button>
+        </div>
+      </form>
+    </div>
   </div>
 </div>
 
 <!-- ── MODAL: Edit Subscriber ── -->
 <div id="modal-edit" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[90vh] overflow-y-auto">
-    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100 sticky top-0 bg-white">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100 sticky top-0 bg-white z-10">
       <h2 class="font-bold text-slate-800">Edit Subscriber</h2>
       <button onclick="document.getElementById('modal-edit').classList.add('hidden')" class="text-slate-400 hover:text-slate-600">
         <i class="fas fa-times"></i>
       </button>
     </div>
-    <form method="POST" id="form-edit" class="px-6 py-5 space-y-4">
-      <div class="grid grid-cols-2 gap-3">
+    <div id="edit-sub-alpine" x-data="{ contacts: [], notes: '', group_id: '', active: true }">
+      <form method="POST" id="form-edit" class="px-6 py-5 space-y-4">
         <div>
-          <label class="block text-xs font-semibold text-slate-600 mb-1.5">First Name</label>
-          <input type="text" name="first_name" id="e-first" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Household Label</label>
+          <input type="text" name="notes" x-model="notes" placeholder="Smith Family"
+                 class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
         </div>
         <div>
-          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Last Name</label>
-          <input type="text" name="last_name" id="e-last" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Group</label>
+          <select name="group_id" x-model="group_id"
+                  class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+            <option value="">— No Group —</option>
+            {% for grp in groups %}
+            <option value="{{ grp.id }}">{{ grp.name }}</option>
+            {% endfor %}
+          </select>
         </div>
-      </div>
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Email</label>
-        <input type="email" name="email" id="e-email" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-      </div>
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Phone</label>
-        <input type="tel" name="phone" id="e-phone" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-      </div>
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-1.5">Group</label>
-        <select name="group_id" id="e-group" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
-          <option value="">— No Group —</option>
-          {% for grp in groups %}
-          <option value="{{ grp.id }}">{{ grp.name }}</option>
-          {% endfor %}
-        </select>
-      </div>
-      <label class="flex items-center space-x-2 cursor-pointer">
-        <input type="checkbox" name="active" id="e-active" class="w-4 h-4 rounded border-slate-300 text-blue-600">
-        <span class="text-sm text-slate-600 font-medium">Active (receives notifications)</span>
-      </label>
-      <div>
-        <label class="block text-xs font-semibold text-slate-600 mb-2">Notify for Buses</label>
-        <div class="grid grid-cols-2 gap-1.5 max-h-40 overflow-y-auto p-1" id="e-buses">
-          {% for bus in all_buses %}
-          <label class="flex items-center space-x-2 p-2 rounded-lg border border-slate-100 hover:border-blue-300 hover:bg-blue-50 cursor-pointer">
-            <input type="checkbox" name="bus_ids" value="{{ bus.id }}" data-bus-id="{{ bus.id }}" class="edit-bus-cb w-4 h-4 rounded border-slate-300 text-blue-600">
-            <span class="text-sm font-medium text-slate-700">{{ bus.identifier }}</span>
-            <span class="text-xs text-slate-400 truncate">{{ bus.name[:14] }}</span>
+        <label class="flex items-center space-x-2 cursor-pointer">
+          <input type="checkbox" name="active" x-model="active" class="w-4 h-4 rounded border-slate-300 text-blue-600">
+          <span class="text-sm text-slate-600 font-medium">Active (receives notifications)</span>
+        </label>
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-2">
+            Contacts <span class="text-slate-400 font-normal">(parents and/or students)</span>
           </label>
-          {% endfor %}
+          <div class="space-y-3">
+            <template x-for="(c, i) in contacts" :key="i">
+              <div class="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+                <div class="flex items-center justify-between">
+                  <select :name="'contact_' + i + '_role'" x-model="c.role"
+                          class="px-2 py-1.5 border border-slate-200 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <option value="parent">Parent / Guardian</option>
+                    <option value="student">Student</option>
+                  </select>
+                  <button type="button" @click="contacts.splice(i, 1)" x-show="contacts.length > 1"
+                          class="px-2 py-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors text-xs">
+                    <i class="fas fa-times"></i> Remove
+                  </button>
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                  <input :name="'contact_' + i + '_first_name'" x-model="c.first_name" type="text" placeholder="First name"
+                         class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <input :name="'contact_' + i + '_last_name'" x-model="c.last_name" type="text" placeholder="Last name"
+                         class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                </div>
+                <input :name="'contact_' + i + '_email'" x-model="c.email" type="email" placeholder="Email address"
+                       class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <input :name="'contact_' + i + '_phone'" x-model="c.phone" type="tel" placeholder="Phone (optional)"
+                       class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+              </div>
+            </template>
+          </div>
+          <input type="hidden" name="contact_count" :value="contacts.length">
+          <button type="button"
+                  @click="contacts.push({first_name:'',last_name:'',email:'',phone:'',role:'parent'})"
+                  class="mt-2 text-sm text-blue-600 hover:text-blue-800 font-medium">
+            <i class="fas fa-plus mr-1"></i>Add Another Person
+          </button>
         </div>
+        <div class="flex justify-end space-x-2 pt-2 border-t border-slate-100">
+          <button type="button" onclick="document.getElementById('modal-edit').classList.add('hidden')"
+                  class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
+          <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Save Changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- ── MODAL: Import CSV ── -->
+<div id="modal-import" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100">
+      <h2 class="font-bold text-slate-800">Import Subscribers from CSV</h2>
+      <button onclick="document.getElementById('modal-import').classList.add('hidden')" class="text-slate-400 hover:text-slate-600">
+        <i class="fas fa-times"></i>
+      </button>
+    </div>
+    <div class="px-6 py-5 space-y-4">
+      <!-- Requirements -->
+      <div class="bg-blue-50 border border-blue-100 rounded-xl p-4 text-sm space-y-2">
+        <p class="font-semibold text-blue-800"><i class="fas fa-info-circle mr-1"></i>CSV Format Requirements</p>
+        <ul class="text-xs text-blue-700 space-y-1 list-disc list-inside">
+          <li>Required columns: <code class="bg-blue-100 px-1 rounded">group</code>, <code class="bg-blue-100 px-1 rounded">first_name</code> or <code class="bg-blue-100 px-1 rounded">email</code></li>
+          <li>Optional: <code class="bg-blue-100 px-1 rounded">household_label</code>, <code class="bg-blue-100 px-1 rounded">role</code>, <code class="bg-blue-100 px-1 rounded">last_name</code>, <code class="bg-blue-100 px-1 rounded">phone</code></li>
+          <li><code class="bg-blue-100 px-1 rounded">role</code> must be <strong>parent</strong> or <strong>student</strong> (default: parent)</li>
+          <li>Rows with the same <strong>group</strong> + <strong>household_label</strong> are merged into one enrollment with multiple contacts</li>
+          <li>Groups must be created first — unknown group names are skipped</li>
+          <li>File must be UTF-8 encoded (Excel exports as UTF-8 with BOM work fine)</li>
+        </ul>
       </div>
-      <div class="flex justify-end space-x-2 pt-2 border-t border-slate-100">
-        <button type="button" onclick="document.getElementById('modal-edit').classList.add('hidden')"
-                class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
-        <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Save Changes</button>
+      <!-- Download template -->
+      <div class="flex items-center justify-between p-3 bg-slate-50 border border-slate-200 rounded-xl">
+        <div>
+          <p class="text-sm font-medium text-slate-700">Download template / current data</p>
+          <p class="text-xs text-slate-400">Export current subscribers as a starting point</p>
+        </div>
+        <a href="{{ url_for('export_subscribers_csv') }}"
+           class="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-200 hover:border-emerald-400 text-slate-600 hover:text-emerald-700 rounded-xl text-sm font-medium transition-colors">
+          <i class="fas fa-download text-xs"></i>Export CSV
+        </a>
       </div>
-    </form>
+      <!-- Upload form -->
+      <form method="POST" action="{{ url_for('import_subscribers_csv') }}" enctype="multipart/form-data">
+        <div>
+          <label class="block text-xs font-semibold text-slate-600 mb-1.5">Select CSV File</label>
+          <input type="file" name="csv_file" accept=".csv"
+                 class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div class="flex justify-end space-x-2 pt-4 border-t border-slate-100 mt-4">
+          <button type="button" onclick="document.getElementById('modal-import').classList.add('hidden')"
+                  class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
+          <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+            <i class="fas fa-file-import mr-1"></i>Import
+          </button>
+        </div>
+      </form>
+    </div>
   </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-// Tab switching
+// ─── Tab switching ──────────────────────────────────────────────────────────
 const NTABS = ['subscribers','groups','broadcast'];
 function showNTab(id) {
   NTABS.forEach(t => {
@@ -639,130 +759,374 @@ function showNTab(id) {
   history.replaceState(null, '', '?tab=' + id);
 }
 
-// Subscriber edit modal
-function openEdit(id, first, last, email, phone, active, busIds, groupId) {
-  document.getElementById('form-edit').action = `/admin/notifications/${id}/edit`;
-  document.getElementById('e-first').value  = first;
-  document.getElementById('e-last').value   = last;
-  document.getElementById('e-email').value  = email;
-  document.getElementById('e-phone').value  = phone;
-  document.getElementById('e-active').checked = active;
-  document.getElementById('e-group').value  = groupId || '';
-  document.querySelectorAll('.edit-bus-cb').forEach(cb => {
-    cb.checked = busIds.includes(parseInt(cb.dataset.busId));
+// ─── Subscriber list: data, state, render ─────────────────────────────────
+const CAN_WRITE = {{ 'true' if can_write else 'false' }};
+const COLOR_MAP = {blue:'#3b82f6',purple:'#8b5cf6',green:'#10b981',orange:'#f97316',red:'#ef4444',pink:'#ec4899',indigo:'#6366f1'};
+
+// Load all subscriber data from hidden DOM nodes
+const ALL_SUBS = [];
+document.querySelectorAll('.sub-data-item').forEach(el => {
+  ALL_SUBS.push({
+    id:        el.dataset.id,
+    name:      el.dataset.name,
+    groupId:   el.dataset.groupId,
+    groupName: el.dataset.groupName,
+    active:    el.dataset.active === 'true',
+    search:    el.dataset.search,
+    deleteUrl: el.dataset.deleteUrl,
+    sub:       JSON.parse(el.dataset.sub),
+    display:   JSON.parse(el.dataset.display),
   });
+});
+
+let currentPage = 1;
+let filteredSubs = [...ALL_SUBS];
+const selectedIds = new Set();
+
+function getFilters() {
+  return {
+    q:      (document.getElementById('sub-search')?.value || '').trim().toLowerCase(),
+    group:  document.getElementById('sub-group-filter')?.value || '',
+    status: document.getElementById('sub-status-filter')?.value || '',
+    size:   parseInt(document.getElementById('sub-page-size')?.value || '20'),
+  };
+}
+
+function filterAndPage(resetPage = true) {
+  if (resetPage) currentPage = 1;
+  const f = getFilters();
+  filteredSubs = ALL_SUBS.filter(s => {
+    if (f.q && !s.search.includes(f.q)) return false;
+    if (f.group === '__none__' && s.groupId !== '') return false;
+    if (f.group && f.group !== '__none__' && s.groupId !== f.group) return false;
+    if (f.status === 'active'   && !s.active)  return false;
+    if (f.status === 'inactive' &&  s.active)  return false;
+    return true;
+  });
+  renderList();
+}
+
+function renderList() {
+  const f = getFilters();
+  const total = filteredSubs.length;
+  const pages = f.size >= 9000 ? 1 : Math.max(1, Math.ceil(total / f.size));
+  if (currentPage > pages) currentPage = pages;
+  const start = f.size >= 9000 ? 0 : (currentPage - 1) * f.size;
+  const end   = f.size >= 9000 ? total : Math.min(start + f.size, total);
+  const slice = filteredSubs.slice(start, end);
+
+  const list = document.getElementById('sub-list');
+  if (ALL_SUBS.length === 0) return; // leave the empty state in place
+
+  list.innerHTML = slice.length === 0
+    ? `<div class="py-12 text-center text-slate-400"><i class="fas fa-search text-3xl mb-2 block text-slate-200"></i><p class="text-sm">No subscribers match your filters</p></div>`
+    : slice.map(s => renderRow(s)).join('');
+
+  renderPagination(total, pages, start, end);
+  updateSelectAllState();
+}
+
+function renderRow(s) {
+  const d = s.display;
+  const initial = (d.full_name || 'S')[0].toUpperCase();
+  const statusBadge = d.active
+    ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-700 flex-shrink-0"><span class="w-1.5 h-1.5 rounded-full mr-1 bg-emerald-500"></span>Active</span>`
+    : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-600 flex-shrink-0"><span class="w-1.5 h-1.5 rounded-full mr-1 bg-red-400"></span>Inactive</span>`;
+
+  const groupBadge = d.group_name
+    ? `<span class="text-xs text-slate-600 bg-slate-100 px-2 py-0.5 rounded-full font-medium truncate max-w-[110px]">${escHtml(d.group_name)}</span>`
+    : `<span class="text-xs text-slate-300">—</span>`;
+
+  let contactsHtml = '';
+  if (d.contacts && d.contacts.length > 0) {
+    contactsHtml = d.contacts.map(c => {
+      const roleClass = c.role === 'student' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700';
+      const roleLabel = c.role === 'student' ? 'Student' : 'Parent';
+      const name = [c.first_name, c.last_name].filter(Boolean).join(' ');
+      let parts = `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded ${roleClass}">${roleLabel}</span>`;
+      if (name) parts += ` <span class="text-xs text-slate-700 font-medium">${escHtml(name)}</span>`;
+      if (c.email) parts += ` <span class="text-xs text-slate-500"><i class="fas fa-envelope mr-0.5 text-slate-400"></i>${escHtml(c.email)}</span>`;
+      if (c.phone) parts += ` <span class="text-xs text-slate-500"><i class="fas fa-phone mr-0.5 text-slate-400"></i>${escHtml(c.phone)}</span>`;
+      return `<div class="flex items-center gap-1.5 flex-wrap">${parts}</div>`;
+    }).join('');
+  } else {
+    if (d.legacy_email) contactsHtml += `<span class="text-xs text-slate-500"><i class="fas fa-envelope mr-1 text-slate-400"></i>${escHtml(d.legacy_email)}</span>`;
+    if (d.legacy_phone) contactsHtml += `<span class="text-xs text-slate-500"><i class="fas fa-phone mr-1 text-slate-400"></i>${escHtml(d.legacy_phone)}</span>`;
+  }
+
+  const isChecked = selectedIds.has(String(s.id));
+  const cbHtml = CAN_WRITE
+    ? `<input type="checkbox" class="sub-cb w-4 h-4 rounded border-slate-300 text-blue-600 cursor-pointer flex-shrink-0"
+            data-id="${s.id}" data-group-id="${s.groupId}" onchange="onRowCheck(this)"
+            ${isChecked ? 'checked' : ''}>`
+    : '';
+
+  const actionsHtml = CAN_WRITE ? `
+    <div class="flex items-center space-x-1 flex-shrink-0">
+      <button onclick='openEditFromData(${JSON.stringify(s.sub)})' data-sub-id="${s.id}"
+              class="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors">
+        <i class="fas fa-edit text-sm"></i>
+      </button>
+      <form method="POST" action="${escHtml(s.deleteUrl)}"
+            onsubmit="return confirm('Remove this subscriber?')">
+        <button type="submit" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
+          <i class="fas fa-trash text-sm"></i>
+        </button>
+      </form>
+    </div>` : '';
+
+  return `
+  <div class="px-5 py-3 flex items-start gap-3 hover:bg-slate-50 transition-colors ${isChecked ? 'bg-blue-50' : ''}">
+    ${cbHtml}
+    <div class="w-8 h-8 bg-gradient-to-br from-purple-400 to-indigo-600 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">
+      <span class="text-white font-bold text-xs">${escHtml(initial)}</span>
+    </div>
+    <div class="flex-1 min-w-0">
+      <div class="flex items-center gap-2 flex-wrap">
+        <p class="font-medium text-slate-800 text-sm">${escHtml(d.full_name || 'Unnamed')}</p>
+        ${d.notes ? `<span class="text-xs text-slate-400 italic">${escHtml(d.notes)}</span>` : ''}
+      </div>
+      <div class="mt-1 space-y-0.5">${contactsHtml}</div>
+    </div>
+    <div class="w-28 hidden sm:flex items-center flex-shrink-0 mt-0.5">${groupBadge}</div>
+    <div class="w-20 flex justify-center flex-shrink-0 mt-0.5">${statusBadge}</div>
+    ${actionsHtml}
+  </div>`;
+}
+
+function renderPagination(total, pages, start, end) {
+  const info = document.getElementById('sub-page-info');
+  const btns = document.getElementById('sub-page-btns');
+  info.textContent = total === 0 ? '' : `Showing ${start + 1}–${end} of ${total}`;
+
+  if (pages <= 1) { btns.innerHTML = ''; return; }
+
+  let html = '';
+  const btn = (label, page, disabled, active) =>
+    `<button onclick="goPage(${page})" ${disabled ? 'disabled' : ''}
+      class="px-3 py-1.5 rounded-xl text-xs font-medium transition-colors ${active ? 'bg-blue-600 text-white' : 'border border-slate-200 text-slate-600 hover:bg-slate-50'} ${disabled ? 'opacity-40 cursor-not-allowed' : ''}">${label}</button>`;
+
+  html += btn('‹', currentPage - 1, currentPage === 1, false);
+  for (let p = 1; p <= pages; p++) {
+    if (pages > 7 && p > 2 && p < pages - 1 && Math.abs(p - currentPage) > 1) {
+      if (p === 3 || p === pages - 2) html += `<span class="px-1 text-slate-400 text-xs">…</span>`;
+      continue;
+    }
+    html += btn(p, p, false, p === currentPage);
+  }
+  html += btn('›', currentPage + 1, currentPage === pages, false);
+  btns.innerHTML = html;
+}
+
+function goPage(p) {
+  currentPage = p;
+  renderList();
+}
+
+// ─── Selection ──────────────────────────────────────────────────────────────
+function onRowCheck(cb) {
+  const id = String(cb.dataset.id);
+  if (cb.checked) selectedIds.add(id); else selectedIds.delete(id);
+  cb.closest('.flex').classList.toggle('bg-blue-50', cb.checked);
+  updateSelectionUI();
+}
+
+function toggleSelectAll(checked) {
+  document.querySelectorAll('.sub-cb').forEach(cb => {
+    cb.checked = checked;
+    const id = String(cb.dataset.id);
+    if (checked) selectedIds.add(id); else selectedIds.delete(id);
+    cb.closest('.flex').classList.toggle('bg-blue-50', checked);
+  });
+  updateSelectionUI();
+}
+
+function selectByGroup(groupId) {
+  if (groupId === '') {
+    // Select all visible
+    document.querySelectorAll('.sub-cb').forEach(cb => {
+      cb.checked = true;
+      selectedIds.add(String(cb.dataset.id));
+      cb.closest('.flex').classList.add('bg-blue-50');
+    });
+  } else {
+    // Select all in specific group (across ALL data, not just current page)
+    ALL_SUBS.forEach(s => {
+      if (String(s.groupId) === String(groupId)) selectedIds.add(String(s.id));
+    });
+    // Also update visible checkboxes
+    document.querySelectorAll('.sub-cb').forEach(cb => {
+      if (String(cb.dataset.groupId) === String(groupId)) {
+        cb.checked = true;
+        cb.closest('.flex').classList.add('bg-blue-50');
+      }
+    });
+  }
+  updateSelectionUI();
+}
+
+function clearSelection() {
+  selectedIds.clear();
+  document.querySelectorAll('.sub-cb').forEach(cb => {
+    cb.checked = false;
+    cb.closest('.flex').classList.remove('bg-blue-50');
+  });
+  updateSelectionUI();
+}
+
+function updateSelectionUI() {
+  const count = selectedIds.size;
+  const bar  = document.getElementById('bulk-bar');
+  if (!bar) return;
+  bar.classList.toggle('hidden', count === 0);
+  document.getElementById('bulk-count').textContent = count;
+  // Sync hidden inputs for bulk delete form
+  const inputsDiv = document.getElementById('bulk-id-inputs');
+  if (inputsDiv) {
+    inputsDiv.innerHTML = [...selectedIds].map(id =>
+      `<input type="hidden" name="subscriber_ids" value="${escHtml(id)}">`
+    ).join('');
+  }
+  updateSelectAllState();
+}
+
+function updateSelectAllState() {
+  const cb = document.getElementById('select-all-cb');
+  if (!cb) return;
+  const visibleCbs = document.querySelectorAll('.sub-cb');
+  const allChecked = visibleCbs.length > 0 && [...visibleCbs].every(c => c.checked);
+  const someChecked = [...visibleCbs].some(c => c.checked);
+  cb.checked = allChecked;
+  cb.indeterminate = !allChecked && someChecked;
+}
+
+function confirmBulkDelete() {
+  const count = selectedIds.size;
+  return count > 0 && confirm(`Delete ${count} subscriber(s)? This cannot be undone.`);
+}
+
+// ─── Modal helpers ──────────────────────────────────────────────────────────
+function openAddModal() {
+  const wrapper = document.getElementById('add-sub-alpine');
+  if (wrapper && window.Alpine) {
+    const data = Alpine.$data(wrapper);
+    data.contacts = [{first_name:'', last_name:'', email:'', phone:'', role:'parent'}];
+  }
+  document.getElementById('modal-add').classList.remove('hidden');
+}
+
+function openEdit(btn) {
+  const sub = JSON.parse(btn.dataset.sub);
+  openEditFromData(sub);
+}
+
+function openEditFromData(sub) {
+  document.getElementById('form-edit').action = '/admin/notifications/' + sub.id + '/edit';
+  const wrapper = document.getElementById('edit-sub-alpine');
+  if (wrapper && window.Alpine) {
+    const data = Alpine.$data(wrapper);
+    data.notes    = sub.notes || '';
+    data.active   = sub.active;
+    data.group_id = String(sub.group_id || '');
+    data.contacts = sub.contacts && sub.contacts.length > 0
+      ? sub.contacts.map(c => ({
+          first_name: c.first_name || '',
+          last_name:  c.last_name  || '',
+          email:      c.email      || '',
+          phone:      c.phone      || '',
+          role:       c.role       || 'parent',
+        }))
+      : [{first_name:'', last_name:'', email:'', phone:'', role:'parent'}];
+  }
   document.getElementById('modal-edit').classList.remove('hidden');
 }
 
-// Group edit card
-function openEditGroup(id, name, color, desc) {
-  document.getElementById('form-edit-group').action = `/admin/notifications/groups/${id}/edit`;
-  document.getElementById('eg-name').value = name;
-  document.getElementById('eg-desc').value = desc;
+function openEditGroup(btn) {
+  const grp = JSON.parse(btn.dataset.group);
+  document.getElementById('form-edit-group').action = '/admin/notifications/groups/' + grp.id + '/edit';
+  document.getElementById('eg-name').value = grp.name;
+  document.getElementById('eg-desc').value = grp.description || '';
   document.querySelectorAll('.edit-color-radio').forEach(r => {
-    r.checked = (r.value === color);
-    updateColorDot(r.nextElementSibling, r.checked);
+    r.checked = (r.value === grp.color);
+    if (r.nextElementSibling) updateColorDot(r.nextElementSibling, r.checked);
+  });
+  document.querySelectorAll('.eg-bus-cb').forEach(cb => {
+    cb.checked = grp.bus_ids.includes(parseInt(cb.dataset.busId));
   });
   document.getElementById('edit-group-card').classList.remove('hidden');
   document.getElementById('edit-group-card').scrollIntoView({behavior:'smooth'});
 }
 
-// Color dot ring on select
+// ─── Color dots ─────────────────────────────────────────────────────────────
 document.querySelectorAll('input[type=radio][name=color], input[type=radio].edit-color-radio').forEach(r => {
   r.addEventListener('change', () => {
-    r.closest('.flex.flex-wrap').querySelectorAll('.color-dot').forEach(d => {
-      d.style.boxShadow = '';
-    });
+    r.closest('.flex.flex-wrap').querySelectorAll('.color-dot').forEach(d => { d.style.boxShadow = ''; });
     updateColorDot(r.nextElementSibling, true);
   });
 });
 function updateColorDot(dot, active) {
   dot.style.boxShadow = active ? '0 0 0 3px white, 0 0 0 5px ' + getComputedStyle(dot).backgroundColor : '';
 }
-// Init color dots for checked radios
-document.querySelectorAll('input[type=radio][name=color]:checked, input[type=radio].edit-color-radio:checked').forEach(r => {
+document.querySelectorAll('input[type=radio][name=color]:checked').forEach(r => {
   if (r.nextElementSibling) updateColorDot(r.nextElementSibling, true);
 });
 
-// Broadcast target toggle
+// ─── Broadcast ──────────────────────────────────────────────────────────────
 function onTargetChange(val) {
   ['bc-groups','bc-sub','bc-user'].forEach(id => document.getElementById(id)?.classList.add('hidden'));
-  if (val === 'group')                   document.getElementById('bc-groups').classList.remove('hidden');
-  if (val === 'individual_subscriber')   document.getElementById('bc-sub').classList.remove('hidden');
-  if (val === 'individual_user')         document.getElementById('bc-user').classList.remove('hidden');
+  if (val === 'group')                 document.getElementById('bc-groups').classList.remove('hidden');
+  if (val === 'individual_subscriber') document.getElementById('bc-sub').classList.remove('hidden');
+  if (val === 'individual_user')       document.getElementById('bc-user').classList.remove('hidden');
 }
 
-// Broadcast interval
 function onIntervalChange(val) {
   const custom = document.getElementById('bc-interval-custom');
   const label  = document.getElementById('bc-interval-label');
   if (val === 'custom') {
-    custom.classList.remove('hidden');
-    label.textContent = '';
+    custom.classList.remove('hidden'); label.textContent = '';
   } else {
     custom.classList.add('hidden');
     label.textContent = val === '0' ? 'No delay — sends immediately' : `~${val}s between each email`;
   }
 }
 
-// Broadcast send
 let pollTimer = null;
 async function sendBroadcast() {
   const target   = document.querySelector('[name=bc_target]:checked')?.value || 'all';
   const subject  = document.getElementById('bc-subject').value.trim();
   const body     = document.getElementById('bc-body').value.trim();
   const intSel   = document.getElementById('bc-interval').value;
-  const interval = intSel === 'custom'
-    ? parseInt(document.getElementById('bc-interval-custom').value || '0')
-    : parseInt(intSel);
-
-  if (!subject || !body) {
-    alert('Subject and message body are required.');
-    return;
-  }
-
-  const groupIds  = [...document.querySelectorAll('[name=bc_group_ids]:checked')].map(c => c.value);
-  const subId     = document.getElementById('bc-sub-select')?.value || null;
-  const userId    = document.getElementById('bc-user-select')?.value || null;
-
+  const interval = intSel === 'custom' ? parseInt(document.getElementById('bc-interval-custom').value || '0') : parseInt(intSel);
+  if (!subject || !body) { alert('Subject and message body are required.'); return; }
+  const groupIds = [...document.querySelectorAll('[name=bc_group_ids]:checked')].map(c => c.value);
+  const subId    = document.getElementById('bc-sub-select')?.value || null;
+  const userId   = document.getElementById('bc-user-select')?.value || null;
   const btn = document.getElementById('btn-broadcast');
   btn.disabled = true;
   btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Starting…';
-
   const resp = await fetch('/admin/notifications/broadcast', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({target, group_ids: groupIds, subscriber_id: subId,
-                          user_id: userId, subject, body, interval}),
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({target, group_ids: groupIds, subscriber_id: subId, user_id: userId, subject, body, interval}),
   });
   const json = await resp.json();
-
   if (!json.ok) {
     alert(json.message);
-    btn.disabled = false;
-    btn.innerHTML = '<i class="fas fa-paper-plane mr-2"></i>Send Message';
-    return;
+    btn.disabled = false; btn.innerHTML = '<i class="fas fa-paper-plane mr-2"></i>Send Message'; return;
   }
-
-  // Show progress card
   const card = document.getElementById('bc-progress-card');
   card.classList.remove('hidden');
   document.getElementById('bc-prog-title').textContent = `Sending to ${json.total} recipient${json.total !== 1 ? 's' : ''}…`;
   document.getElementById('bc-done-msg').classList.add('hidden');
   document.getElementById('bc-errors').classList.add('hidden');
-
   pollTimer = setInterval(() => pollBroadcast(json.job_id, json.total), 1500);
 }
 
 async function pollBroadcast(jobId, total) {
   const resp = await fetch(`/admin/notifications/broadcast/${jobId}/status`);
   const job  = await resp.json();
-
-  const pct = total > 0 ? Math.round((job.sent + job.failed) / total * 100) : 100;
+  const pct  = total > 0 ? Math.round((job.sent + job.failed) / total * 100) : 100;
   document.getElementById('bc-prog-bar').style.width = pct + '%';
-  document.getElementById('bc-prog-label').textContent =
-    `${job.sent} sent · ${job.failed} failed · ${total - job.sent - job.failed} remaining`;
-
+  document.getElementById('bc-prog-label').textContent = `${job.sent} sent · ${job.failed} failed · ${total - job.sent - job.failed} remaining`;
   if (job.done) {
     clearInterval(pollTimer);
     document.getElementById('bc-prog-icon').className = 'fas fa-check-circle text-emerald-500';
@@ -772,13 +1136,19 @@ async function pollBroadcast(jobId, total) {
     if (job.errors?.length) {
       const errDiv = document.getElementById('bc-errors');
       errDiv.classList.remove('hidden');
-      errDiv.innerHTML = '<p class="text-xs font-semibold text-red-600 mb-1">Errors:</p>' +
-        job.errors.map(e => `<p class="text-xs text-red-500">${e}</p>`).join('');
+      errDiv.innerHTML = '<p class="text-xs font-semibold text-red-600 mb-1">Errors:</p>' + job.errors.map(e => `<p class="text-xs text-red-500">${e}</p>`).join('');
     }
     const btn = document.getElementById('btn-broadcast');
-    btn.disabled = false;
-    btn.innerHTML = '<i class="fas fa-paper-plane mr-2"></i>Send Message';
+    btn.disabled = false; btn.innerHTML = '<i class="fas fa-paper-plane mr-2"></i>Send Message';
   }
 }
+
+// ─── Utility ────────────────────────────────────────────────────────────────
+function escHtml(str) {
+  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// ─── Init ────────────────────────────────────────────────────────────────────
+filterAndPage();
 </script>
 {% endblock %}

@@ -302,24 +302,62 @@ class BusIncidentRecord(db.Model):
 
 
 class SubscriberGroup(db.Model):
-    id          = db.Column(db.Integer, primary_key=True)
-    name        = db.Column(db.String(100), unique=True, nullable=False)
-    description = db.Column(db.String(200), default='')
-    color       = db.Column(db.String(20), default='blue')
-    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
-    subscribers = db.relationship('NotificationSubscriber', backref='group', lazy=True)
+    id              = db.Column(db.Integer, primary_key=True)
+    name            = db.Column(db.String(100), unique=True, nullable=False)
+    description     = db.Column(db.String(200), default='')
+    color           = db.Column(db.String(20), default='blue')
+    created_at      = db.Column(db.DateTime, default=datetime.utcnow)
+    subscribers     = db.relationship('NotificationSubscriber', backref='group', lazy=True)
+    bus_assignments = db.relationship('GroupBusAssignment', backref='group',
+                                      lazy=True, cascade='all, delete-orphan')
+
+
+class GroupBusAssignment(db.Model):
+    __tablename__ = 'group_bus_assignment'
+    id       = db.Column(db.Integer, primary_key=True)
+    group_id = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'), nullable=False)
+    bus_id   = db.Column(db.Integer, db.ForeignKey('bus.id'), nullable=False)
+    bus      = db.relationship('Bus')
+    __table_args__ = (db.UniqueConstraint('group_id', 'bus_id'),)
 
 
 class NotificationSubscriber(db.Model):
-    id             = db.Column(db.Integer, primary_key=True)
-    first_name     = db.Column(db.String(80))
-    last_name      = db.Column(db.String(80))
-    email          = db.Column(db.String(120))
-    phone          = db.Column(db.String(30))
-    active         = db.Column(db.Boolean, default=True)
-    created_at     = db.Column(db.DateTime, default=datetime.utcnow)
-    group_id       = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'), nullable=True)
-    bus_assignments = db.relationship('NotificationBusAssignment', backref='subscriber', lazy=True, cascade='all, delete-orphan')
+    id          = db.Column(db.Integer, primary_key=True)
+    notes       = db.Column(db.String(200))        # optional household label
+    active      = db.Column(db.Boolean, default=True)
+    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    group_id    = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'), nullable=True)
+    # Legacy columns — kept for DB compat, migrated to SubscriberContact on startup
+    first_name  = db.Column(db.String(80))
+    last_name   = db.Column(db.String(80))
+    email       = db.Column(db.String(120))
+    phone       = db.Column(db.String(30))
+    bus_assignments = db.relationship('NotificationBusAssignment', backref='subscriber',
+                                      lazy=True, cascade='all, delete-orphan')
+    contacts    = db.relationship('SubscriberContact', backref='subscriber',
+                                  lazy=True, cascade='all, delete-orphan',
+                                  order_by='SubscriberContact.sort_order')
+
+    @property
+    def full_name(self):
+        if self.contacts:
+            name = self.contacts[0].full_name
+            if name: return name
+        if self.notes: return self.notes
+        legacy = f"{self.first_name or ''} {self.last_name or ''}".strip()
+        return legacy or 'Unnamed'
+
+
+class SubscriberContact(db.Model):
+    __tablename__ = 'subscriber_contact'
+    id            = db.Column(db.Integer, primary_key=True)
+    subscriber_id = db.Column(db.Integer, db.ForeignKey('notification_subscriber.id'), nullable=False)
+    first_name    = db.Column(db.String(80))
+    last_name     = db.Column(db.String(80))
+    email         = db.Column(db.String(120))
+    phone         = db.Column(db.String(30))
+    role          = db.Column(db.String(20), default='parent')  # 'parent' | 'student'
+    sort_order    = db.Column(db.Integer, default=0)
 
     @property
     def full_name(self): return f"{self.first_name or ''} {self.last_name or ''}".strip()
@@ -464,6 +502,7 @@ def _migrate_add_columns():
         ('configuration',           'mail_use_ssl',    'BOOLEAN DEFAULT 0'),
         ('configuration',           'time_format',     "VARCHAR(4) DEFAULT '12h'"),
         ('notification_subscriber', 'group_id',        'INTEGER'),
+        ('notification_subscriber', 'notes',           'VARCHAR(200)'),
         ('bus_schedule_type',       'window_start',    'VARCHAR(5)'),
         ('bus_schedule_type',       'window_end',      'VARCHAR(5)'),
     ]
@@ -476,11 +515,33 @@ def _migrate_add_columns():
                 pass  # column already exists
 
 
+def _migrate_subscriber_contacts():
+    """One-time: convert legacy subscriber person fields → SubscriberContact records."""
+    try:
+        subs = NotificationSubscriber.query.all()
+        changed = False
+        for sub in subs:
+            if not sub.contacts and (sub.email or sub.first_name):
+                db.session.add(SubscriberContact(
+                    subscriber_id=sub.id,
+                    first_name=sub.first_name, last_name=sub.last_name,
+                    email=sub.email, phone=sub.phone,
+                    role='parent', sort_order=0,
+                ))
+                changed = True
+        if changed:
+            db.session.commit()
+    except Exception as e:
+        print(f'[Migration] subscriber_contacts skipped: {e}')
+        db.session.rollback()
+
+
 def init_db():
     _migrate_bus_table()
     db.create_all()
     _migrate_add_columns()
     _seed_defaults()
+    _migrate_subscriber_contacts()
 
     # Auto-detect existing installations: if users exist but no lock file, create it.
     if not is_installed() and User.query.count() > 0:
@@ -690,8 +751,7 @@ def _send_bus_notifications(rec):
         if not cfg or (not cfg.mail_server and cfg.mail_provider == 'custom'):
             return
         configure_mail(cfg)
-        bus = rec.bus
-        it  = rec.incident_type
+        bus, it = rec.bus, rec.incident_type
         subject = f"Bus Update: {bus.display_name}"
         body = (f"Bus {bus.display_name} — Status Update\n\n"
                 f"Status: {it.name}\n"
@@ -701,20 +761,34 @@ def _send_bus_notifications(rec):
 
         sent_emails = set()
 
-        # Send only to subscribers explicitly assigned to this bus
-        assignments = NotificationBusAssignment.query.filter_by(bus_id=rec.bus_id).all()
-        for a in assignments:
-            sub = a.subscriber
-            if not sub.active or not sub.email:
-                continue
-            if sub.email in sent_emails:
-                continue
-            sent_emails.add(sub.email)
+        def _try_send(name, email):
+            if not email or email in sent_emails: return
+            sent_emails.add(email)
             try:
-                msg = Message(subject=subject, recipients=[sub.email], body=body)
-                mail.send(msg)
+                mail.send(Message(subject=subject, recipients=[email], body=body))
             except Exception as e:
-                print(f'[Notifications] subscriber send error: {e}')
+                print(f'[Notifications] send error to {email}: {e}')
+
+        # Primary path: group-level bus assignment → contacts
+        group_ids = {a.group_id for a in
+                     GroupBusAssignment.query.filter_by(bus_id=rec.bus_id).all()}
+        if group_ids:
+            subs = NotificationSubscriber.query.filter(
+                NotificationSubscriber.active == True,
+                NotificationSubscriber.group_id.in_(group_ids)
+            ).all()
+            for sub in subs:
+                if sub.contacts:
+                    for contact in sub.contacts:
+                        _try_send(contact.full_name, contact.email)
+                else:
+                    _try_send(sub.full_name, sub.email)  # legacy fallback
+
+        # Backward compat: direct NotificationBusAssignment (legacy records)
+        for a in NotificationBusAssignment.query.filter_by(bus_id=rec.bus_id).all():
+            s = a.subscriber
+            if s.active:
+                _try_send(s.full_name, s.email)
 
     except Exception as e:
         print(f'[Notifications] send error: {e}')
@@ -1873,23 +1947,36 @@ def notifications():
                            all_buses=all_buses, admin_users=admin_users,
                            can_write=can_write)
 
+def _save_contacts(subscriber_id, form):
+    """Read contact_{i}_* fields from form and create SubscriberContact records."""
+    count = int(form.get('contact_count', 0) or 0)
+    for i in range(min(count, 20)):
+        fn = form.get(f'contact_{i}_first_name', '').strip()
+        ln = form.get(f'contact_{i}_last_name',  '').strip()
+        em = form.get(f'contact_{i}_email',       '').strip()
+        ph = form.get(f'contact_{i}_phone',       '').strip()
+        rl = form.get(f'contact_{i}_role',        'parent').strip()
+        if fn or em:
+            db.session.add(SubscriberContact(
+                subscriber_id=subscriber_id,
+                first_name=fn or None, last_name=ln or None,
+                email=em or None,      phone=ph or None,
+                role=rl,               sort_order=i,
+            ))
+
 @app.route('/admin/notifications/add', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
 def add_subscriber():
     s = NotificationSubscriber(
-        first_name=request.form.get('first_name','').strip() or None,
-        last_name=request.form.get('last_name','').strip() or None,
-        email=request.form.get('email','').strip() or None,
-        phone=request.form.get('phone','').strip() or None,
+        notes=request.form.get('notes', '').strip() or None,
         group_id=request.form.get('group_id', type=int) or None,
     )
     db.session.add(s)
     db.session.flush()
-    for bid in request.form.getlist('bus_ids'):
-        db.session.add(NotificationBusAssignment(subscriber_id=s.id, bus_id=int(bid)))
+    _save_contacts(s.id, request.form)
     db.session.commit()
-    flash(f'Subscriber "{s.full_name}" added.', 'success')
+    flash(f'Enrollment "{s.full_name}" added.', 'success')
     return redirect(url_for('notifications'))
 
 @app.route('/admin/notifications/<int:sid>/edit', methods=['POST'])
@@ -1897,17 +1984,13 @@ def add_subscriber():
 @require_module('notifications', 'full')
 def edit_subscriber(sid):
     s = NotificationSubscriber.query.get_or_404(sid)
-    s.first_name = request.form.get('first_name','').strip() or None
-    s.last_name  = request.form.get('last_name','').strip() or None
-    s.email      = request.form.get('email','').strip() or None
-    s.phone      = request.form.get('phone','').strip() or None
-    s.active     = 'active' in request.form
-    s.group_id   = request.form.get('group_id', type=int) or None
-    NotificationBusAssignment.query.filter_by(subscriber_id=sid).delete()
-    for bid in request.form.getlist('bus_ids'):
-        db.session.add(NotificationBusAssignment(subscriber_id=sid, bus_id=int(bid)))
+    s.notes    = request.form.get('notes', '').strip() or None
+    s.active   = 'active' in request.form
+    s.group_id = request.form.get('group_id', type=int) or None
+    SubscriberContact.query.filter_by(subscriber_id=sid).delete()
+    _save_contacts(sid, request.form)
     db.session.commit()
-    flash('Subscriber updated.', 'success')
+    flash('Enrollment updated.', 'success')
     return redirect(url_for('notifications'))
 
 @app.route('/admin/notifications/<int:sid>/delete', methods=['POST'])
@@ -1918,6 +2001,137 @@ def delete_subscriber(sid):
     db.session.delete(s)
     db.session.commit()
     flash('Subscriber removed.', 'success')
+    return redirect(url_for('notifications'))
+
+
+@app.route('/admin/notifications/bulk-delete', methods=['POST'])
+@login_required
+@require_module('notifications', 'full')
+def bulk_delete_subscribers():
+    ids = request.form.getlist('subscriber_ids')
+    count = 0
+    for sid in ids:
+        try:
+            s = NotificationSubscriber.query.get(int(sid))
+            if s:
+                db.session.delete(s)
+                count += 1
+        except (ValueError, TypeError):
+            pass
+    if count:
+        db.session.commit()
+        flash(f'{count} subscriber(s) deleted.', 'success')
+    return redirect(url_for('notifications'))
+
+
+@app.route('/admin/notifications/export-csv')
+@login_required
+@require_module('notifications')
+def export_subscribers_csv():
+    import csv, io
+    subs = (NotificationSubscriber.query
+            .order_by(NotificationSubscriber.id).all())
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['subscriber_id', 'household_label', 'group', 'active',
+                     'role', 'first_name', 'last_name', 'email', 'phone'])
+    for sub in subs:
+        group_name = sub.group.name if sub.group else ''
+        active_str = 'yes' if sub.active else 'no'
+        if sub.contacts:
+            for c in sub.contacts:
+                writer.writerow([sub.id, sub.notes or '', group_name, active_str,
+                                 c.role or 'parent', c.first_name or '',
+                                 c.last_name or '', c.email or '', c.phone or ''])
+        else:
+            writer.writerow([sub.id, sub.notes or '', group_name, active_str,
+                             'parent', sub.first_name or '', sub.last_name or '',
+                             sub.email or '', sub.phone or ''])
+    output.seek(0)
+    from flask import Response
+    return Response(
+        '\ufeff' + output.getvalue(),   # BOM for Excel UTF-8 compatibility
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment;filename=subscribers.csv'})
+
+
+@app.route('/admin/notifications/import-csv', methods=['POST'])
+@login_required
+@require_module('notifications', 'full')
+def import_subscribers_csv():
+    import csv, io
+    from collections import OrderedDict
+    file = request.files.get('csv_file')
+    if not file or not file.filename:
+        flash('No file selected.', 'error')
+        return redirect(url_for('notifications'))
+    try:
+        content = file.read().decode('utf-8-sig')
+    except UnicodeDecodeError:
+        flash('File must be UTF-8 encoded.', 'error')
+        return redirect(url_for('notifications'))
+
+    reader = csv.DictReader(io.StringIO(content))
+    groups_cache = {g.name.strip().lower(): g for g in SubscriberGroup.query.all()}
+
+    # Group rows by (group_id, household_label) so multiple contacts share one subscriber
+    households = OrderedDict()
+    row_errors = []
+    skipped = 0
+
+    for i, row in enumerate(reader, 2):   # row 1 = header
+        group_name = (row.get('group') or '').strip()
+        household  = (row.get('household_label') or '').strip()
+        first_name = (row.get('first_name') or '').strip()
+        last_name  = (row.get('last_name') or '').strip()
+        email      = (row.get('email') or '').strip()
+        phone      = (row.get('phone') or '').strip()
+        role_raw   = (row.get('role') or 'parent').strip().lower()
+        role       = role_raw if role_raw in ('parent', 'student') else 'parent'
+
+        if not first_name and not email:
+            skipped += 1
+            continue
+
+        group_obj = groups_cache.get(group_name.lower()) if group_name else None
+        if group_name and not group_obj:
+            row_errors.append(f'Row {i}: group "{group_name}" not found — skipped')
+            skipped += 1
+            continue
+
+        group_id = group_obj.id if group_obj else None
+        key = (group_id, household if household else f'__row_{i}__')
+        if key not in households:
+            households[key] = {'group_id': group_id, 'notes': household or None, 'contacts': []}
+        households[key]['contacts'].append({
+            'first_name': first_name or None,
+            'last_name':  last_name  or None,
+            'email':      email      or None,
+            'phone':      phone      or None,
+            'role':       role,
+        })
+
+    imported = 0
+    for key, hh in households.items():
+        sub = NotificationSubscriber(
+            notes=hh['notes'],
+            group_id=hh['group_id'],
+            active=True,
+        )
+        db.session.add(sub)
+        db.session.flush()
+        for idx, c in enumerate(hh['contacts']):
+            db.session.add(SubscriberContact(
+                subscriber_id=sub.id, sort_order=idx, **c))
+        imported += 1
+
+    db.session.commit()
+    parts = [f'{imported} subscriber(s) imported.']
+    if skipped:
+        parts.append(f'{skipped} row(s) skipped.')
+    if row_errors:
+        parts.append(' | '.join(row_errors[:5]))
+    flash(' '.join(parts), 'success' if not row_errors else 'warning')
     return redirect(url_for('notifications'))
 
 
@@ -1936,7 +2150,14 @@ def add_subscriber_group():
     if SubscriberGroup.query.filter_by(name=name).first():
         flash(f'Group "{name}" already exists.', 'error')
         return redirect(url_for('notifications', tab='groups'))
-    db.session.add(SubscriberGroup(name=name, color=color, description=desc))
+    g = SubscriberGroup(name=name, color=color, description=desc)
+    db.session.add(g)
+    db.session.flush()
+    for bid in request.form.getlist('bus_ids'):
+        try:
+            db.session.add(GroupBusAssignment(group_id=g.id, bus_id=int(bid)))
+        except Exception:
+            pass
     db.session.commit()
     flash(f'Group "{name}" created.', 'success')
     return redirect(url_for('notifications', tab='groups'))
@@ -1971,6 +2192,12 @@ def edit_subscriber_group(gid):
     g.name        = name
     g.color       = request.form.get('color', g.color)
     g.description = request.form.get('description', '').strip()
+    GroupBusAssignment.query.filter_by(group_id=gid).delete()
+    for bid in request.form.getlist('bus_ids'):
+        try:
+            db.session.add(GroupBusAssignment(group_id=gid, bus_id=int(bid)))
+        except Exception:
+            pass
     db.session.commit()
     flash('Group updated.', 'success')
     return redirect(url_for('notifications', tab='groups'))
@@ -1988,12 +2215,20 @@ def _build_recipient_list(target, group_ids, subscriber_id, user_id):
             seen.add(email)
             recipients.append((name, email))
 
+    def add_sub(s):
+        """Add all contacts of a subscriber, or legacy email if no contacts."""
+        if s.contacts:
+            for c in s.contacts:
+                add(c.full_name, c.email)
+        else:
+            add(s.full_name, s.email)
+
     if target in ('all', 'subscribers', 'group'):
         query = NotificationSubscriber.query.filter_by(active=True)
         if target == 'group' and group_ids:
             query = query.filter(NotificationSubscriber.group_id.in_(group_ids))
-        for s in query.order_by(NotificationSubscriber.last_name).all():
-            add(s.full_name, s.email)
+        for s in query.all():
+            add_sub(s)
 
     if target in ('all', 'admins'):
         for u in User.query.filter_by(active=True, receive_notifications=True).all():
@@ -2002,7 +2237,7 @@ def _build_recipient_list(target, group_ids, subscriber_id, user_id):
     if target == 'individual_subscriber' and subscriber_id:
         s = NotificationSubscriber.query.get(subscriber_id)
         if s:
-            add(s.full_name, s.email)
+            add_sub(s)
 
     if target == 'individual_user' and user_id:
         u = User.query.get(user_id)
