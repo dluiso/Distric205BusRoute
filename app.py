@@ -1367,7 +1367,7 @@ def statistics():
         n = r.incident_type.name
         by_type[n]        = by_type.get(n, 0) + 1
         by_type_colors[n] = r.incident_type.color
-        b = r.bus.identifier
+        b = f"{r.bus.identifier} · {r.bus.name}"
         by_bus[b] = by_bus.get(b, 0) + 1
         d = r.incident_date.isoformat()
         by_day[d] = by_day.get(d, 0) + 1
@@ -1382,11 +1382,11 @@ def statistics():
     for r in records:
         pname = r.schedule_type.name if r.schedule_type else None
         if pname and pname in period_bus_data:
-            b = r.bus.identifier
+            b = f"{r.bus.identifier} · {r.bus.name}"
             period_bus_data[pname][b] = period_bus_data[pname].get(b, 0) + 1
     # Only keep periods that actually have data
     period_bus_data = {k: v for k, v in period_bus_data.items() if v}
-    record_buses = sorted({r.bus.identifier for r in records})
+    record_buses = sorted({f"{r.bus.identifier} · {r.bus.name}" for r in records})
 
     # ── Bus Audit ─────────────────────────────────────────────────────────
     default_type = IncidentType.query.filter_by(is_default=True).first()
@@ -1408,14 +1408,15 @@ def statistics():
     for bus in audit_buses_list:
         inc_days = len(bus_incident_dates.get(bus.id, set()))
         ot_days  = max(0, total_days_in_range - inc_days)
-        on_time_by_bus[bus.identifier] = ot_days
+        blabel = f"{bus.identifier} · {bus.name}"
+        on_time_by_bus[blabel] = ot_days
         bus_delays = [r.delay_minutes for r in records
                       if r.bus_id == bus.id and r.delay_minutes and r.delay_minutes > 0]
         avg_d = round(sum(bus_delays) / len(bus_delays), 1) if bus_delays else 0.0
         tot_d = sum(bus_delays)
         rate  = round(ot_days / total_days_in_range * 100, 1) if total_days_in_range else 100.0
-        bus_audit[bus.identifier] = {
-            'name': bus.name, 'route': bus.route or '',
+        bus_audit[blabel] = {
+            'id': bus.identifier, 'name': bus.name, 'route': bus.route or '',
             'total_days': total_days_in_range,
             'on_time_days': ot_days, 'incident_days': inc_days,
             'on_time_rate': rate, 'avg_delay': avg_d, 'total_delay': tot_d,
@@ -1428,7 +1429,7 @@ def statistics():
         by_type_colors[default_type.name] = default_type.color
 
     # Stacked datasets for audit chart: {status_name: {data:[...], color:hex}}
-    audit_bus_order = [b.identifier for b in audit_buses_list]
+    audit_bus_order = [f"{b.identifier} · {b.name}" for b in audit_buses_list]
     audit_datasets  = {}
     if default_type:
         audit_datasets[default_type.name] = {
@@ -1437,14 +1438,15 @@ def statistics():
         }
     for r in records:
         if not r.incident_type.is_default:
-            n = r.incident_type.name
+            n   = r.incident_type.name
+            blb = f"{r.bus.identifier} · {r.bus.name}"
             if n not in audit_datasets:
                 audit_datasets[n] = {
                     'data':  [0] * len(audit_bus_order),
                     'color': r.incident_type.color,
                 }
-            if r.bus.identifier in audit_bus_order:
-                audit_datasets[n]['data'][audit_bus_order.index(r.bus.identifier)] += 1
+            if blb in audit_bus_order:
+                audit_datasets[n]['data'][audit_bus_order.index(blb)] += 1
 
     all_buses  = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
     all_types  = IncidentType.query.order_by(IncidentType.sort_order).all()
