@@ -2712,7 +2712,7 @@ def system_status():
         result['psutil'] = True
     except ImportError:
         result['psutil'] = False
-        result['cpu_pct'] = result['mem_pct'] = result['disk_pct'] = 'N/A'
+        result['cpu_pct'] = result['mem_pct'] = 'N/A'
         result['mem_total'] = result['mem_used'] = 'N/A'
         result['uptime'] = 'N/A (psutil not installed)'
 
