@@ -325,74 +325,71 @@
       <!-- Body -->
       <div class="p-4 flex-1 space-y-3">
 
-        <!-- 1. Status + delay + ETA — always first, most important -->
+        <!-- 1. TODAY'S UPDATES (top) — incidents with pill styling, or clean On Time -->
+        {% if item.incidents %}
+        <div>
+          <p class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Today's Updates</p>
+          <div class="space-y-2">
+            {% for inc in item.incidents %}
+            <div>
+              <!-- Incident pill + delay + ETA on same row -->
+              <div class="flex flex-wrap items-center gap-1.5">
+                <span class="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-semibold text-white"
+                      style="background-color:{{ inc.incident_type.color }}">
+                  <i class="fas {{ inc.incident_type.icon }} text-xs"></i>
+                  <span>{{ inc.incident_type.name }}</span>
+                </span>
+                {% if inc.delay_minutes and inc.delay_minutes > 0 %}
+                <span class="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
+                  <i class="fas fa-clock text-xs"></i>+{{ inc.delay_minutes }} {{ t('delay') }}
+                </span>
+                {% endif %}
+                {% if inc.eta %}
+                <span class="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">
+                  <i class="fas fa-hourglass-half text-xs"></i>ETA {{ fmt_time(inc.eta, cfg.time_format) }}
+                </span>
+                {% endif %}
+              </div>
+              <!-- Reason / notes below pills -->
+              {% if inc.delay_reason_id and inc.delay_reason %}
+              <p class="text-xs text-slate-400 mt-0.5 ml-0.5"><i class="fas fa-comment-alt mr-1 opacity-50"></i>{{ inc.delay_reason.reason }}</p>
+              {% elif inc.delay_reason_text %}
+              <p class="text-xs text-slate-400 mt-0.5 ml-0.5"><i class="fas fa-comment-alt mr-1 opacity-50"></i>{{ inc.delay_reason_text }}</p>
+              {% endif %}
+              {% if inc.notes %}<p class="text-xs text-slate-400 italic mt-0.5 ml-0.5">{{ inc.notes }}</p>{% endif %}
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        {% else %}
+        <!-- No incidents: clean status pill + no-incidents note -->
         <div class="flex flex-wrap items-center gap-1.5">
           <span class="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-semibold text-white"
                 style="background-color:{{ status.color if status else '#10b981' }}">
             <i class="fas {{ status.icon if status else 'fa-check-circle' }} text-xs"></i>
             <span>{{ status.name if status else t('on_time') }}</span>
           </span>
-          {% if delay and delay > 0 %}
-          <span class="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
-            <i class="fas fa-clock text-xs"></i>+{{ delay }} {{ t('delay') }}
-          </span>
-          {% endif %}
-          {% if item.eta %}
-          <span class="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">
-            <i class="fas fa-hourglass-half text-xs"></i>ETA {{ fmt_time(item.eta, cfg.time_format) }}
-          </span>
-          {% endif %}
         </div>
+        <p class="text-xs text-slate-300"><i class="fas fa-check mr-1"></i>{{ t('no_incidents') }}</p>
+        {% endif %}
 
         <!-- 2. Route -->
         {% if bus.route %}
         <p class="text-xs text-slate-400"><i class="fas fa-map-marker-alt mr-1"></i>{{ bus.route }}</p>
         {% endif %}
 
-        <!-- 3. Schedule departure times -->
+        <!-- 3. Service schedule -->
         {% if item.schedule_assignments %}
-        <div class="flex flex-wrap gap-1">
-          {% for a in item.schedule_assignments %}
-          <span class="text-xs px-2 py-0.5 bg-slate-100 text-slate-500 rounded-full">
-            {{ a.schedule_type.name }}{% if a.departure_time %} <span class="text-blue-500 font-medium">{{ fmt_time(a.departure_time, cfg.time_format) }}</span>{% endif %}
-          </span>
-          {% endfor %}
-        </div>
-        {% endif %}
-
-        <!-- 4. Today's incidents -->
-        {% if item.incidents %}
-        <div class="border-t border-slate-100 pt-2 space-y-2">
-          <p class="text-xs font-semibold text-slate-400 uppercase tracking-wide">{{ t('todays_incidents') if t('todays_incidents') != 'todays_incidents' else "Today's Updates" }}</p>
-          {% for inc in item.incidents %}
-          <div class="flex items-start gap-2">
-            <span class="w-2 h-2 rounded-full mt-1 flex-shrink-0" style="background-color:{{ inc.incident_type.color }}"></span>
-            <div class="min-w-0 text-xs space-y-0.5">
-              <!-- Status name + schedule period -->
-              <div class="flex flex-wrap items-center gap-1.5">
-                <span class="font-semibold" style="color:{{ inc.incident_type.color }}">{{ inc.incident_type.name }}</span>
-                {% if inc.schedule_type %}<span class="text-slate-400">· {{ inc.schedule_type.name }}</span>{% endif %}
-              </div>
-              <!-- Delay + ETA on their own line -->
-              {% if inc.delay_minutes or inc.eta %}
-              <div class="flex flex-wrap items-center gap-1.5">
-                {% if inc.delay_minutes %}<span class="text-orange-600 font-medium">+{{ inc.delay_minutes }} min</span>{% endif %}
-                {% if inc.eta %}<span class="text-blue-600 font-medium">ETA {{ fmt_time(inc.eta, cfg.time_format) }}</span>{% endif %}
-              </div>
-              {% endif %}
-              <!-- Reason -->
-              {% if inc.delay_reason_id and inc.delay_reason %}
-              <p class="text-slate-400"><i class="fas fa-comment-alt mr-1 opacity-60"></i>{{ inc.delay_reason.reason }}</p>
-              {% elif inc.delay_reason_text %}
-              <p class="text-slate-400"><i class="fas fa-comment-alt mr-1 opacity-60"></i>{{ inc.delay_reason_text }}</p>
-              {% endif %}
-              {% if inc.notes %}<p class="text-slate-400 italic">{{ inc.notes }}</p>{% endif %}
-            </div>
+        <div>
+          <p class="text-xs text-slate-400 mb-1">Service schedule:</p>
+          <div class="flex flex-wrap gap-1">
+            {% for a in item.schedule_assignments %}
+            <span class="text-xs px-2 py-0.5 bg-slate-100 text-slate-500 rounded-full">
+              {{ a.schedule_type.name }}{% if a.departure_time %} <span class="text-blue-500 font-medium">{{ fmt_time(a.departure_time, cfg.time_format) }}</span>{% endif %}
+            </span>
+            {% endfor %}
           </div>
-          {% endfor %}
         </div>
-        {% else %}
-        <p class="text-xs text-slate-300 pt-0.5"><i class="fas fa-check mr-1"></i>{{ t('no_incidents') }}</p>
         {% endif %}
 
       </div>
