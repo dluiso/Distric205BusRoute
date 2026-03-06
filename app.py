@@ -2940,11 +2940,16 @@ def check_twilio():
     if not sid or not tok:
         return jsonify({'ok': False, 'message': 'Account SID and Auth Token are required.'})
     try:
-        tw      = TwilioClient(sid, tok)
-        account = tw.api.accounts(sid).fetch()
+        tw = TwilioClient(sid, tok)
+        # Use incoming phone numbers list — works on both trial and paid accounts
+        numbers = tw.incoming_phone_numbers.list(limit=1)
+        label = numbers[0].phone_number if numbers else '(no numbers purchased yet)'
         return jsonify({'ok': True,
-                        'message': f'Connected! Account: {account.friendly_name} ({account.status})'})
+                        'message': f'Connected! Credentials valid. From number on account: {label}'})
     except TwilioRestException as e:
+        # 20003 = authentication error (bad SID/token)
+        if e.code == 20003:
+            return jsonify({'ok': False, 'message': 'Authentication failed — check your Account SID and Auth Token.'})
         return jsonify({'ok': False, 'message': f'Twilio error {e.code}: {e.msg}'})
     except Exception as e:
         return jsonify({'ok': False, 'message': str(e)})
