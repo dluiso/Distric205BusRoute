@@ -374,6 +374,137 @@
   {% endif %}
 </div>
 
+<!-- ══ Notification Statistics ══════════════════════════════════════════════ -->
+<div class="mt-5">
+  <div class="flex items-center justify-between mb-3">
+    <h2 class="text-lg font-bold text-slate-700 flex items-center space-x-2">
+      <i class="fas fa-bell text-blue-500"></i><span>Notification Statistics</span>
+    </h2>
+    {% if can_export %}
+    <a href="{{ url_for('export_notification_stats', period=period, date_from=date_from, date_to=date_to, bus_id=bus_id or '') }}"
+       class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-medium rounded-xl transition-colors">
+      <i class="fas fa-download"></i>Export Notifications CSV
+    </a>
+    {% endif %}
+  </div>
+
+  <!-- Summary cards -->
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 text-center">
+      <p class="text-2xl font-bold text-slate-700">{{ notif_sent + notif_failed }}</p>
+      <p class="text-xs text-slate-400 mt-0.5">Total Sent</p>
+    </div>
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 text-center">
+      <p class="text-2xl font-bold text-blue-600">{{ notif_email_sent }}</p>
+      <p class="text-xs text-slate-400 mt-0.5"><i class="fas fa-envelope mr-1"></i>Emails</p>
+    </div>
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 text-center">
+      <p class="text-2xl font-bold text-emerald-600">{{ notif_sms_sent }}</p>
+      <p class="text-xs text-slate-400 mt-0.5"><i class="fas fa-sms mr-1"></i>SMS</p>
+    </div>
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 text-center">
+      <p class="text-2xl font-bold text-orange-600">${{ '%.4f'|format(notif_total_cost) }}</p>
+      <p class="text-xs text-slate-400 mt-0.5">SMS Cost (USD)</p>
+    </div>
+  </div>
+
+  {% if notif_logs %}
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+
+    <!-- Channel donut -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
+      <h4 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3">By Channel</h4>
+      <div class="relative h-44">
+        <canvas id="notifChannelChart"></canvas>
+      </div>
+    </div>
+
+    <!-- Daily bar chart -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 lg:col-span-2">
+      <h4 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3">Notifications Per Day</h4>
+      <div class="relative h-44">
+        <canvas id="notifDayChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Group breakdown -->
+  {% if notif_by_group_json != '{}' %}
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 mb-4">
+    <h4 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3">Notifications by Group</h4>
+    <div class="relative h-40">
+      <canvas id="notifGroupChart"></canvas>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Log table -->
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+    <div class="px-5 py-3 border-b border-slate-100 flex items-center justify-between">
+      <h4 class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Notification Log</h4>
+      <span class="text-xs text-slate-400">{{ notif_logs|length }} record{{ 's' if notif_logs|length != 1 }}</span>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-left text-xs font-semibold text-slate-500 bg-slate-50 border-b border-slate-100">
+            <th class="px-4 py-2.5">Sent At</th>
+            <th class="px-4 py-2.5">Channel</th>
+            <th class="px-4 py-2.5">Bus</th>
+            <th class="px-4 py-2.5">Recipient</th>
+            <th class="px-4 py-2.5">Group</th>
+            <th class="px-4 py-2.5">Status</th>
+            <th class="px-4 py-2.5">Cost</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-50">
+          {% for nl in notif_logs[:100] %}
+          <tr class="hover:bg-slate-50 transition-colors">
+            <td class="px-4 py-2 text-xs text-slate-500 whitespace-nowrap">{{ nl.sent_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td class="px-4 py-2">
+              {% if nl.channel == 'email' %}
+              <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">
+                <i class="fas fa-envelope text-xs"></i>Email
+              </span>
+              {% else %}
+              <span class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">
+                <i class="fas fa-sms text-xs"></i>SMS
+              </span>
+              {% endif %}
+            </td>
+            <td class="px-4 py-2 text-xs text-slate-600">{{ nl.bus_label or '—' }}</td>
+            <td class="px-4 py-2 text-xs text-slate-600">
+              <span class="font-medium">{{ nl.recipient_name or '—' }}</span>
+              {% if nl.recipient_address %}<span class="block text-slate-400">{{ nl.recipient_address }}</span>{% endif %}
+            </td>
+            <td class="px-4 py-2 text-xs text-slate-500">{{ nl.group_name or '—' }}</td>
+            <td class="px-4 py-2">
+              {% if nl.status == 'sent' %}
+              <span class="text-xs font-medium text-emerald-600"><i class="fas fa-check mr-0.5"></i>Sent</span>
+              {% else %}
+              <span class="text-xs font-medium text-red-500" title="{{ nl.error_message or '' }}"><i class="fas fa-times mr-0.5"></i>Failed</span>
+              {% endif %}
+            </td>
+            <td class="px-4 py-2 text-xs text-slate-500">
+              {% if nl.sms_cost_usd %}<span class="font-mono">${{ '%.4f'|format(nl.sms_cost_usd) }}</span>{% else %}—{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          {% if notif_logs|length > 100 %}
+          <tr><td colspan="7" class="px-4 py-2 text-center text-xs text-slate-400 italic">Showing first 100 of {{ notif_logs|length }} records. Export CSV for full log.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% else %}
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-8 text-center text-slate-400">
+    <i class="fas fa-bell-slash text-2xl mb-2 block"></i>
+    <p class="text-sm">No notifications logged for this period.</p>
+  </div>
+  {% endif %}
+</div>
+
 {% if can_write %}
 <!-- ══ Reset Statistics ══════════════════════════════════════════════════════ -->
 <div class="bg-white rounded-2xl shadow-sm border border-red-100 p-5 mt-5">
@@ -777,6 +908,55 @@ if (Object.keys(busAudit).length) {
 } else {
   const el = document.getElementById('audit-table-loading');
   if (el) el.innerHTML = '<i class="fas fa-bus text-3xl block mb-2 text-slate-200"></i>No active buses found';
+}
+
+// ── Notification Charts ──────────────────────────────────────────────────────
+const notifByChannel = {{ notif_by_channel_json|safe }};
+const notifByDay     = {{ notif_by_day_json|safe }};
+const notifByGroup   = {{ notif_by_group_json|safe }};
+
+if (Object.keys(notifByChannel).length) {
+  new Chart(document.getElementById('notifChannelChart'), {
+    type: 'doughnut',
+    data: {
+      labels: Object.keys(notifByChannel),
+      datasets: [{ data: Object.values(notifByChannel), borderWidth: 2, borderColor: '#fff',
+        backgroundColor: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444'] }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, cutout: '60%',
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } } } }
+  });
+}
+
+if (Object.keys(notifByDay).length) {
+  new Chart(document.getElementById('notifDayChart'), {
+    type: 'bar',
+    data: {
+      labels: Object.keys(notifByDay),
+      datasets: [{ label: 'Notifications', data: Object.values(notifByDay),
+        backgroundColor: '#3b82f6', borderRadius: 4 }]
+    },
+    options: { responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+    }
+  });
+}
+
+if (Object.keys(notifByGroup).length && document.getElementById('notifGroupChart')) {
+  new Chart(document.getElementById('notifGroupChart'), {
+    type: 'bar',
+    data: {
+      labels: Object.keys(notifByGroup),
+      datasets: [{ label: 'Notifications', data: Object.values(notifByGroup),
+        backgroundColor: Object.keys(notifByGroup).map((_,i) => `hsl(${220+i*25},70%,55%)`),
+        borderRadius: 4 }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+      plugins: { legend: { display: false } },
+      scales: { x: { beginAtZero: true, ticks: { precision: 0 } } }
+    }
+  });
 }
 </script>
 {% endblock %}

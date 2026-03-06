@@ -12,6 +12,7 @@
     ('operational', 'Operational','fa-clock'),
     ('language',    'Language',   'fa-language'),
     ('email',       'Email',      'fa-envelope'),
+    ('sms',         'SMS',        'fa-sms'),
     ('data',        'Data',       'fa-database'),
   ] %}
   <button onclick="showTab('{{ tab_id }}')" id="tab-btn-{{ tab_id }}"
@@ -776,6 +777,222 @@
   </div>
 </div>
 
+<!-- ══ SMS ══ -->
+<div id="tab-sms" {% if active_tab != 'sms' %}class="hidden"{% endif %}>
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+
+    <!-- Main form -->
+    <div class="lg:col-span-2">
+      <form method="POST" id="sms-form">
+        <input type="hidden" name="section" value="sms">
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 space-y-5">
+          <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+            <i class="fas fa-sms text-blue-500"></i><span>Twilio SMS Settings</span>
+          </h3>
+
+          <!-- Enable toggle -->
+          <div class="flex items-center justify-between p-4 bg-slate-50 rounded-xl">
+            <div>
+              <p class="text-sm font-semibold text-slate-700">Enable SMS Notifications</p>
+              <p class="text-xs text-slate-500 mt-0.5">Send text messages to subscribers when bus incidents are recorded</p>
+            </div>
+            <label class="relative inline-flex items-center cursor-pointer">
+              <input type="checkbox" name="twilio_enabled" id="twilio_enabled"
+                     {% if cfg.twilio_enabled %}checked{% endif %}
+                     class="sr-only peer">
+              <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer
+                          peer-checked:after:translate-x-full peer-checked:after:border-white
+                          after:content-[''] after:absolute after:top-[2px] after:left-[2px]
+                          after:bg-white after:border after:rounded-full after:h-5 after:w-5
+                          after:transition-all peer-checked:bg-blue-600"></div>
+            </label>
+          </div>
+
+          <!-- Credentials -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Account SID</label>
+            <input type="text" name="twilio_account_sid" id="twilio_account_sid"
+                   value="{{ cfg.twilio_account_sid or '' }}"
+                   placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                   autocomplete="off"
+                   class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">
+              Auth Token
+              {% if cfg.twilio_auth_token %}<span class="ml-1 text-emerald-600 font-normal text-xs">(saved)</span>{% endif %}
+            </label>
+            <div class="relative">
+              <input type="password" name="twilio_auth_token" id="twilio_auth_token"
+                     placeholder="Leave blank to keep current"
+                     autocomplete="new-password"
+                     class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 pr-9">
+              <button type="button" onclick="toggleSmsPwd()"
+                      class="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs">
+                <i class="fas fa-eye" id="sms-pwd-eye"></i>
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">From Number <span class="font-normal text-slate-400">(E.164 format: +1XXXXXXXXXX)</span></label>
+            <input type="text" name="twilio_from_number" id="twilio_from_number"
+                   value="{{ cfg.twilio_from_number or '' }}"
+                   placeholder="+15551234567"
+                   class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500">
+          </div>
+
+          <div>
+            <label class="block text-xs font-semibold text-slate-600 mb-1.5">Cost per SMS Segment <span class="font-normal text-slate-400">(USD — check your Twilio plan)</span></label>
+            <div class="relative w-40">
+              <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">$</span>
+              <input type="number" name="twilio_sms_cost_per_seg" id="twilio_sms_cost_per_seg"
+                     value="{{ cfg.twilio_sms_cost_per_seg or 0.0079 }}"
+                     step="0.0001" min="0" max="1"
+                     class="w-full pl-7 pr-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <p class="text-xs text-slate-400 mt-1">Standard Twilio US rate: $0.0079/segment (160 chars = 1 segment)</p>
+          </div>
+
+          {% if can_write %}
+          <div class="pt-2 border-t border-slate-100">
+            <button type="submit"
+                    class="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium transition-colors">
+              <i class="fas fa-save mr-1"></i>Save SMS Config
+            </button>
+          </div>
+          {% endif %}
+        </div>
+      </form>
+
+      <!-- Test tools -->
+      {% if can_write %}
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 mt-5 space-y-5">
+
+        <!-- Check Connection -->
+        <div>
+          <h3 class="font-bold text-slate-700 mb-1 flex items-center space-x-2">
+            <i class="fas fa-plug text-blue-500"></i><span>Verify Credentials</span>
+          </h3>
+          <p class="text-xs text-slate-500 mb-3">
+            Connects to the Twilio API and verifies Account SID + Auth Token — without sending any message.
+          </p>
+          <button type="button" onclick="checkTwilio()"
+                  class="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+            <i class="fas fa-network-wired mr-1"></i>Verify Connection
+          </button>
+          <p id="twilio-check-result" class="text-sm mt-2 hidden"></p>
+        </div>
+
+        <div class="border-t border-slate-100"></div>
+
+        <!-- Send Test SMS -->
+        <div>
+          <h3 class="font-bold text-slate-700 mb-1 flex items-center space-x-2">
+            <i class="fas fa-paper-plane text-emerald-500"></i><span>Send Test SMS</span>
+          </h3>
+          <p class="text-xs text-slate-500 mb-3">
+            Sends a real test SMS. The number must be in E.164 format (+1XXXXXXXXXX).
+            In Twilio trial accounts, only verified numbers can receive messages.
+          </p>
+          <div class="flex items-center space-x-2">
+            <input type="tel" id="sms_test_to" placeholder="+15551234567"
+                   class="flex-1 px-3 py-2.5 border border-slate-200 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-emerald-500">
+            <button type="button" onclick="sendTestSms()"
+                    class="px-4 py-2.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl text-sm font-medium whitespace-nowrap">
+              <i class="fas fa-paper-plane mr-1"></i>Send Test
+            </button>
+          </div>
+          <p id="sms-test-result" class="text-sm mt-2 hidden"></p>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Right sidebar -->
+    <div class="space-y-4">
+
+      <!-- Status indicator -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
+        <h4 class="font-semibold text-slate-600 text-xs uppercase tracking-wider mb-3">Configuration Status</h4>
+        <div class="space-y-2 text-sm">
+          {% set sms_enabled = cfg.twilio_enabled %}
+          {% set sms_sid = cfg.twilio_account_sid %}
+          {% set sms_tok = cfg.twilio_auth_token %}
+          {% set sms_from = cfg.twilio_from_number %}
+          <div class="flex items-center space-x-2">
+            <i class="fas {% if sms_enabled %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <span class="text-slate-600">SMS Enabled</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <i class="fas {% if sms_sid %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <span class="text-slate-600">Account SID</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <i class="fas {% if sms_tok %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <span class="text-slate-600">Auth Token</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <i class="fas {% if sms_from %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <span class="text-slate-600">From Number</span>
+          </div>
+          {% if sms_enabled and sms_sid and sms_tok and sms_from %}
+          <p class="mt-2 text-xs text-emerald-600 font-medium"><i class="fas fa-check mr-1"></i>Ready to send SMS</p>
+          {% else %}
+          <p class="mt-2 text-xs text-amber-600 font-medium"><i class="fas fa-exclamation-triangle mr-1"></i>Setup incomplete</p>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- Quick guide -->
+      <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
+        <h4 class="font-semibold text-slate-600 text-xs uppercase tracking-wider mb-3">
+          <i class="fab fa-twilio text-red-500 mr-1"></i>Twilio Setup Guide
+        </h4>
+        <ol class="text-xs text-slate-600 space-y-2 list-decimal list-inside">
+          <li>Sign up at <span class="font-mono text-blue-600">twilio.com</span></li>
+          <li>From the Console, copy your <strong>Account SID</strong> and <strong>Auth Token</strong></li>
+          <li>Buy a phone number (Messaging → Phone Numbers)</li>
+          <li>Enter the number in E.164 format: <span class="font-mono">+1XXXXXXXXXX</span></li>
+          <li>Set your cost per segment to match your Twilio plan</li>
+          <li>Use "Verify Connection" to confirm credentials</li>
+          <li>Send a test SMS before enabling for production</li>
+        </ol>
+      </div>
+
+      <!-- Phone number format tip -->
+      <div class="bg-amber-50 rounded-2xl border border-amber-100 p-4">
+        <h4 class="font-semibold text-amber-700 text-xs uppercase tracking-wider mb-2">
+          <i class="fas fa-exclamation-triangle mr-1"></i>Phone Number Format
+        </h4>
+        <p class="text-xs text-amber-700">
+          Subscriber phone numbers must be in <strong>E.164 format</strong>:
+          <span class="font-mono">+15551234567</span>
+        </p>
+        <p class="text-xs text-amber-600 mt-1">
+          Numbers without country code (+1 for US/Canada) will fail to send.
+          Update subscriber contacts in the Notifications module.
+        </p>
+      </div>
+
+      <!-- Cost info -->
+      <div class="bg-blue-50 rounded-2xl border border-blue-100 p-4">
+        <h4 class="font-semibold text-blue-700 text-xs uppercase tracking-wider mb-2">
+          <i class="fas fa-dollar-sign mr-1"></i>Cost Calculation
+        </h4>
+        <p class="text-xs text-blue-700">
+          SMS cost is calculated locally at send time: <strong>segments × cost/segment</strong>.
+        </p>
+        <p class="text-xs text-blue-600 mt-1">
+          A standard SMS (≤160 chars) = 1 segment. Longer messages split into multiple segments.
+          View cumulative costs in the Statistics module.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ══ DATA ══ -->
 <div id="tab-data" {% if active_tab != 'data' %}class="hidden"{% endif %}>
   <div class="space-y-6 max-w-5xl">
@@ -1236,6 +1453,74 @@ async function testEmailLive() {
     }
   }
 })();
+
+// ── SMS TAB ────────────────────────────────────────────────────────────────
+function toggleSmsPwd() {
+  const inp = document.getElementById('twilio_auth_token');
+  const eye = document.getElementById('sms-pwd-eye');
+  if (inp.type === 'password') {
+    inp.type = 'text';
+    eye.className = 'fas fa-eye-slash';
+  } else {
+    inp.type = 'password';
+    eye.className = 'fas fa-eye';
+  }
+}
+
+function smsFormData() {
+  return {
+    account_sid: document.getElementById('twilio_account_sid')?.value.trim() || '',
+    auth_token:  document.getElementById('twilio_auth_token')?.value.trim() || '',
+    from_number: document.getElementById('twilio_from_number')?.value.trim() || '',
+  };
+}
+
+async function checkTwilio() {
+  const result = document.getElementById('twilio-check-result');
+  result.textContent = 'Checking…';
+  result.className = 'text-sm mt-2 text-blue-600';
+  result.classList.remove('hidden');
+  try {
+    const resp = await fetch('/admin/config/check-twilio', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(smsFormData()),
+    });
+    const json = await resp.json();
+    result.textContent = json.message;
+    result.className = 'text-sm mt-2 font-medium ' + (json.ok ? 'text-emerald-600' : 'text-red-600');
+  } catch (e) {
+    result.textContent = 'Network error: ' + e.message;
+    result.className = 'text-sm mt-2 text-red-600';
+  }
+}
+
+async function sendTestSms() {
+  const toNum  = document.getElementById('sms_test_to').value.trim();
+  const result = document.getElementById('sms-test-result');
+  if (!toNum) {
+    result.textContent = 'Enter a destination phone number.';
+    result.className = 'text-sm mt-2 text-red-600';
+    result.classList.remove('hidden');
+    return;
+  }
+  result.textContent = 'Sending…';
+  result.className = 'text-sm mt-2 text-blue-600';
+  result.classList.remove('hidden');
+  try {
+    const resp = await fetch('/admin/config/test-sms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...smsFormData(), to_number: toNum }),
+    });
+    const json = await resp.json();
+    result.textContent = json.message;
+    result.className = 'text-sm mt-2 font-medium ' + (json.ok ? 'text-emerald-600' : 'text-red-600');
+  } catch (e) {
+    result.textContent = 'Network error: ' + e.message;
+    result.className = 'text-sm mt-2 text-red-600';
+  }
+}
 
 // ── DATA TAB — System Status ───────────────────────────────────────────────
 function loadStatus() {

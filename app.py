@@ -14,7 +14,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime, date, timedelta
 from functools import wraps
 from sqlalchemy import func
-import os, json, csv, io, pytz, re, threading, uuid, time, secrets, html, tempfile
+import os, json, csv, io, pytz, re, threading, uuid, time, secrets, html, tempfile, math
 from collections import defaultdict
 
 try:
@@ -34,6 +34,13 @@ try:
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
+
+try:
+    from twilio.rest import Client as TwilioClient
+    from twilio.base.exceptions import TwilioRestException
+    TWILIO_AVAILABLE = True
+except ImportError:
+    TWILIO_AVAILABLE = False
 
 
 # ── APP SETUP ────────────────────────────────────────────────────────────────
@@ -129,6 +136,12 @@ class Configuration(db.Model):
     mail_password       = db.Column(db.String(200), default='')
     mail_from_email     = db.Column(db.String(100), default='')
     mail_from_name      = db.Column(db.String(100), default='Bus Tracker')
+    # SMS / Twilio
+    twilio_enabled          = db.Column(db.Boolean, default=False)
+    twilio_account_sid      = db.Column(db.String(60), default='')
+    twilio_auth_token       = db.Column(db.String(60), default='')
+    twilio_from_number      = db.Column(db.String(20), default='')
+    twilio_sms_cost_per_seg = db.Column(db.Float, default=0.0079)
 
 
 class OperationalSchedule(db.Model):
@@ -386,6 +399,26 @@ class NotificationBusAssignment(db.Model):
     __table_args__ = (db.UniqueConstraint('subscriber_id', 'bus_id'),)
 
 
+class NotificationLog(db.Model):
+    __tablename__ = 'notification_log'
+    id                 = db.Column(db.Integer, primary_key=True)
+    incident_record_id = db.Column(db.Integer, db.ForeignKey('bus_incident_record.id'), nullable=True)
+    sent_at            = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    channel            = db.Column(db.String(10), nullable=False)   # 'email' | 'sms'
+    recipient_name     = db.Column(db.String(160))
+    recipient_address  = db.Column(db.String(160))                  # email or phone
+    subscriber_id      = db.Column(db.Integer, db.ForeignKey('notification_subscriber.id'), nullable=True)
+    group_id           = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'), nullable=True)
+    group_name         = db.Column(db.String(100))
+    bus_id             = db.Column(db.Integer, db.ForeignKey('bus.id'), nullable=True)
+    bus_label          = db.Column(db.String(80))
+    status             = db.Column(db.String(10), default='sent')   # 'sent' | 'failed'
+    error_message      = db.Column(db.Text)
+    sms_sid            = db.Column(db.String(50))
+    sms_segments       = db.Column(db.Integer)
+    sms_cost_usd       = db.Column(db.Float)
+
+
 @login_manager.user_loader
 def load_user(uid): return User.query.get(int(uid))
 
@@ -520,7 +553,12 @@ def _migrate_add_columns():
         ('notification_subscriber', 'notes',           'VARCHAR(200)'),
         ('bus_schedule_type',       'window_start',    'VARCHAR(5)'),
         ('bus_schedule_type',       'window_end',      'VARCHAR(5)'),
-        ('holiday',                 'custom_message',  'TEXT'),
+        ('holiday',                 'custom_message',        'TEXT'),
+        ('configuration',           'twilio_enabled',         'BOOLEAN DEFAULT 0'),
+        ('configuration',           'twilio_account_sid',     "VARCHAR(60) DEFAULT ''"),
+        ('configuration',           'twilio_auth_token',      "VARCHAR(60) DEFAULT ''"),
+        ('configuration',           'twilio_from_number',     "VARCHAR(20) DEFAULT ''"),
+        ('configuration',           'twilio_sms_cost_per_seg','REAL DEFAULT 0.0079'),
     ]
     with db.engine.connect() as conn:
         for table, col, coltype in cols:
@@ -784,47 +822,116 @@ def commit_pending_incidents():
 def _send_bus_notifications(rec):
     try:
         cfg = Configuration.query.first()
-        if not cfg or (not cfg.mail_server and cfg.mail_provider == 'custom'):
+        if not cfg:
             return
-        configure_mail(cfg)
         bus, it = rec.bus, rec.incident_type
+
+        # ── Email ────────────────────────────────────────────────────────────
+        email_enabled = cfg.mail_server or cfg.mail_provider != 'custom'
+        if email_enabled:
+            try:
+                configure_mail(cfg)
+            except Exception:
+                email_enabled = False
+
         subject = f"Bus Update: {bus.display_name}"
-        body = (f"Bus {bus.display_name} — Status Update\n\n"
-                f"Status: {it.name}\n"
-                f"Delay: {rec.delay_minutes} minutes\n"
-                f"Notes: {rec.notes or 'N/A'}\n\n"
-                f"Sent by {cfg.app_name}")
+        email_body = (f"Bus {bus.display_name} — Status Update\n\n"
+                      f"Status: {it.name}\n"
+                      f"Delay: {rec.delay_minutes} minutes\n"
+                      f"Notes: {rec.notes or 'N/A'}\n\n"
+                      f"Sent by {cfg.app_name}")
+
+        # ── SMS body (concise ≤160 chars) ────────────────────────────────────
+        delay_part = f' +{rec.delay_minutes}min' if rec.delay_minutes else ''
+        eta_part   = f' ETA {rec.eta}' if rec.eta else ''
+        sms_body   = f"[{cfg.app_name}] {bus.display_name}: {it.name}{delay_part}{eta_part}"
+        if len(sms_body) > 160:
+            sms_body = sms_body[:157] + '...'
+        sms_segments  = math.ceil(len(sms_body) / 160)
+        cost_per_seg  = getattr(cfg, 'twilio_sms_cost_per_seg', 0.0079) or 0.0079
+
+        twilio_on = (getattr(cfg, 'twilio_enabled', False) and TWILIO_AVAILABLE
+                     and getattr(cfg, 'twilio_account_sid', '') and getattr(cfg, 'twilio_auth_token', '')
+                     and getattr(cfg, 'twilio_from_number', ''))
 
         sent_emails = set()
+        sent_phones = set()
 
-        def _try_send(name, email):
-            if not email or email in sent_emails: return
+        def _log(channel, name, address, sub, grp_id, grp_name, status, error=None,
+                 sms_sid=None, segs=None, cost=None):
+            try:
+                db.session.add(NotificationLog(
+                    incident_record_id=rec.id,
+                    channel=channel,
+                    recipient_name=name or '',
+                    recipient_address=address or '',
+                    subscriber_id=sub.id if sub else None,
+                    group_id=grp_id,
+                    group_name=grp_name or '',
+                    bus_id=bus.id,
+                    bus_label=bus.display_name,
+                    status=status,
+                    error_message=error,
+                    sms_sid=sms_sid,
+                    sms_segments=segs,
+                    sms_cost_usd=cost,
+                ))
+                db.session.commit()
+            except Exception as le:
+                db.session.rollback()
+                print(f'[NotifLog] log error: {le}')
+
+        def _try_email(name, email, sub, grp_id, grp_name):
+            if not email or email in sent_emails or not email_enabled: return
             sent_emails.add(email)
             try:
-                mail.send(Message(subject=subject, recipients=[email], body=body))
+                mail.send(Message(subject=subject, recipients=[email], body=email_body))
+                _log('email', name, email, sub, grp_id, grp_name, 'sent')
             except Exception as e:
-                print(f'[Notifications] send error to {email}: {e}')
+                print(f'[Notifications] email error to {email}: {e}')
+                _log('email', name, email, sub, grp_id, grp_name, 'failed', error=str(e))
+
+        def _try_sms(name, phone, sub, grp_id, grp_name):
+            if not phone or phone in sent_phones or not twilio_on: return
+            sent_phones.add(phone)
+            try:
+                tw = TwilioClient(cfg.twilio_account_sid, cfg.twilio_auth_token)
+                msg = tw.messages.create(to=phone, from_=cfg.twilio_from_number, body=sms_body)
+                cost = round(sms_segments * cost_per_seg, 6)
+                _log('sms', name, phone, sub, grp_id, grp_name, 'sent',
+                     sms_sid=msg.sid, segs=sms_segments, cost=cost)
+            except Exception as e:
+                print(f'[Notifications] SMS error to {phone}: {e}')
+                _log('sms', name, phone, sub, grp_id, grp_name, 'failed', error=str(e))
 
         # Primary path: group-level bus assignment → contacts
         group_ids = {a.group_id for a in
                      GroupBusAssignment.query.filter_by(bus_id=rec.bus_id).all()}
         if group_ids:
+            groups_map = {g.id: g for g in
+                          SubscriberGroup.query.filter(SubscriberGroup.id.in_(group_ids)).all()}
             subs = NotificationSubscriber.query.filter(
                 NotificationSubscriber.active == True,
                 NotificationSubscriber.group_id.in_(group_ids)
             ).all()
             for sub in subs:
+                grp = groups_map.get(sub.group_id)
+                grp_id   = grp.id   if grp else None
+                grp_name = grp.name if grp else ''
                 if sub.contacts:
                     for contact in sub.contacts:
-                        _try_send(contact.full_name, contact.email)
+                        _try_email(contact.full_name, contact.email, sub, grp_id, grp_name)
+                        _try_sms(contact.full_name, contact.phone, sub, grp_id, grp_name)
                 else:
-                    _try_send(sub.full_name, sub.email)  # legacy fallback
+                    _try_email(sub.full_name, sub.email, sub, grp_id, grp_name)
+                    _try_sms(sub.full_name, sub.phone, sub, grp_id, grp_name)
 
         # Backward compat: direct NotificationBusAssignment (legacy records)
         for a in NotificationBusAssignment.query.filter_by(bus_id=rec.bus_id).all():
             s = a.subscriber
             if s.active:
-                _try_send(s.full_name, s.email)
+                _try_email(s.full_name, s.email, s, None, '')
+                _try_sms(s.full_name, s.phone, s, None, '')
 
     except Exception as e:
         print(f'[Notifications] send error: {e}')
@@ -1598,6 +1705,35 @@ def statistics():
     all_types  = IncidentType.query.order_by(IncidentType.sort_order).all()
     can_export = current_user.has_access('statistics', 'limited')
 
+    # ── Notification Log stats ─────────────────────────────────────────────
+    notif_q = NotificationLog.query.filter(
+        NotificationLog.sent_at >= datetime.combine(d_from, datetime.min.time()),
+        NotificationLog.sent_at <= datetime.combine(d_to,   datetime.max.time()),
+    )
+    if bus_id:
+        notif_q = notif_q.filter_by(bus_id=bus_id)
+    notif_logs = notif_q.order_by(NotificationLog.sent_at.desc()).all()
+
+    notif_by_channel = {}; notif_by_day = {}; notif_by_group = {}
+    notif_sent = 0; notif_failed = 0; notif_total_cost = 0.0
+    notif_email_sent = 0; notif_sms_sent = 0
+    for nl in notif_logs:
+        ch = nl.channel
+        notif_by_channel[ch] = notif_by_channel.get(ch, 0) + 1
+        d = nl.sent_at.strftime('%Y-%m-%d')
+        notif_by_day[d] = notif_by_day.get(d, 0) + 1
+        if nl.group_name:
+            notif_by_group[nl.group_name] = notif_by_group.get(nl.group_name, 0) + 1
+        if nl.status == 'sent':
+            notif_sent += 1
+            if ch == 'email': notif_email_sent += 1
+            if ch == 'sms':   notif_sms_sent   += 1
+        else:
+            notif_failed += 1
+        if nl.sms_cost_usd:
+            notif_total_cost += nl.sms_cost_usd
+    notif_total_cost = round(notif_total_cost, 4)
+
     return render_template('admin/statistics.html',
         records=records, period=period,
         date_from=d_from.isoformat(), date_to=d_to.isoformat(),
@@ -1617,6 +1753,13 @@ def statistics():
         total=len(records), all_buses=all_buses, all_types=all_types,
         can_export=can_export, can_write=current_user.has_access('statistics', 'full'),
         today=today,
+        notif_logs=notif_logs,
+        notif_by_channel_json=json.dumps(notif_by_channel),
+        notif_by_day_json=json.dumps(notif_by_day),
+        notif_by_group_json=json.dumps(notif_by_group),
+        notif_sent=notif_sent, notif_failed=notif_failed,
+        notif_email_sent=notif_email_sent, notif_sms_sent=notif_sms_sent,
+        notif_total_cost=notif_total_cost,
     )
 
 def _parse_period(period, d_from_s, d_to_s, today):
@@ -1684,6 +1827,25 @@ def export_statistics(fmt):
         audit_rows.append([bus.identifier, bus.name, bus.route or '',
                            total_days_exp, ot_d, inc_d, rate, avg_d, sum(bdel)])
 
+    # ── Notification log for general export ──────────────────────────────────
+    notif_exp_q = NotificationLog.query.filter(
+        NotificationLog.sent_at >= datetime.combine(d_from, datetime.min.time()),
+        NotificationLog.sent_at <= datetime.combine(d_to,   datetime.max.time()),
+    )
+    if bus_id:
+        notif_exp_q = notif_exp_q.filter_by(bus_id=bus_id)
+    notif_exp = notif_exp_q.order_by(NotificationLog.sent_at.desc()).all()
+    notif_headers = ['Sent At (UTC)', 'Channel', 'Bus', 'Recipient', 'Address',
+                     'Group', 'Status', 'SMS SID', 'Segments', 'Cost (USD)', 'Error']
+    notif_rows = [[
+        nl.sent_at.strftime('%Y-%m-%d %H:%M:%S'), nl.channel, nl.bus_label or '',
+        nl.recipient_name or '', nl.recipient_address or '',
+        nl.group_name or '', nl.status, nl.sms_sid or '',
+        nl.sms_segments or '',
+        f'{nl.sms_cost_usd:.6f}' if nl.sms_cost_usd else '',
+        nl.error_message or '',
+    ] for nl in notif_exp]
+
     if fmt == 'csv':
         output = io.StringIO()
         w = csv.writer(output)
@@ -1693,6 +1855,10 @@ def export_statistics(fmt):
         w.writerow(['Bus Audit Summary'])
         w.writerow(audit_headers)
         w.writerows(audit_rows)
+        w.writerow([])
+        w.writerow(['Notification Log'])
+        w.writerow(notif_headers)
+        w.writerows(notif_rows)
         resp = make_response(output.getvalue())
         resp.headers['Content-Type'] = 'text/csv'
         resp.headers['Content-Disposition'] = f'attachment; filename="bus_report_{d_from}_{d_to}.csv"'
@@ -1796,6 +1962,38 @@ def export_statistics(fmt):
             pdf.ln()
             alt = not alt
 
+        # Notification section in PDF
+        if notif_exp:
+            pdf.ln(4)
+            pdf.set_font('Helvetica', 'B', 9)
+            pdf.set_text_color(30, 64, 175)
+            pdf.cell(0, 6, 'Notification Log', ln=True)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(1)
+            n_widths = [32, 16, 32, 38, 38, 30, 16, 30, 16, 22]
+            n_hdrs   = ['Sent At', 'Channel', 'Bus', 'Recipient', 'Address',
+                        'Group', 'Status', 'SMS SID', 'Segs', 'Cost']
+            pdf.set_font('Helvetica', 'B', 6)
+            pdf.set_fill_color(30, 64, 175)
+            pdf.set_text_color(255, 255, 255)
+            for h, w in zip(n_hdrs, n_widths):
+                pdf.cell(w, 7, _pdf_safe(h), border=0, fill=True, align='C')
+            pdf.ln()
+            pdf.set_font('Helvetica', '', 6)
+            pdf.set_text_color(15, 23, 42)
+            alt = False
+            for nl in notif_exp:
+                pdf.set_fill_color(241, 245, 249) if alt else pdf.set_fill_color(255, 255, 255)
+                vals = [nl.sent_at.strftime('%Y-%m-%d %H:%M'), nl.channel,
+                        nl.bus_label or '', nl.recipient_name or '', nl.recipient_address or '',
+                        nl.group_name or '', nl.status, nl.sms_sid or '',
+                        str(nl.sms_segments or ''),
+                        f'${nl.sms_cost_usd:.4f}' if nl.sms_cost_usd else '']
+                for val, w in zip(vals, n_widths):
+                    pdf.cell(w, 5, _pdf_safe(str(val))[:28], border=0, fill=True)
+                pdf.ln()
+                alt = not alt
+
         resp = make_response(bytes(pdf.output()))
         resp.headers['Content-Type'] = 'application/pdf'
         resp.headers['Content-Disposition'] = f'attachment; filename="bus_report_{d_from}_{d_to}.pdf"'
@@ -1821,6 +2019,16 @@ def export_statistics(fmt):
             cells = a_table.add_row().cells
             for i, val in enumerate(row):
                 cells[i].text = str(val)
+        if notif_exp:
+            doc.add_heading('Notification Log', level=2)
+            n_table = doc.add_table(rows=1, cols=len(notif_headers))
+            n_table.style = 'Table Grid'
+            for i, h in enumerate(notif_headers):
+                n_table.rows[0].cells[i].text = h
+            for row in notif_rows:
+                cells = n_table.add_row().cells
+                for i, val in enumerate(row):
+                    cells[i].text = str(val)
         buf = io.BytesIO()
         doc.save(buf)
         buf.seek(0)
@@ -1902,6 +2110,47 @@ def reset_statistics():
            f'{d_from} → {d_to}', f'Deleted {deleted} records')
     flash(f'{deleted} record{"s" if deleted != 1 else ""} deleted ({d_from} → {d_to}).', 'success')
     return redirect(url_for('statistics'))
+
+
+@app.route('/admin/statistics/export/notifications')
+@login_required
+@require_module('statistics', 'limited')
+def export_notification_stats():
+    today    = date.today()
+    period   = request.args.get('period', 'today')
+    d_from_s = request.args.get('date_from', today.isoformat())
+    d_to_s   = request.args.get('date_to',   today.isoformat())
+    bus_id   = request.args.get('bus_id', type=int)
+    d_from, d_to = _parse_period(period, d_from_s, d_to_s, today)
+
+    q = NotificationLog.query.filter(
+        NotificationLog.sent_at >= datetime.combine(d_from, datetime.min.time()),
+        NotificationLog.sent_at <= datetime.combine(d_to,   datetime.max.time()),
+    )
+    if bus_id:
+        q = q.filter_by(bus_id=bus_id)
+    logs = q.order_by(NotificationLog.sent_at.desc()).all()
+
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(['Sent At (UTC)', 'Channel', 'Bus', 'Recipient', 'Address',
+                'Group', 'Status', 'SMS SID', 'Segments', 'Cost (USD)', 'Error'])
+    for nl in logs:
+        w.writerow([
+            nl.sent_at.strftime('%Y-%m-%d %H:%M:%S'),
+            nl.channel, nl.bus_label or '',
+            nl.recipient_name or '', nl.recipient_address or '',
+            nl.group_name or '', nl.status,
+            nl.sms_sid or '', nl.sms_segments or '',
+            f'{nl.sms_cost_usd:.6f}' if nl.sms_cost_usd else '',
+            nl.error_message or '',
+        ])
+    resp = make_response(output.getvalue())
+    resp.headers['Content-Type'] = 'text/csv'
+    resp.headers['Content-Disposition'] = (
+        f'attachment; filename="notification_stats_{d_from}_{d_to}.csv"'
+    )
+    return resp
 
 
 # ── USERS MODULE ──────────────────────────────────────────────────────────────
@@ -2487,6 +2736,17 @@ def config_page():
                 cfg.mail_password = new_pwd
             cfg.mail_from_email = request.form.get('mail_from_email', '').strip()
             cfg.mail_from_name  = request.form.get('mail_from_name', '').strip()
+        elif section == 'sms':
+            cfg.twilio_enabled      = 'twilio_enabled' in request.form
+            cfg.twilio_account_sid  = request.form.get('twilio_account_sid', '').strip()
+            cfg.twilio_from_number  = request.form.get('twilio_from_number', '').strip()
+            new_tok = request.form.get('twilio_auth_token', '').strip()
+            if new_tok:
+                cfg.twilio_auth_token = new_tok
+            try:
+                cfg.twilio_sms_cost_per_seg = float(request.form.get('twilio_sms_cost_per_seg', 0.0079))
+            except (ValueError, TypeError):
+                pass
         db.session.commit()
         flash('Configuration saved.', 'success')
         return redirect(url_for('config_page', tab=section))
@@ -2662,6 +2922,62 @@ def check_smtp():
 
     smtp.quit()
     return jsonify({'ok': True, 'steps': steps})
+
+
+@app.route('/admin/config/check-twilio', methods=['POST'])
+@login_required
+@require_module('config', 'full')
+def check_twilio():
+    """AJAX: verify Twilio credentials without sending a message."""
+    if not TWILIO_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Twilio library not installed. Run: pip install twilio'})
+    data = request.get_json(silent=True) or {}
+    cfg  = get_config()
+    sid  = data.get('account_sid', '') or getattr(cfg, 'twilio_account_sid', '') or ''
+    tok  = data.get('auth_token',  '') or getattr(cfg, 'twilio_auth_token',  '') or ''
+    if not sid or not tok:
+        return jsonify({'ok': False, 'message': 'Account SID and Auth Token are required.'})
+    try:
+        tw      = TwilioClient(sid, tok)
+        account = tw.api.accounts(sid).fetch()
+        return jsonify({'ok': True,
+                        'message': f'Connected! Account: {account.friendly_name} ({account.status})'})
+    except TwilioRestException as e:
+        return jsonify({'ok': False, 'message': f'Twilio error {e.code}: {e.msg}'})
+    except Exception as e:
+        return jsonify({'ok': False, 'message': str(e)})
+
+
+@app.route('/admin/config/test-sms', methods=['POST'])
+@login_required
+@require_module('config', 'full')
+def test_sms():
+    """AJAX: send a test SMS using current form values."""
+    if not TWILIO_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Twilio library not installed. Run: pip install twilio'})
+    data = request.get_json(silent=True) or {}
+    cfg  = get_config()
+    sid      = data.get('account_sid', '')  or getattr(cfg, 'twilio_account_sid', '') or ''
+    tok      = data.get('auth_token',  '')  or getattr(cfg, 'twilio_auth_token',  '') or ''
+    from_num = data.get('from_number', '')  or getattr(cfg, 'twilio_from_number', '') or ''
+    to_num   = data.get('to_number',   '').strip()
+    if not sid or not tok:
+        return jsonify({'ok': False, 'message': 'Account SID and Auth Token are required.'})
+    if not from_num:
+        return jsonify({'ok': False, 'message': 'From Number is required.'})
+    if not to_num:
+        return jsonify({'ok': False, 'message': 'Destination phone number is required.'})
+    try:
+        tw  = TwilioClient(sid, tok)
+        msg = tw.messages.create(
+            to=to_num, from_=from_num,
+            body=f'[{get_config().app_name}] Test SMS — configuration verified successfully.'
+        )
+        return jsonify({'ok': True, 'message': f'SMS sent! SID: {msg.sid} — Status: {msg.status}'})
+    except TwilioRestException as e:
+        return jsonify({'ok': False, 'message': f'Twilio error {e.code}: {e.msg}'})
+    except Exception as e:
+        return jsonify({'ok': False, 'message': str(e)})
 
 
 @app.route('/admin/config/schedules/add', methods=['POST'])
