@@ -311,7 +311,7 @@
            style="background-color:{{ status.color if status else '#10b981' }}">
         <div class="flex items-center space-x-2">
           <i class="fas {{ status.icon if status else 'fa-check-circle' }} text-white text-sm"></i>
-          <span class="text-white font-bold text-sm">{{ bus.identifier }}</span>
+          <span class="text-white font-bold text-sm">{{ bus.identifier }} - {{ bus.name }}</span>
         </div>
         <div class="flex items-center space-x-2 flex-wrap">
           {% if delay and delay > 0 %}
@@ -334,12 +334,9 @@
 
       <!-- Body -->
       <div class="p-4 flex-1 space-y-2">
-        <div>
-          <p class="font-bold text-slate-800 leading-tight">{{ bus.name }}</p>
-          {% if bus.route %}
-          <p class="text-xs opacity-50 mt-0.5"><i class="fas fa-map-marker-alt mr-1"></i>{{ bus.route }}</p>
-          {% endif %}
-        </div>
+        {% if bus.route %}
+        <p class="text-xs text-slate-500"><i class="fas fa-map-marker-alt mr-1"></i>{{ bus.route }}</p>
+        {% endif %}
 
         <!-- Status badge -->
         <div class="flex items-center space-x-1.5">

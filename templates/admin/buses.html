@@ -54,6 +54,7 @@
         <div>
           <div class="flex items-center space-x-1.5 flex-wrap">
             <span class="text-white font-extrabold text-lg leading-none">{{ bus.identifier }}</span>
+            <span class="text-white/70 font-semibold text-base leading-none">- {{ bus.name[:20] }}</span>
             {% if delay and delay > 0 %}
             <span class="bg-white/20 text-white text-xs px-1.5 py-0.5 rounded font-medium">+{{ delay }}min</span>
             {% endif %}
@@ -61,7 +62,6 @@
             <span class="bg-white/20 text-white text-xs px-1.5 py-0.5 rounded font-medium">ETA {{ item.eta }}</span>
             {% endif %}
           </div>
-          <p class="text-white/80 text-xs leading-none mt-0.5">{{ bus.name[:28] }}</p>
         </div>
       </div>
       <span class="bg-white/15 border border-white/25 text-white text-xs px-2.5 py-1.5 rounded-xl font-semibold flex items-center space-x-1.5 backdrop-blur-sm">
