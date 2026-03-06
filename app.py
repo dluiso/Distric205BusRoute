@@ -2963,74 +2963,75 @@ def import_run(job_id):
 
     def _generate():
         from sqlalchemy import text as sa_text
-        errors   = []
-        restored = 0
+        with app.app_context():
+            errors   = []
+            restored = 0
 
-        yield f'data: {json.dumps({"status":"truncating","total":total})}\n\n'
+            yield f'data: {json.dumps({"status":"truncating","total":total})}\n\n'
 
-        try:
-            with db.engine.begin() as conn:
-                # ── TRUNCATE all tables first ─────────────────────────────
-                if is_pg:
-                    for t, _ in tables:
-                        try:
-                            conn.execute(sa_text(f'TRUNCATE TABLE "{t}" CASCADE'))
-                        except Exception as e:
-                            errors.append(f'TRUNCATE {t}: {e}')
-                else:
-                    conn.execute(sa_text('PRAGMA foreign_keys = OFF'))
-                    for t, _ in tables:
-                        try:
-                            conn.execute(sa_text(f'DELETE FROM "{t}"'))
-                        except Exception as e:
-                            errors.append(f'DELETE {t}: {e}')
-
-                # ── INSERT each table ─────────────────────────────────────
-                for step, (t, rows) in enumerate(tables, 1):
-                    inserted = 0
-                    try:
-                        for row in rows:
-                            if not isinstance(row, dict) or not row:
-                                continue
-                            col_names    = ', '.join(f'"{k}"' for k in row)
-                            placeholders = ', '.join(f':{k}' for k in row)
-                            conn.execute(
-                                sa_text(f'INSERT INTO "{t}" ({col_names}) VALUES ({placeholders})'),
-                                row
-                            )
-                            inserted += 1
-                        # Reset PG sequences
-                        if is_pg and rows and 'id' in rows[0]:
+            try:
+                with db.engine.begin() as conn:
+                    # ── TRUNCATE all tables first ─────────────────────────────
+                    if is_pg:
+                        for t, _ in tables:
                             try:
-                                conn.execute(sa_text(
-                                    f"SELECT setval(pg_get_serial_sequence('\"{t}\"','id'),"
-                                    f"COALESCE(MAX(id),1),true) FROM \"{t}\""
-                                ))
-                            except Exception:
-                                pass
-                        restored += 1
-                        ok = True
-                        err_msg = ''
-                    except Exception as e:
-                        ok = False
-                        err_msg = str(e)
-                        errors.append(f'{t}: {err_msg}')
+                                conn.execute(sa_text(f'TRUNCATE TABLE "{t}" CASCADE'))
+                            except Exception as e:
+                                errors.append(f'TRUNCATE {t}: {e}')
+                    else:
+                        conn.execute(sa_text('PRAGMA foreign_keys = OFF'))
+                        for t, _ in tables:
+                            try:
+                                conn.execute(sa_text(f'DELETE FROM "{t}"'))
+                            except Exception as e:
+                                errors.append(f'DELETE {t}: {e}')
 
-                    yield f'data: {json.dumps({"step":step,"total":total,"table":t,"rows":inserted,"ok":ok,"error":err_msg})}\n\n'
+                    # ── INSERT each table ─────────────────────────────────────
+                    for step, (t, rows) in enumerate(tables, 1):
+                        inserted = 0
+                        try:
+                            for row in rows:
+                                if not isinstance(row, dict) or not row:
+                                    continue
+                                col_names    = ', '.join(f'"{k}"' for k in row)
+                                placeholders = ', '.join(f':{k}' for k in row)
+                                conn.execute(
+                                    sa_text(f'INSERT INTO "{t}" ({col_names}) VALUES ({placeholders})'),
+                                    row
+                                )
+                                inserted += 1
+                            # Reset PG sequences
+                            if is_pg and rows and 'id' in rows[0]:
+                                try:
+                                    conn.execute(sa_text(
+                                        f"SELECT setval(pg_get_serial_sequence('\"{t}\"','id'),"
+                                        f"COALESCE(MAX(id),1),true) FROM \"{t}\""
+                                    ))
+                                except Exception:
+                                    pass
+                            restored += 1
+                            ok = True
+                            err_msg = ''
+                        except Exception as e:
+                            ok = False
+                            err_msg = str(e)
+                            errors.append(f'{t}: {err_msg}')
 
-                if not is_pg:
-                    conn.execute(sa_text('PRAGMA foreign_keys = ON'))
+                        yield f'data: {json.dumps({"step":step,"total":total,"table":t,"rows":inserted,"ok":ok,"error":err_msg})}\n\n'
 
-        except Exception as e:
-            errors.append(f'Transaction error: {e}')
+                    if not is_pg:
+                        conn.execute(sa_text('PRAGMA foreign_keys = ON'))
 
-        try:
-            os.remove(jpath)
-        except Exception:
-            pass
-        _audit('import_db_done', 'config', f'{restored}/{total} tables restored',
-               '; '.join(errors) if errors else 'no errors')
-        yield f'data: {json.dumps({"done":True,"restored":restored,"total":total,"errors":errors})}\n\n'
+            except Exception as e:
+                errors.append(f'Transaction error: {e}')
+
+            try:
+                os.remove(jpath)
+            except Exception:
+                pass
+            _audit('import_db_done', 'config', f'{restored}/{total} tables restored',
+                   '; '.join(errors) if errors else 'no errors')
+            yield f'data: {json.dumps({"done":True,"restored":restored,"total":total,"errors":errors})}\n\n'
 
     resp = app.response_class(_generate(), mimetype='text/event-stream')
     resp.headers['Cache-Control'] = 'no-cache'
