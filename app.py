@@ -1596,7 +1596,8 @@ def statistics():
         default_type_name=(default_type.name if default_type else 'On Time'),
         total_days_in_range=total_days_in_range,
         total=len(records), all_buses=all_buses, all_types=all_types,
-        can_export=can_export, today=today,
+        can_export=can_export, can_write=current_user.has_access('statistics', 'full'),
+        today=today,
     )
 
 def _parse_period(period, d_from_s, d_to_s, today):
@@ -1837,6 +1838,50 @@ def email_statistics():
         flash(f'Report sent to {to_email}.', 'success')
     except Exception as e:
         flash(f'Could not send email: {e}', 'error')
+    return redirect(url_for('statistics'))
+
+
+@app.route('/admin/statistics/reset', methods=['POST'])
+@login_required
+@require_module('statistics', 'full')
+def reset_statistics():
+    preset      = request.form.get('preset', '')
+    date_from_s = request.form.get('rs_date_from', '')
+    date_to_s   = request.form.get('rs_date_to', '')
+    today = date.today()
+    try:
+        if preset == 'today':
+            d_from = d_to = today
+        elif preset == 'week':
+            d_from = today - timedelta(days=today.weekday())
+            d_to   = today
+        elif preset == 'month':
+            d_from = today.replace(day=1)
+            d_to   = today
+        elif preset == 'year':
+            d_from = today.replace(month=1, day=1)
+            d_to   = today
+        elif preset == 'custom':
+            d_from = date.fromisoformat(date_from_s)
+            d_to   = date.fromisoformat(date_to_s)
+            if d_from > d_to:
+                flash('Start date must be before end date.', 'error')
+                return redirect(url_for('statistics'))
+        else:
+            flash('Invalid selection.', 'error')
+            return redirect(url_for('statistics'))
+    except (ValueError, TypeError):
+        flash('Invalid date.', 'error')
+        return redirect(url_for('statistics'))
+
+    deleted = BusIncidentRecord.query.filter(
+        BusIncidentRecord.incident_date >= d_from,
+        BusIncidentRecord.incident_date <= d_to
+    ).delete(synchronize_session='fetch')
+    db.session.commit()
+    _audit('reset_statistics', 'statistics',
+           f'{d_from} → {d_to}', f'Deleted {deleted} records')
+    flash(f'{deleted} record{"s" if deleted != 1 else ""} deleted ({d_from} → {d_to}).', 'success')
     return redirect(url_for('statistics'))
 
 

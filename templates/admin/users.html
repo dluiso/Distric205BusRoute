@@ -137,7 +137,7 @@
         </div>
         {% if can_write and not g.is_admin %}
         <div class="flex items-center space-x-2">
-          <button onclick="openEditGroup({{ g.id }}, '{{ g.name }}', '{{ g.description or '' }}', {{ g.permissions | map(attribute='module_key') | list | tojson }}, {{ g.permissions | map(attribute='access_level') | list | tojson }})"
+          <button onclick="openEditGroup({{ g.id }}, {{ g.name | tojson }}, {{ (g.description or '') | tojson }}, {{ g.permissions | map(attribute='module_key') | list | tojson }}, {{ g.permissions | map(attribute='access_level') | list | tojson }})"
                   class="px-3 py-1.5 border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:border-blue-400 hover:text-blue-600 transition-colors">
             <i class="fas fa-edit mr-1"></i>Edit
           </button>
@@ -444,17 +444,33 @@ function openEditUser(id, username, first, last, email, phone, workplace, jobtit
   document.getElementById('modal-edit-user').classList.remove('hidden');
 }
 
+function updatePermRow(key) {
+  const sel = document.querySelector(`input[name="perm_${key}"]:checked`);
+  if (!sel) return;
+  document.querySelectorAll(`input[name="perm_${key}"]`).forEach(inp => {
+    const lbl = inp.closest('label');
+    if (!lbl) return;
+    const active = inp.value === sel.value;
+    lbl.style.borderColor     = active ? '#60a5fa' : '#e2e8f0';
+    lbl.style.backgroundColor = active ? '#eff6ff' : '#ffffff';
+    lbl.querySelector('span').style.color = active ? '#1d4ed8' : '#64748b';
+  });
+}
+
 function buildPermMatrix(containerId, existing) {
   const container = document.getElementById(containerId);
   if (!container) return;
   container.innerHTML = MODULES_JS.map(mod => {
     const cur = (existing || {})[mod.key] || 'none';
-    const radios = ['none','limited','full'].map(lvl => `
-      <label class="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border cursor-pointer transition-all hover:border-blue-300 ${lvl===cur?'border-blue-400 bg-blue-50':'border-slate-200'}">
-        <input type="radio" name="perm_${mod.key}" value="${lvl}" ${lvl===cur?'checked':''} class="sr-only peer"
-               onchange="this.closest('.space-y-2').querySelectorAll('[name=perm_${mod.key}] ~ span').forEach((s,i)=>s.className='text-xs font-medium '+(i===0&&this.value==='none'||i===1&&this.value==='limited'||i===2&&this.value==='full'?'text-blue-700':'text-slate-500')+' peer-checked:text-blue-700')">
-        <span class="text-xs font-medium ${lvl===cur?'text-blue-700':'text-slate-500'} peer-checked:text-blue-700">${lvl.charAt(0).toUpperCase()+lvl.slice(1)}</span>
-      </label>`).join('');
+    const radios = ['none', 'limited', 'full'].map(lvl => {
+      const active = lvl === cur;
+      return `<label style="border-color:${active?'#60a5fa':'#e2e8f0'};background:${active?'#eff6ff':'#ffffff'}"
+                     class="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border cursor-pointer transition-all hover:border-blue-300">
+        <input type="radio" name="perm_${mod.key}" value="${lvl}" ${active?'checked':''} class="w-3 h-3 accent-blue-600"
+               onchange="updatePermRow('${mod.key}')">
+        <span style="color:${active?'#1d4ed8':'#64748b'}" class="text-xs font-medium">${lvl.charAt(0).toUpperCase()+lvl.slice(1)}</span>
+      </label>`;
+    }).join('');
     return `<div class="flex items-center justify-between p-3 bg-slate-50 rounded-xl">
       <div class="flex items-center space-x-2">
         <i class="fas ${mod.icon} text-slate-500 w-4 text-center"></i>

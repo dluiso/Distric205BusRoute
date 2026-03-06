@@ -373,6 +373,76 @@
   </div>
   {% endif %}
 </div>
+
+{% if can_write %}
+<!-- ══ Reset Statistics ══════════════════════════════════════════════════════ -->
+<div class="bg-white rounded-2xl shadow-sm border border-red-100 p-5 mt-5">
+  <div class="flex items-start justify-between mb-1">
+    <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+      <i class="fas fa-trash-alt text-red-400"></i><span>Reset Statistics</span>
+    </h3>
+  </div>
+  <p class="text-xs text-slate-400 mb-4">Permanently delete incident records for a selected period. This cannot be undone.</p>
+
+  <form method="POST" action="{{ url_for('reset_statistics') }}" onsubmit="return confirmReset(this)">
+    <!-- Preset pills -->
+    <div class="flex flex-wrap gap-2 mb-4" id="rs-presets">
+      {% for val, label in [('today','Today'),('week','This Week'),('month','This Month'),('year','This Year'),('custom','Custom Range')] %}
+      <label class="cursor-pointer">
+        <input type="radio" name="preset" value="{{ val }}" class="sr-only"
+               onchange="document.getElementById('rs-custom').classList.toggle('hidden', this.value !== 'custom')">
+        <span class="rs-pill px-3 py-1.5 rounded-xl border text-xs font-medium transition-all select-none
+                     border-slate-200 text-slate-600 hover:border-red-300 hover:text-red-600">{{ label }}</span>
+      </label>
+      {% endfor %}
+    </div>
+
+    <!-- Custom range (hidden until selected) -->
+    <div id="rs-custom" class="hidden flex flex-wrap gap-3 mb-4 items-end">
+      <div>
+        <label class="block text-xs font-semibold text-slate-500 mb-1">From</label>
+        <input type="date" name="rs_date_from"
+               class="text-sm border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-red-400">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-500 mb-1">To</label>
+        <input type="date" name="rs_date_to"
+               class="text-sm border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-red-400">
+      </div>
+    </div>
+
+    <button type="submit"
+            class="px-4 py-2 bg-red-500 hover:bg-red-600 text-white text-sm font-semibold rounded-xl transition-colors flex items-center gap-2">
+      <i class="fas fa-trash-alt text-xs"></i> Delete Records
+    </button>
+  </form>
+</div>
+
+<script>
+// Pill visual toggle for preset radios
+document.querySelectorAll('#rs-presets input[type=radio]').forEach(inp => {
+  inp.addEventListener('change', () => {
+    document.querySelectorAll('.rs-pill').forEach(p => {
+      p.style.borderColor    = '#e2e8f0';
+      p.style.color          = '#475569';
+      p.style.backgroundColor = '#ffffff';
+    });
+    const active = inp.closest('label').querySelector('.rs-pill');
+    active.style.borderColor    = '#f87171';
+    active.style.color          = '#b91c1c';
+    active.style.backgroundColor = '#fff1f2';
+  });
+});
+
+function confirmReset(form) {
+  const preset = form.querySelector('input[name="preset"]:checked');
+  if (!preset) { alert('Please select a time period first.'); return false; }
+  const labels = {today:'today', week:'this week', month:'this month', year:'this year', custom:'the selected custom date range'};
+  return confirm('Delete ALL incident records for ' + (labels[preset.value] || preset.value) + '?\n\nThis cannot be undone.');
+}
+</script>
+{% endif %}
+
 {% endblock %}
 
 {% block scripts %}
