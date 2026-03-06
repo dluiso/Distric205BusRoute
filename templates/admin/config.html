@@ -778,31 +778,182 @@
 
 <!-- ══ DATA ══ -->
 <div id="tab-data" {% if active_tab != 'data' %}class="hidden"{% endif %}>
-  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 max-w-lg">
-    <h3 class="font-bold text-slate-700 mb-4 flex items-center space-x-2">
-      <i class="fas fa-database text-blue-500"></i><span>Database & Backups</span>
-    </h3>
-    <p class="text-sm text-slate-500 mb-5">Export a full copy of the SQLite database for backup or migration.</p>
-    <div class="space-y-3">
-      <a href="{{ url_for('export_db') }}"
-         class="flex items-center space-x-3 p-4 bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-300 rounded-xl transition-colors group">
-        <div class="w-10 h-10 bg-blue-500 rounded-lg flex items-center justify-center flex-shrink-0 group-hover:scale-110 transition-transform">
-          <i class="fas fa-download text-white text-sm"></i>
+  <div class="space-y-6 max-w-5xl">
+
+    <!-- ── System Health ─────────────────────────────────────────────────────── -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-slate-700 flex items-center gap-2">
+          <i class="fas fa-server text-blue-500"></i> System Health
+        </h3>
+        <button onclick="loadStatus()" id="btn-refresh-status"
+          class="text-xs bg-slate-100 hover:bg-blue-50 border border-slate-200 hover:border-blue-300 text-slate-600 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5">
+          <i class="fas fa-rotate-right text-xs"></i> Refresh
+        </button>
+      </div>
+
+      <div id="status-loading" class="text-center py-8 text-slate-400 text-sm">
+        <i class="fas fa-spinner fa-spin mr-2"></i>Loading system info…
+      </div>
+      <div id="status-content" class="hidden">
+        <!-- DB -->
+        <p class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Database</p>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">Type</p>
+            <p class="text-sm font-bold text-slate-700" id="st-db-type">—</p>
+          </div>
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">Version</p>
+            <p class="text-sm font-semibold text-slate-600 truncate" id="st-db-ver">—</p>
+          </div>
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">Size</p>
+            <p class="text-sm font-bold text-slate-700" id="st-db-size">—</p>
+          </div>
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">Connection</p>
+            <p class="text-sm font-bold" id="st-db-ok">—</p>
+          </div>
         </div>
+
+        <!-- Server -->
+        <p class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Server</p>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">CPU</p>
+            <p class="text-sm font-bold text-slate-700" id="st-cpu">—</p>
+          </div>
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">Memory</p>
+            <p class="text-sm font-bold text-slate-700" id="st-mem">—</p>
+          </div>
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">Disk</p>
+            <p class="text-sm font-bold text-slate-700" id="st-disk">—</p>
+          </div>
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">Uptime</p>
+            <p class="text-sm font-semibold text-slate-600" id="st-uptime">—</p>
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-3 mb-4 md:w-1/2">
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">Python</p>
+            <p class="text-sm font-semibold text-slate-600" id="st-python">—</p>
+          </div>
+          <div class="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <p class="text-xs text-slate-400 mb-0.5">Platform</p>
+            <p class="text-sm font-semibold text-slate-600 truncate" id="st-platform">—</p>
+          </div>
+        </div>
+
+        <!-- Table counts -->
+        <p class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Table Row Counts</p>
+        <div id="st-tables" class="flex flex-wrap gap-2"></div>
+      </div>
+    </div>
+
+    <!-- ── Dependencies ───────────────────────────────────────────────────────── -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-slate-700 flex items-center gap-2">
+          <i class="fas fa-cubes text-purple-500"></i> Python Dependencies
+        </h3>
+        <button onclick="loadDeps()" id="btn-refresh-deps"
+          class="text-xs bg-slate-100 hover:bg-purple-50 border border-slate-200 hover:border-purple-300 text-slate-600 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5">
+          <i class="fas fa-rotate-right text-xs"></i> Check versions
+        </button>
+      </div>
+      <div id="deps-loading" class="text-center py-8 text-slate-400 text-sm">
+        <i class="fas fa-spinner fa-spin mr-2"></i>Checking PyPI versions…
+      </div>
+      <div id="deps-content" class="hidden">
+        <div id="deps-list" class="space-y-2"></div>
+        <div class="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-700" id="deps-update-tip" style="display:none">
+          <i class="fas fa-triangle-exclamation mr-1"></i>
+          <strong>To update packages on the server:</strong>
+          <code class="block mt-1 bg-amber-100 rounded px-2 py-1 font-mono" id="deps-update-cmd"></code>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Database & Backups ─────────────────────────────────────────────────── -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
+      <h3 class="font-bold text-slate-700 flex items-center gap-2 mb-4">
+        <i class="fas fa-database text-blue-500"></i> Database &amp; Backups
+      </h3>
+      <div class="grid md:grid-cols-2 gap-4">
+        <!-- Export -->
         <div>
-          <p class="text-sm font-medium text-slate-800">Download Database Backup</p>
-          <p class="text-xs text-slate-500">Downloads bustrack.db SQLite file</p>
+          <p class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Export / Download</p>
+          <div class="space-y-2">
+            <a href="{{ url_for('export_json') }}"
+               class="flex items-center gap-3 p-3 bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-300 rounded-xl transition-colors group">
+              <div class="w-9 h-9 bg-blue-500 rounded-lg flex items-center justify-center flex-shrink-0">
+                <i class="fas fa-file-code text-white text-sm"></i>
+              </div>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-medium text-slate-800">Export as JSON</p>
+                <p class="text-xs text-slate-500">All tables — portable format</p>
+              </div>
+              <i class="fas fa-download text-slate-300 text-xs"></i>
+            </a>
+            <a href="{{ url_for('export_sql') }}"
+               class="flex items-center gap-3 p-3 bg-slate-50 hover:bg-green-50 border border-slate-200 hover:border-green-300 rounded-xl transition-colors group">
+              <div class="w-9 h-9 bg-green-500 rounded-lg flex items-center justify-center flex-shrink-0">
+                <i class="fas fa-file-lines text-white text-sm"></i>
+              </div>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-medium text-slate-800">Export as SQL</p>
+                <p class="text-xs text-slate-500">INSERT statements — universal</p>
+              </div>
+              <i class="fas fa-download text-slate-300 text-xs"></i>
+            </a>
+            {% set is_sqlite = not config.get('SQLALCHEMY_DATABASE_URI','').startswith('postgresql') %}
+            {% if is_sqlite %}
+            <a href="{{ url_for('export_db') }}"
+               class="flex items-center gap-3 p-3 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl transition-colors group">
+              <div class="w-9 h-9 bg-slate-600 rounded-lg flex items-center justify-center flex-shrink-0">
+                <i class="fas fa-hard-drive text-white text-sm"></i>
+              </div>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-medium text-slate-800">Download SQLite File</p>
+                <p class="text-xs text-slate-500">Raw .db binary — SQLite only</p>
+              </div>
+              <i class="fas fa-download text-slate-300 text-xs"></i>
+            </a>
+            {% endif %}
+          </div>
         </div>
-        <i class="fas fa-chevron-right text-slate-300 ml-auto text-xs"></i>
-      </a>
+
+        <!-- Import -->
+        <div>
+          <p class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Import / Restore</p>
+          <form action="{{ url_for('import_db') }}" method="POST" enctype="multipart/form-data"
+                onsubmit="return confirm('This will OVERWRITE all current data with the backup. Are you sure?')">
+            <div class="border-2 border-dashed border-slate-200 rounded-xl p-4 text-center hover:border-orange-300 hover:bg-orange-50 transition-colors cursor-pointer"
+                 onclick="document.getElementById('import-file').click()">
+              <i class="fas fa-file-import text-2xl text-slate-300 mb-2"></i>
+              <p class="text-sm font-medium text-slate-600">Click to select JSON backup</p>
+              <p class="text-xs text-slate-400 mt-1" id="import-filename">No file selected</p>
+              <input type="file" id="import-file" name="backup_file" accept=".json" class="hidden"
+                     onchange="document.getElementById('import-filename').textContent = this.files[0]?.name || 'No file selected'">
+            </div>
+            <div class="mt-3 p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-600">
+              <i class="fas fa-triangle-exclamation mr-1"></i>
+              <strong>Warning:</strong> Restoring overwrites all current data. Export a backup first.
+            </div>
+            <button type="submit"
+              class="mt-3 w-full bg-orange-500 hover:bg-orange-600 text-white text-sm font-semibold px-4 py-2.5 rounded-xl transition-colors flex items-center justify-center gap-2">
+              <i class="fas fa-upload"></i> Restore from Backup
+            </button>
+          </form>
+        </div>
+      </div>
     </div>
-    <div class="mt-5 pt-4 border-t border-slate-100">
-      <p class="text-xs text-slate-400">
-        <i class="fas fa-info-circle mr-1"></i>
-        Database stores all buses, incidents, users, and configuration. Back up regularly for disaster recovery.
-      </p>
-    </div>
-  </div>
+
+  </div><!-- /space-y-6 -->
 </div>
 {% endblock %}
 
@@ -817,6 +968,7 @@ function showTab(id) {
     btn.className += ' ' + (t === id ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50');
   });
   history.replaceState(null, '', '?tab=' + id);
+  if (id === 'data') { loadStatus(); loadDeps(); }
 }
 
 // ── HOLIDAYS ──────────────────────────────────────────────────────────────────
@@ -1066,5 +1218,107 @@ async function testEmailLive() {
     }
   }
 })();
+
+// ── DATA TAB — System Status ───────────────────────────────────────────────
+function loadStatus() {
+  const btn = document.getElementById('btn-refresh-status');
+  document.getElementById('status-loading').classList.remove('hidden');
+  document.getElementById('status-content').classList.add('hidden');
+  if (btn) btn.disabled = true;
+  fetch('/admin/config/system-status')
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('st-db-type').textContent    = d.db_type || '—';
+      document.getElementById('st-db-ver').textContent     = d.db_version || '—';
+      document.getElementById('st-db-size').textContent    = d.db_size || '—';
+      const okEl = document.getElementById('st-db-ok');
+      if (d.db_ok) {
+        okEl.textContent = 'Connected';
+        okEl.className = 'text-sm font-bold text-green-600';
+      } else {
+        okEl.textContent = 'Error';
+        okEl.className = 'text-sm font-bold text-red-500';
+        okEl.title = d.db_error || '';
+      }
+      document.getElementById('st-cpu').textContent     = d.psutil ? d.cpu_pct + '%' : 'N/A';
+      document.getElementById('st-mem').textContent     = d.psutil ? `${d.mem_used} / ${d.mem_total} (${d.mem_pct}%)` : 'N/A';
+      document.getElementById('st-disk').textContent    = `${d.disk_used} / ${d.disk_total} (${d.disk_pct}%)`;
+      document.getElementById('st-uptime').textContent  = d.uptime || '—';
+      document.getElementById('st-python').textContent  = d.python || '—';
+      document.getElementById('st-platform').textContent = d.platform || '—';
+
+      const tablesEl = document.getElementById('st-tables');
+      tablesEl.innerHTML = '';
+      const tables = d.tables || {};
+      Object.entries(tables).sort((a,b) => a[0].localeCompare(b[0])).forEach(([t, c]) => {
+        const badge = document.createElement('span');
+        badge.className = 'inline-flex items-center gap-1 text-xs bg-slate-100 border border-slate-200 text-slate-600 px-2.5 py-1 rounded-lg font-mono';
+        badge.innerHTML = `<span class="font-semibold text-slate-800">${c}</span> ${t}`;
+        tablesEl.appendChild(badge);
+      });
+
+      document.getElementById('status-loading').classList.add('hidden');
+      document.getElementById('status-content').classList.remove('hidden');
+    })
+    .catch(() => {
+      document.getElementById('status-loading').innerHTML =
+        '<i class="fas fa-triangle-exclamation text-red-400 mr-2"></i>Failed to load system status.';
+    })
+    .finally(() => { if (btn) btn.disabled = false; });
+}
+
+// ── DATA TAB — Dependencies ────────────────────────────────────────────────
+function loadDeps() {
+  const btn = document.getElementById('btn-refresh-deps');
+  document.getElementById('deps-loading').classList.remove('hidden');
+  document.getElementById('deps-content').classList.add('hidden');
+  if (btn) btn.disabled = true;
+  fetch('/admin/config/check-deps')
+    .then(r => r.json())
+    .then(items => {
+      const list = document.getElementById('deps-list');
+      list.innerHTML = '';
+      const toUpdate = [];
+      items.forEach(p => {
+        const isOk      = p.status === 'ok';
+        const isMissing = p.status === 'missing';
+        const isMajor   = p.status === 'major_update';
+        const isUpdate  = p.status === 'update' || isMajor;
+        if (isUpdate) toUpdate.push(p.package);
+        const color = isMissing ? 'red' : isMajor ? 'orange' : isUpdate ? 'amber' : 'green';
+        const icon  = isMissing ? 'fa-circle-xmark' : isUpdate ? 'fa-circle-up' : 'fa-circle-check';
+        const row = document.createElement('div');
+        row.className = 'flex items-center gap-3 px-3 py-2.5 rounded-xl border border-slate-100 bg-slate-50';
+        row.innerHTML = `
+          <i class="fas ${icon} text-${color}-500 text-sm w-4 flex-shrink-0"></i>
+          <span class="text-sm font-semibold text-slate-700 flex-1 font-mono">${p.package}</span>
+          <span class="text-xs text-slate-500">Installed: <strong>${p.installed}</strong></span>
+          <span class="text-xs text-slate-400">Latest: ${p.latest}</span>
+          ${isMajor ? '<span class="text-xs bg-orange-100 text-orange-700 border border-orange-200 px-2 py-0.5 rounded-full font-semibold">Major ⚠</span>' : ''}
+        `;
+        list.appendChild(row);
+      });
+      const tipEl  = document.getElementById('deps-update-tip');
+      const cmdEl  = document.getElementById('deps-update-cmd');
+      if (toUpdate.length > 0) {
+        cmdEl.textContent = 'pip install --upgrade ' + toUpdate.join(' ');
+        tipEl.style.display = '';
+      } else {
+        tipEl.style.display = 'none';
+      }
+      document.getElementById('deps-loading').classList.add('hidden');
+      document.getElementById('deps-content').classList.remove('hidden');
+    })
+    .catch(() => {
+      document.getElementById('deps-loading').innerHTML =
+        '<i class="fas fa-triangle-exclamation text-red-400 mr-2"></i>Failed to check dependencies.';
+    })
+    .finally(() => { if (btn) btn.disabled = false; });
+}
+
+// Auto-load data panels if data tab is active on page load
+if (new URLSearchParams(location.search).get('tab') === 'data') {
+  loadStatus(); loadDeps();
+}
 </script>
 {% endblock %}

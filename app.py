@@ -2631,7 +2631,290 @@ def export_db():
         return send_file(db_path, as_attachment=True,
                          download_name=f'bustrack_backup_{date.today()}.db')
     flash('Database file not found.', 'error')
-    return redirect(url_for('config_page', tab='general'))
+    return redirect(url_for('config_page', tab='data'))
+
+
+@app.route('/admin/config/system-status')
+@login_required
+@require_module('config')
+def system_status():
+    import platform, sys
+    result = {}
+    # DB info
+    db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+    is_pg = db_url.startswith('postgresql')
+    result['db_type'] = 'PostgreSQL' if is_pg else 'SQLite'
+    try:
+        if is_pg:
+            row = db.session.execute(db.text('SELECT version()')).fetchone()
+            result['db_version'] = row[0].split('\n')[0] if row else 'Unknown'
+            size_row = db.session.execute(db.text(
+                "SELECT pg_size_pretty(pg_database_size(current_database()))"
+            )).fetchone()
+            result['db_size'] = size_row[0] if size_row else 'Unknown'
+        else:
+            db_path = os.path.join(BASE_DIR, 'bustrack.db')
+            if os.path.exists(db_path):
+                sz = os.path.getsize(db_path)
+                result['db_size'] = f'{sz/1024/1024:.2f} MB' if sz > 1024*1024 else f'{sz/1024:.1f} KB'
+            else:
+                result['db_size'] = 'N/A'
+            result['db_version'] = 'SQLite ' + db.session.execute(db.text('SELECT sqlite_version()')).fetchone()[0]
+        result['db_ok'] = True
+        result['db_error'] = None
+    except Exception as e:
+        result['db_ok'] = False
+        result['db_error'] = str(e)
+        result['db_version'] = 'N/A'
+        result['db_size'] = 'N/A'
+
+    # Table row counts
+    try:
+        from sqlalchemy import inspect as sa_inspect
+        inspector = sa_inspect(db.engine)
+        tables = inspector.get_table_names()
+        counts = {}
+        for t in sorted(tables):
+            try:
+                row = db.session.execute(db.text(f'SELECT COUNT(*) FROM "{t}"')).fetchone()
+                counts[t] = row[0]
+            except Exception:
+                counts[t] = '?'
+        result['tables'] = counts
+    except Exception as e:
+        result['tables'] = {}
+
+    # Server / process stats
+    try:
+        import shutil
+        du = shutil.disk_usage(BASE_DIR)
+        result['disk_total'] = f'{du.total/1024**3:.1f} GB'
+        result['disk_used']  = f'{du.used/1024**3:.1f} GB'
+        result['disk_free']  = f'{du.free/1024**3:.1f} GB'
+        result['disk_pct']   = round(du.used / du.total * 100, 1)
+    except Exception:
+        result['disk_total'] = result['disk_used'] = result['disk_free'] = 'N/A'
+        result['disk_pct'] = 0
+
+    try:
+        import psutil
+        result['cpu_pct']   = psutil.cpu_percent(interval=0.5)
+        mem = psutil.virtual_memory()
+        result['mem_total'] = f'{mem.total/1024**3:.1f} GB'
+        result['mem_used']  = f'{mem.used/1024**3:.1f} GB'
+        result['mem_pct']   = mem.percent
+        boot = datetime.fromtimestamp(psutil.boot_time())
+        delta = datetime.now() - boot
+        d, rem = divmod(int(delta.total_seconds()), 86400)
+        h, rem = divmod(rem, 3600)
+        m = rem // 60
+        result['uptime'] = f'{d}d {h}h {m}m'
+        result['psutil'] = True
+    except ImportError:
+        result['psutil'] = False
+        result['cpu_pct'] = result['mem_pct'] = result['disk_pct'] = 'N/A'
+        result['mem_total'] = result['mem_used'] = 'N/A'
+        result['uptime'] = 'N/A (psutil not installed)'
+
+    result['python'] = sys.version.split(' ')[0]
+    result['platform'] = platform.system() + ' ' + platform.release()
+    return jsonify(result)
+
+
+@app.route('/admin/config/check-deps')
+@login_required
+@require_module('config')
+def check_deps():
+    import importlib.metadata, urllib.request
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    packages = [
+        'Flask', 'Flask-SQLAlchemy', 'Flask-Login', 'Flask-Mail',
+        'Werkzeug', 'APScheduler', 'fpdf2', 'python-docx',
+        'pytz', 'psycopg2-binary', 'python-dotenv', 'gunicorn',
+    ]
+
+    def _installed_version(pkg):
+        # normalise: psycopg2-binary → psycopg2-binary, try both hyphen/underscore
+        for name in (pkg, pkg.replace('-', '_'), pkg.lower()):
+            try:
+                return importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                continue
+        return None
+
+    def _pypi_latest(pkg):
+        try:
+            url = f'https://pypi.org/pypi/{pkg}/json'
+            with urllib.request.urlopen(url, timeout=5) as r:
+                data = json.loads(r.read())
+            return data['info']['version']
+        except Exception:
+            return None
+
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        fut_installed = {ex.submit(_installed_version, p): p for p in packages}
+        installed = {fut_installed[f]: f.result() for f in as_completed(fut_installed)}
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        fut_latest = {ex.submit(_pypi_latest, p): p for p in packages}
+        latest = {fut_latest[f]: f.result() for f in as_completed(fut_latest)}
+
+    def _parse_ver(v):
+        if not v: return (0,)
+        try:
+            return tuple(int(x) for x in v.split('.')[:3])
+        except Exception:
+            return (0,)
+
+    for pkg in packages:
+        inst = installed.get(pkg)
+        lat  = latest.get(pkg)
+        iv = _parse_ver(inst)
+        lv = _parse_ver(lat)
+        status = 'ok'
+        if not inst:
+            status = 'missing'
+        elif lat and lv > iv:
+            status = 'major_update' if lv[0] > iv[0] else 'update'
+        results.append({
+            'package': pkg,
+            'installed': inst or 'Not installed',
+            'latest': lat or 'Unknown',
+            'status': status,
+        })
+    return jsonify(results)
+
+
+@app.route('/admin/config/export-json')
+@login_required
+@require_module('config', 'full')
+def export_json():
+    from sqlalchemy import inspect as sa_inspect, text as sa_text
+    inspector = sa_inspect(db.engine)
+    tables = inspector.get_table_names()
+    dump = {}
+    for t in tables:
+        try:
+            rows = db.session.execute(sa_text(f'SELECT * FROM "{t}"')).mappings().all()
+            dump[t] = [dict(r) for r in rows]
+        except Exception as e:
+            dump[t] = {'error': str(e)}
+
+    def _default(o):
+        if isinstance(o, (datetime, date)): return o.isoformat()
+        return str(o)
+
+    payload = json.dumps(dump, default=_default, indent=2, ensure_ascii=False)
+    resp = make_response(payload)
+    resp.headers['Content-Type'] = 'application/json'
+    resp.headers['Content-Disposition'] = f'attachment; filename=bustrack_backup_{date.today()}.json'
+    return resp
+
+
+@app.route('/admin/config/export-sql')
+@login_required
+@require_module('config', 'full')
+def export_sql():
+    from sqlalchemy import inspect as sa_inspect, text as sa_text
+    inspector = sa_inspect(db.engine)
+    tables = inspector.get_table_names()
+    lines = [f'-- BusTrack SQL Dump — {datetime.utcnow().isoformat()}Z\n']
+    for t in tables:
+        try:
+            rows = db.session.execute(sa_text(f'SELECT * FROM "{t}"')).mappings().all()
+            for row in rows:
+                d = dict(row)
+                cols = ', '.join(f'"{k}"' for k in d)
+                vals_list = []
+                for v in d.values():
+                    if v is None:
+                        vals_list.append('NULL')
+                    elif isinstance(v, bool):
+                        vals_list.append('TRUE' if v else 'FALSE')
+                    elif isinstance(v, (int, float)):
+                        vals_list.append(str(v))
+                    else:
+                        escaped = str(v).replace("'", "''")
+                        vals_list.append(f"'{escaped}'")
+                vals = ', '.join(vals_list)
+                lines.append(f'INSERT INTO "{t}" ({cols}) VALUES ({vals});')
+        except Exception as e:
+            lines.append(f'-- Error dumping {t}: {e}')
+    payload = '\n'.join(lines)
+    resp = make_response(payload)
+    resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=bustrack_backup_{date.today()}.sql'
+    return resp
+
+
+@app.route('/admin/config/import-db', methods=['POST'])
+@login_required
+@require_module('config', 'full')
+def import_db():
+    f = request.files.get('backup_file')
+    if not f or not f.filename.endswith('.json'):
+        flash('Please upload a valid .json backup file.', 'error')
+        return redirect(url_for('config_page', tab='data'))
+    try:
+        raw = f.read().decode('utf-8')
+        dump = json.loads(raw)
+    except Exception as e:
+        flash(f'Could not parse backup file: {e}', 'error')
+        return redirect(url_for('config_page', tab='data'))
+
+    from sqlalchemy import inspect as sa_inspect, text as sa_text
+    inspector = sa_inspect(db.engine)
+    existing_tables = set(inspector.get_table_names())
+    db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+    is_pg = db_url.startswith('postgresql')
+
+    # Tables to restore (only those that exist in current schema)
+    SKIP = {'alembic_version'}
+    try:
+        with db.engine.begin() as conn:
+            # Disable FK checks
+            if is_pg:
+                conn.execute(sa_text('SET session_replication_role = replica'))
+            else:
+                conn.execute(sa_text('PRAGMA foreign_keys = OFF'))
+
+            for t, rows in dump.items():
+                if t in SKIP or t not in existing_tables:
+                    continue
+                if not isinstance(rows, list):
+                    continue
+                conn.execute(sa_text(f'DELETE FROM "{t}"'))
+                for row in rows:
+                    if not isinstance(row, dict) or not row:
+                        continue
+                    cols = ', '.join(f':{k}' for k in row)
+                    col_names = ', '.join(f'"{k}"' for k in row)
+                    conn.execute(
+                        sa_text(f'INSERT INTO "{t}" ({col_names}) VALUES ({cols})'),
+                        row
+                    )
+                # Reset PostgreSQL sequences
+                if is_pg and 'id' in (rows[0] if rows else {}):
+                    try:
+                        conn.execute(sa_text(
+                            f"SELECT setval(pg_get_serial_sequence('\"{t}\"','id'), "
+                            f"COALESCE(MAX(id),0)+1, false) FROM \"{t}\""
+                        ))
+                    except Exception:
+                        pass
+
+            # Re-enable FK checks
+            if is_pg:
+                conn.execute(sa_text('SET session_replication_role = DEFAULT'))
+            else:
+                conn.execute(sa_text('PRAGMA foreign_keys = ON'))
+
+        flash('Database restored successfully from backup.', 'success')
+    except Exception as e:
+        flash(f'Restore failed: {e}', 'error')
+    return redirect(url_for('config_page', tab='data'))
 
 @app.route('/admin/config/manual-commit', methods=['POST'])
 @login_required
