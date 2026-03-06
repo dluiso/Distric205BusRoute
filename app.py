@@ -2103,14 +2103,46 @@ def reset_statistics():
         flash('Invalid date.', 'error')
         return redirect(url_for('statistics'))
 
+    include_notifs = request.form.get('include_notifications') == '1'
+
+    # Collect the incident IDs that will be deleted
+    incident_ids = [r.id for r in BusIncidentRecord.query.filter(
+        BusIncidentRecord.incident_date >= d_from,
+        BusIncidentRecord.incident_date <= d_to
+    ).with_entities(BusIncidentRecord.id).all()]
+
+    notif_deleted = 0
+    if incident_ids:
+        if include_notifs:
+            # Delete notification logs tied to those incidents OR sent in that date range
+            dt_from = datetime.combine(d_from, datetime.min.time())
+            dt_to   = datetime.combine(d_to,   datetime.max.time())
+            notif_deleted = NotificationLog.query.filter(
+                db.or_(
+                    NotificationLog.incident_record_id.in_(incident_ids),
+                    db.and_(
+                        NotificationLog.sent_at >= dt_from,
+                        NotificationLog.sent_at <= dt_to
+                    )
+                )
+            ).delete(synchronize_session='fetch')
+        else:
+            # Null-out FK so the incident delete doesn't violate the constraint
+            NotificationLog.query.filter(
+                NotificationLog.incident_record_id.in_(incident_ids)
+            ).update({NotificationLog.incident_record_id: None}, synchronize_session='fetch')
+
     deleted = BusIncidentRecord.query.filter(
         BusIncidentRecord.incident_date >= d_from,
         BusIncidentRecord.incident_date <= d_to
     ).delete(synchronize_session='fetch')
     db.session.commit()
-    _audit('reset_statistics', 'statistics',
-           f'{d_from} → {d_to}', f'Deleted {deleted} records')
-    flash(f'{deleted} record{"s" if deleted != 1 else ""} deleted ({d_from} → {d_to}).', 'success')
+
+    detail = f'Deleted {deleted} incident record{"s" if deleted != 1 else ""}'
+    if include_notifs:
+        detail += f' + {notif_deleted} notification log{"s" if notif_deleted != 1 else ""}'
+    _audit('reset_statistics', 'statistics', f'{d_from} → {d_to}', detail)
+    flash(f'{detail} ({d_from} → {d_to}).', 'success')
     return redirect(url_for('statistics'))
 
 
