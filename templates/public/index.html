@@ -84,6 +84,20 @@
     /* ── Dark mode — offline card border ── */
     html[data-theme="dark"] .offline-card { border-color: rgba(255,255,255,.07) !important; }
 
+    /* ── Holiday announcement banner ── */
+    .holiday-banner {
+      background: #fffbeb;
+      border-color: #fde68a;
+    }
+    html[data-theme="dark"] .holiday-banner {
+      background: rgba(120,83,0,.22) !important;
+      border-color: rgba(251,191,36,.25) !important;
+    }
+    html[data-theme="dark"] .holiday-banner .hb-title  { color: #fcd34d !important; }
+    html[data-theme="dark"] .holiday-banner .hb-text   { color: #fbbf24 !important; }
+    html[data-theme="dark"] .holiday-banner .hb-badge  { background: rgba(251,191,36,.18) !important; color: #fcd34d !important; }
+    html[data-theme="dark"] .holiday-banner .hb-icon   { background: rgba(251,191,36,.18) !important; color: #f59e0b !important; }
+
     /* ── Theme toggle button ── */
     .theme-toggle {
       width: 2.25rem; height: 2.25rem;
@@ -139,15 +153,54 @@
   </div>
 </nav>
 
+<!-- ── UPCOMING HOLIDAY ANNOUNCEMENTS (7-day advance notice) ── -->
+{% if upcoming_holidays %}
+<div class="max-w-7xl mx-auto px-4 pt-4 space-y-2">
+  {% for h in upcoming_holidays %}
+  {% set days_away = (h.holiday_date - today).days %}
+  <div class="holiday-banner border rounded-2xl px-5 py-3.5 flex items-start gap-3">
+    <div class="hb-icon flex-shrink-0 w-9 h-9 rounded-xl bg-amber-100 flex items-center justify-center mt-0.5">
+      <i class="fas fa-calendar-xmark text-amber-600 text-sm"></i>
+    </div>
+    <div class="flex-1 min-w-0">
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="hb-title font-bold text-amber-900 text-sm">
+          No bus service on {{ h.holiday_date.strftime('%A, %B %d') }}
+        </span>
+        <span class="hb-badge text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-semibold">
+          {% if days_away == 1 %}Tomorrow{% else %}In {{ days_away }} days{% endif %}
+        </span>
+        <span class="hb-text text-xs text-amber-700 font-medium">— {{ h.name }}</span>
+      </div>
+      {% if h.custom_message %}
+      <p class="hb-text text-xs text-amber-700 mt-0.5">{{ h.custom_message }}</p>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 <!-- ── OFFLINE BANNER ── -->
 {% if not operational %}
 <div class="max-w-7xl mx-auto px-4 py-10 text-center">
   <div class="c-card offline-card rounded-3xl shadow-sm border border-slate-100 p-10 max-w-lg mx-auto">
+    {% if today_holiday %}
+    <div class="w-20 h-20 bg-amber-50 rounded-full flex items-center justify-center mx-auto mb-5">
+      <i class="fas fa-umbrella-beach text-amber-400 text-3xl"></i>
+    </div>
+    <p class="text-xs font-semibold uppercase tracking-widest text-amber-500 mb-1">{{ today_holiday.holiday_type | capitalize }} Holiday</p>
+    <h2 class="text-2xl font-black mb-3">{{ today_holiday.name }}</h2>
+    <p class="text-sm opacity-70">
+      {{ offline_msg if offline_msg != ('No bus service today — ' + today_holiday.name) else 'No bus service today.' }}
+    </p>
+    {% else %}
     <div class="w-20 h-20 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-5">
       <i class="fas fa-bus-alt text-slate-300 text-3xl"></i>
     </div>
     <h2 class="text-xl font-bold mb-2">Service Offline</h2>
     <p class="text-sm opacity-60">{{ offline_msg or 'Bus service is currently offline.' }}</p>
+    {% endif %}
   </div>
 </div>
 {% else %}

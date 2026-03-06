@@ -148,6 +148,7 @@ class Holiday(db.Model):
     holiday_date    = db.Column(db.Date, nullable=False)
     is_recurring    = db.Column(db.Boolean, default=False)
     is_active       = db.Column(db.Boolean, default=True)
+    custom_message  = db.Column(db.Text)   # displayed on public page on the holiday day
     created_at      = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -505,6 +506,7 @@ def _migrate_add_columns():
         ('notification_subscriber', 'notes',           'VARCHAR(200)'),
         ('bus_schedule_type',       'window_start',    'VARCHAR(5)'),
         ('bus_schedule_type',       'window_end',      'VARCHAR(5)'),
+        ('holiday',                 'custom_message',  'TEXT'),
     ]
     with db.engine.connect() as conn:
         for table, col, coltype in cols:
@@ -594,7 +596,8 @@ def is_operational():
         # Check holidays
         holiday = Holiday.query.filter_by(holiday_date=now.date(), is_active=True).first()
         if holiday:
-            return False, f"Service unavailable — {holiday.name}"
+            msg = holiday.custom_message or f"No bus service today — {holiday.name}"
+            return False, msg
         # Check schedules
         schedules = OperationalSchedule.query.filter_by(is_active=True).all()
         for s in schedules:
@@ -1027,18 +1030,31 @@ def _seed_defaults():
 
 @app.route('/')
 def index():
+    from datetime import timedelta
     cfg = get_config()
     operational, offline_msg = is_operational()
     current_period = get_current_period() if operational else None
     buses_data     = bus_list_today(period=current_period) if operational else []
     incident_types = IncidentType.query.order_by(IncidentType.sort_order).all()
     schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
+    today_dt = date.today()
+    # Holiday for today (for richer offline display)
+    today_holiday = Holiday.query.filter_by(
+        holiday_date=today_dt, is_active=True).first() if not operational else None
+    # Upcoming holidays in the next 7 days (for advance announcement)
+    upcoming_holidays = Holiday.query.filter(
+        Holiday.is_active == True,
+        Holiday.holiday_date > today_dt,
+        Holiday.holiday_date <= today_dt + timedelta(days=7)
+    ).order_by(Holiday.holiday_date).all()
     return render_template('public/index.html',
                            buses_data=buses_data, incident_types=incident_types,
                            schedule_types=schedule_types, cfg=cfg,
                            current_period=current_period,
                            operational=operational, offline_msg=offline_msg,
-                           today=date.today())
+                           today=today_dt,
+                           today_holiday=today_holiday,
+                           upcoming_holidays=upcoming_holidays)
 
 @app.route('/api/buses')
 def api_buses():
@@ -2568,12 +2584,33 @@ def add_holiday():
             holiday_type=request.form.get('holiday_type','school'),
             holiday_date=date.fromisoformat(request.form.get('holiday_date','')),
             is_recurring='is_recurring' in request.form,
+            custom_message=request.form.get('custom_message','').strip() or None,
         )
         db.session.add(h)
         db.session.commit()
         flash('Holiday added.', 'success')
     except Exception:
         flash('Invalid date.', 'error')
+    return redirect(url_for('config_page', tab='operational'))
+
+@app.route('/admin/config/holidays/<int:hid>/edit', methods=['POST'])
+@login_required
+@require_module('config', 'full')
+def edit_holiday(hid):
+    h = Holiday.query.get_or_404(hid)
+    name = request.form.get('name', '').strip()
+    if name:
+        h.name = name
+    h.holiday_type   = request.form.get('holiday_type', h.holiday_type)
+    h.custom_message = request.form.get('custom_message', '').strip() or None
+    try:
+        new_date = request.form.get('holiday_date', '').strip()
+        if new_date:
+            h.holiday_date = date.fromisoformat(new_date)
+    except Exception:
+        pass
+    db.session.commit()
+    flash('Holiday updated.', 'success')
     return redirect(url_for('config_page', tab='operational'))
 
 @app.route('/admin/config/holidays/<int:hid>/delete', methods=['POST'])

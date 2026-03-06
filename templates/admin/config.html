@@ -332,30 +332,43 @@
         <h3 class="font-bold text-slate-700 flex items-center space-x-2">
           <i class="fas fa-umbrella-beach text-blue-500"></i><span>Holidays & No-Service Days</span>
         </h3>
+        <p class="text-xs text-slate-400 mt-1">The public page shows each holiday's custom message on that day and announces it 7 days in advance.</p>
       </div>
       {% if holidays %}
-      <div class="max-h-72 overflow-y-auto">
+      <div class="max-h-80 overflow-y-auto">
         <table class="w-full text-sm">
-          <thead class="sticky top-0"><tr class="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider">
-            <th class="px-4 py-2.5 text-left">Date</th>
+          <thead class="sticky top-0 z-10"><tr class="bg-slate-50 text-slate-500 text-xs uppercase tracking-wider">
+            <th class="px-4 py-2.5 text-left w-28">Date</th>
             <th class="px-4 py-2.5 text-left">Name</th>
-            <th class="px-4 py-2.5 text-left">Type</th>
-            {% if can_write %}<th class="px-4 py-2.5"></th>{% endif %}
+            <th class="px-4 py-2.5 text-left w-20">Type</th>
+            <th class="px-4 py-2.5 text-left">Custom Message</th>
+            {% if can_write %}<th class="px-4 py-2.5 w-20"></th>{% endif %}
           </tr></thead>
           <tbody class="divide-y divide-slate-50">
             {% for h in holidays %}
-            <tr class="hover:bg-slate-50">
-              <td class="px-4 py-2.5 text-xs font-medium text-slate-700">{{ h.holiday_date.strftime('%b %d, %Y') }}</td>
-              <td class="px-4 py-2.5 text-sm text-slate-700">{{ h.name }}</td>
+            <tr class="hover:bg-slate-50 align-top">
+              <td class="px-4 py-2.5 text-xs font-medium text-slate-700 whitespace-nowrap">{{ h.holiday_date.strftime('%b %d, %Y') }}</td>
+              <td class="px-4 py-2.5 text-sm text-slate-700 font-medium">{{ h.name }}</td>
               <td class="px-4 py-2.5">
                 <span class="text-xs bg-slate-100 text-slate-500 px-2 py-0.5 rounded-full">{{ h.holiday_type }}</span>
               </td>
+              <td class="px-4 py-2.5 text-xs text-slate-500">
+                {% if h.custom_message %}
+                <span class="italic">{{ h.custom_message[:80] }}{% if h.custom_message|length > 80 %}…{% endif %}</span>
+                {% else %}
+                <span class="text-slate-300">—</span>
+                {% endif %}
+              </td>
               {% if can_write %}
-              <td class="px-4 py-2.5 text-right">
-                <form method="POST" action="{{ url_for('delete_holiday', hid=h.id) }}"
-                      onsubmit="return confirm('Remove holiday?')">
-                  <button type="submit" class="text-red-400 hover:text-red-600 text-xs"><i class="fas fa-trash"></i></button>
-                </form>
+              <td class="px-4 py-2.5">
+                <div class="flex items-center justify-end gap-2">
+                  <button onclick="openEditHoliday({{ h.id }}, '{{ h.holiday_date }}', {{ h.name | tojson }}, '{{ h.holiday_type }}', {{ (h.custom_message or '') | tojson }})"
+                          class="text-slate-400 hover:text-blue-600 text-xs p-1"><i class="fas fa-edit"></i></button>
+                  <form method="POST" action="{{ url_for('delete_holiday', hid=h.id) }}"
+                        onsubmit="return confirm('Remove {{ h.name }}?')">
+                    <button type="submit" class="text-slate-400 hover:text-red-600 text-xs p-1"><i class="fas fa-trash"></i></button>
+                  </form>
+                </div>
               </td>
               {% endif %}
             </tr>
@@ -364,33 +377,91 @@
         </table>
       </div>
       {% else %}
-      <p class="px-5 py-4 text-sm text-slate-400">No holidays defined.</p>
+      <p class="px-5 py-4 text-sm text-slate-400">No holidays defined yet.</p>
       {% endif %}
+
       {% if can_write %}
-      <form method="POST" action="{{ url_for('add_holiday') }}" class="px-5 py-3 bg-slate-50 border-t border-slate-100">
-        <div class="flex flex-wrap gap-2 items-end">
-          <div>
-            <label class="block text-xs text-slate-500 mb-1">Date</label>
-            <input type="date" name="holiday_date" required
-                   class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      <!-- Add holiday form -->
+      <div class="px-5 py-4 bg-slate-50 border-t border-slate-100">
+        <p class="text-xs font-semibold text-slate-500 mb-3 uppercase tracking-wide">Add Holiday</p>
+        <form method="POST" action="{{ url_for('add_holiday') }}" class="space-y-2">
+          <div class="flex flex-wrap gap-2 items-end">
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">Date</label>
+              <input type="date" name="holiday_date" required
+                     class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">Name</label>
+              <input type="text" name="name" placeholder="Labor Day" required
+                     class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-36">
+            </div>
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">Type</label>
+              <select name="holiday_type" class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+                <option value="school">School</option>
+                <option value="federal">Federal</option>
+                <option value="state">State</option>
+                <option value="local">Local</option>
+              </select>
+            </div>
+          </div>
+          <div class="flex gap-2 items-end">
+            <div class="flex-1">
+              <label class="block text-xs text-slate-500 mb-1">
+                Custom Message <span class="text-slate-400 font-normal">(shown on public page on this day and 7 days before)</span>
+              </label>
+              <input type="text" name="custom_message"
+                     placeholder="No bus service today due to Labor Day. Enjoy the long weekend!"
+                     class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium flex-shrink-0">Add</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Edit holiday card (hidden until Edit clicked) -->
+      <div id="edit-holiday-card" class="hidden px-5 py-4 bg-blue-50 border-t border-blue-200">
+        <p class="text-xs font-semibold text-blue-700 mb-3 uppercase tracking-wide flex items-center gap-2">
+          <i class="fas fa-edit"></i>Edit Holiday
+        </p>
+        <form method="POST" id="form-edit-holiday" class="space-y-2">
+          <div class="flex flex-wrap gap-2 items-end">
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">Date</label>
+              <input type="date" name="holiday_date" id="eh-date" required
+                     class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+            </div>
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">Name</label>
+              <input type="text" name="name" id="eh-name" required
+                     class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white w-36">
+            </div>
+            <div>
+              <label class="block text-xs text-slate-500 mb-1">Type</label>
+              <select name="holiday_type" id="eh-type" class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+                <option value="school">School</option>
+                <option value="federal">Federal</option>
+                <option value="state">State</option>
+                <option value="local">Local</option>
+              </select>
+            </div>
           </div>
           <div>
-            <label class="block text-xs text-slate-500 mb-1">Name</label>
-            <input type="text" name="name" placeholder="Labor Day" required
-                   class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-36">
+            <label class="block text-xs text-slate-500 mb-1">Custom Message</label>
+            <input type="text" name="custom_message" id="eh-message"
+                   placeholder="No bus service today…"
+                   class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
           </div>
-          <div>
-            <label class="block text-xs text-slate-500 mb-1">Type</label>
-            <select name="holiday_type" class="px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
-              <option value="school">School</option>
-              <option value="federal">Federal</option>
-              <option value="state">State</option>
-              <option value="local">Local</option>
-            </select>
+          <div class="flex gap-2 pt-1">
+            <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+              <i class="fas fa-save mr-1"></i>Save
+            </button>
+            <button type="button" onclick="document.getElementById('edit-holiday-card').classList.add('hidden')"
+                    class="px-4 py-2 border border-slate-200 bg-white rounded-xl text-sm text-slate-600 hover:bg-slate-50">Cancel</button>
           </div>
-          <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">Add</button>
-        </div>
-      </form>
+        </form>
+      </div>
       {% endif %}
     </div>
   </div>
@@ -746,6 +817,18 @@ function showTab(id) {
     btn.className += ' ' + (t === id ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50');
   });
   history.replaceState(null, '', '?tab=' + id);
+}
+
+// ── HOLIDAYS ──────────────────────────────────────────────────────────────────
+function openEditHoliday(id, date, name, type, message) {
+  document.getElementById('form-edit-holiday').action = '/admin/config/holidays/' + id + '/edit';
+  document.getElementById('eh-date').value    = date;
+  document.getElementById('eh-name').value    = name;
+  document.getElementById('eh-type').value    = type;
+  document.getElementById('eh-message').value = message;
+  const card = document.getElementById('edit-holiday-card');
+  card.classList.remove('hidden');
+  card.scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
 
 // Time format selector visual
