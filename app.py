@@ -566,7 +566,7 @@ def _migrate_add_columns():
                 conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {col} {coltype}'))
                 conn.commit()
             except Exception:
-                pass  # column already exists
+                conn.rollback()  # reset aborted transaction (required for PostgreSQL)
 
 
 def _migrate_subscriber_contacts():
