@@ -560,13 +560,15 @@ def _migrate_add_columns():
         ('configuration',           'twilio_from_number',     "VARCHAR(20) DEFAULT ''"),
         ('configuration',           'twilio_sms_cost_per_seg','REAL DEFAULT 0.0079'),
     ]
-    with db.engine.connect() as conn:
-        for table, col, coltype in cols:
-            try:
+    # Use a separate connection per column so a failed ALTER TABLE (column already
+    # exists) never leaves a shared connection in an aborted-transaction state.
+    for table, col, coltype in cols:
+        try:
+            with db.engine.connect() as conn:
                 conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {col} {coltype}'))
                 conn.commit()
-            except Exception:
-                conn.rollback()  # reset aborted transaction (required for PostgreSQL)
+        except Exception:
+            pass  # column already exists — safe to ignore
 
 
 def _migrate_subscriber_contacts():
