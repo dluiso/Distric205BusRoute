@@ -2872,43 +2872,42 @@ def import_db():
 
     # Tables to restore (only those that exist in current schema)
     SKIP = {'alembic_version'}
+    tables_to_restore = [
+        (t, rows) for t, rows in dump.items()
+        if t not in SKIP and t in existing_tables and isinstance(rows, list)
+    ]
     try:
         with db.engine.begin() as conn:
-            # Disable FK checks
             if is_pg:
-                conn.execute(sa_text('SET session_replication_role = replica'))
+                # TRUNCATE CASCADE handles FK ordering without superuser privileges
+                for t, _ in tables_to_restore:
+                    conn.execute(sa_text(f'TRUNCATE TABLE "{t}" CASCADE'))
             else:
                 conn.execute(sa_text('PRAGMA foreign_keys = OFF'))
+                for t, _ in tables_to_restore:
+                    conn.execute(sa_text(f'DELETE FROM "{t}"'))
 
-            for t, rows in dump.items():
-                if t in SKIP or t not in existing_tables:
-                    continue
-                if not isinstance(rows, list):
-                    continue
-                conn.execute(sa_text(f'DELETE FROM "{t}"'))
+            for t, rows in tables_to_restore:
                 for row in rows:
                     if not isinstance(row, dict) or not row:
                         continue
-                    cols = ', '.join(f':{k}' for k in row)
                     col_names = ', '.join(f'"{k}"' for k in row)
+                    placeholders = ', '.join(f':{k}' for k in row)
                     conn.execute(
-                        sa_text(f'INSERT INTO "{t}" ({col_names}) VALUES ({cols})'),
+                        sa_text(f'INSERT INTO "{t}" ({col_names}) VALUES ({placeholders})'),
                         row
                     )
-                # Reset PostgreSQL sequences
-                if is_pg and 'id' in (rows[0] if rows else {}):
+                # Reset PostgreSQL sequences after insert
+                if is_pg and rows and 'id' in rows[0]:
                     try:
                         conn.execute(sa_text(
                             f"SELECT setval(pg_get_serial_sequence('\"{t}\"','id'), "
-                            f"COALESCE(MAX(id),0)+1, false) FROM \"{t}\""
+                            f"COALESCE(MAX(id),1), true) FROM \"{t}\""
                         ))
                     except Exception:
                         pass
 
-            # Re-enable FK checks
-            if is_pg:
-                conn.execute(sa_text('SET session_replication_role = DEFAULT'))
-            else:
+            if not is_pg:
                 conn.execute(sa_text('PRAGMA foreign_keys = ON'))
 
         flash('Database restored successfully from backup.', 'success')
