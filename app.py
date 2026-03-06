@@ -628,19 +628,20 @@ def is_operational():
     except Exception:
         return True, None
 
-def bus_list_today(period=None):
-    """Return bus status list for today, optionally filtered to a specific period.
+def bus_list_today(period=None, admin=False):
+    """Return bus status list for today.
 
-    When ``period`` is a BusScheduleType, only buses assigned to that period are
-    returned and their status is resolved against period-specific incidents only.
-    Pass period=None to bypass filtering (admin views, statistics, etc.).
+    admin=True  → all active buses, all today's incidents (no period filter).
+    admin=False → public view: only buses assigned to current period.
     """
     today = date.today()
-    current_period = period  # caller may override; default = auto-detect
+    current_period = period
     if current_period is None:
         current_period = get_current_period()
 
-    if current_period is not None:
+    if admin:
+        buses = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
+    elif current_period is not None:
         assigned_ids = {a.bus_id for a in BusScheduleAssignment.query.filter_by(
             schedule_type_id=current_period.id).all()}
         buses = Bus.query.filter(
@@ -655,7 +656,7 @@ def bus_list_today(period=None):
     for bus in buses:
         status, delay = get_bus_status(bus.id, today, schedule_type_id=period_id)
         q = BusIncidentRecord.query.filter_by(bus_id=bus.id, incident_date=today)
-        if period_id:
+        if not admin and period_id:
             q = q.filter_by(schedule_type_id=period_id)
         incidents = q.order_by(BusIncidentRecord.created_at.desc()).all()
         schedules = [a.schedule_type for a in bus.schedule_assignments]
@@ -828,10 +829,28 @@ def _send_bus_notifications(rec):
     except Exception as e:
         print(f'[Notifications] send error: {e}')
 
-if SCHEDULER_AVAILABLE:
-    scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(commit_pending_incidents, 'interval', minutes=1, id='commit_pending')
-    scheduler.start()
+_sched_lock_fh = None   # module-level ref keeps file lock alive for process lifetime
+
+def _start_scheduler_once():
+    """Start the scheduler in only ONE gunicorn worker using a file lock.
+    Falls back to unconditional start on Windows (dev) where fcntl is unavailable."""
+    global _sched_lock_fh
+    if not SCHEDULER_AVAILABLE:
+        return
+    sched = BackgroundScheduler(daemon=True)
+    sched.add_job(commit_pending_incidents, 'interval', minutes=1, id='commit_pending')
+    try:
+        import fcntl
+        _sched_lock_fh = open('/tmp/bustrack_sched.lock', 'w')
+        fcntl.flock(_sched_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sched.start()   # we got the lock → this worker owns the scheduler
+        print('[Scheduler] started (pid=%d)' % os.getpid())
+    except ImportError:
+        sched.start()   # Windows / dev mode — no fcntl, just start it
+    except (IOError, OSError):
+        pass            # another worker already holds the lock → skip
+
+_start_scheduler_once()
 
 
 # ── SECURITY MIDDLEWARE ───────────────────────────────────────────────────────
@@ -1269,7 +1288,7 @@ def dashboard():
 def buses():
     today          = date.today()
     current_period = get_current_period()
-    buses_data     = bus_list_today(period=current_period)
+    buses_data     = bus_list_today(admin=True)   # show all buses regardless of schedule period
     incident_types = IncidentType.query.order_by(IncidentType.sort_order).all()
     schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
     delay_reasons  = DelayReason.query.order_by(DelayReason.sort_order).all()
