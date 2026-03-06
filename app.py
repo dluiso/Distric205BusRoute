@@ -14,7 +14,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime, date, timedelta
 from functools import wraps
 from sqlalchemy import func
-import os, json, csv, io, pytz, re, threading, uuid, time, secrets, html
+import os, json, csv, io, pytz, re, threading, uuid, time, secrets, html, tempfile
 from collections import defaultdict
 
 try:
@@ -757,7 +757,6 @@ def _audit(action, module, target='', details=''):
 
 
 # In-memory store for DB import jobs
-_import_jobs = {}
 
 
 # ── APSCHEDULER ──────────────────────────────────────────────────────────────
@@ -2902,11 +2901,16 @@ def export_sql():
 
 _IMPORT_TABLE_ORDER = [
     'user_group', 'group_permission', 'user', 'configuration',
-    'bus_schedule_type', 'bus', 'bus_schedule_assignment', 'delay_reason',
+    'operational_schedule', 'bus_schedule_type', 'incident_type',
+    'delay_reason', 'bus', 'bus_schedule_assignment',
     'bus_incident_record', 'subscriber_group', 'group_bus_assignment',
     'notification_subscriber', 'subscriber_contact',
     'notification_bus_assignment', 'holiday', 'audit_log',
 ]
+
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(tempfile.gettempdir(), f'bustrack_import_{job_id}.json')
 
 
 @app.route('/admin/config/import-db', methods=['POST'])
@@ -2934,7 +2938,8 @@ def import_db():
     ordered = [(t, dump[t]) for t in known + rest if isinstance(dump.get(t), list)]
 
     job_id = secrets.token_urlsafe(16)
-    _import_jobs[job_id] = {'tables': ordered, 'is_pg': is_pg}
+    with open(_job_path(job_id), 'w', encoding='utf-8') as fp:
+        json.dump({'tables': ordered, 'is_pg': is_pg}, fp)
     _audit('import_db_start', 'config', f'{len(ordered)} tables', f'File: {f.filename}')
     return jsonify({'ok': True, 'job_id': job_id, 'total': len(ordered)})
 
@@ -2944,11 +2949,13 @@ def import_db():
 @require_module('config', 'full')
 def import_run(job_id):
     """Phase 2: SSE stream that executes the restore and reports per-table progress."""
-    job = _import_jobs.get(job_id)
-    if not job:
+    jpath = _job_path(job_id)
+    if not os.path.exists(jpath):
         def _err():
             yield 'data: {"error":"Job not found or expired"}\n\n'
         return app.response_class(_err(), mimetype='text/event-stream')
+    with open(jpath, 'r', encoding='utf-8') as fp:
+        job = json.load(fp)
 
     tables  = job['tables']
     is_pg   = job['is_pg']
@@ -3017,7 +3024,10 @@ def import_run(job_id):
         except Exception as e:
             errors.append(f'Transaction error: {e}')
 
-        _import_jobs.pop(job_id, None)
+        try:
+            os.remove(jpath)
+        except Exception:
+            pass
         _audit('import_db_done', 'config', f'{restored}/{total} tables restored',
                '; '.join(errors) if errors else 'no errors')
         yield f'data: {json.dumps({"done":True,"restored":restored,"total":total,"errors":errors})}\n\n'
