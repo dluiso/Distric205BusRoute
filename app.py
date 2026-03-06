@@ -177,7 +177,21 @@ MODULES = [
     {'key': 'users',         'label': 'Users',           'icon': 'fa-users'},
     {'key': 'notifications', 'label': 'Notifications',   'icon': 'fa-bell'},
     {'key': 'config',        'label': 'Configuration',   'icon': 'fa-cog'},
+    {'key': 'logs',          'label': 'System Logs',     'icon': 'fa-scroll'},
 ]
+
+
+class AuditLog(db.Model):
+    __tablename__ = 'audit_log'
+    id         = db.Column(db.Integer, primary_key=True)
+    user_id    = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='SET NULL'), nullable=True)
+    username   = db.Column(db.String(80))
+    action     = db.Column(db.String(100))
+    module     = db.Column(db.String(50))
+    target     = db.Column(db.String(200))
+    details    = db.Column(db.Text)
+    ip_address = db.Column(db.String(45))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 class User(UserMixin, db.Model):
@@ -727,6 +741,25 @@ def require_module(module_key, level='limited'):
     return decorator
 
 
+# ── AUDIT HELPER ─────────────────────────────────────────────────────────────
+
+def _audit(action, module, target='', details=''):
+    try:
+        uid   = current_user.id if current_user.is_authenticated else None
+        uname = current_user.username if current_user.is_authenticated else 'system'
+        ip    = request.remote_addr or '0.0.0.0'
+        db.session.add(AuditLog(user_id=uid, username=uname, action=action,
+                                module=module, target=target or '',
+                                details=details or '', ip_address=ip))
+        db.session.commit()
+    except Exception:
+        pass
+
+
+# In-memory store for DB import jobs
+_import_jobs = {}
+
+
 # ── APSCHEDULER ──────────────────────────────────────────────────────────────
 
 def commit_pending_incidents():
@@ -1113,12 +1146,14 @@ def login():
             login_user(user)
             user.last_login = datetime.utcnow()
             db.session.commit()
+            _audit('login', 'auth', user.username)
             # Prevent open-redirect: only allow relative next URLs
             next_url = request.args.get('next', '')
             if next_url and next_url.startswith('/'):
                 return redirect(next_url)
             return redirect(url_for('dashboard'))
         _login_attempts[ip].append(now)
+        _audit('login_failed', 'auth', identifier or '(empty)')
         flash('Invalid credentials. Please try again.', 'error')
     return render_template('admin/login.html')
 
@@ -1269,6 +1304,7 @@ def add_bus():
         db.session.add(BusScheduleAssignment(bus_id=bus.id, schedule_type_id=int(sid),
                                              departure_time=dep_time))
     db.session.commit()
+    _audit('add_bus', 'buses', bus.display_name)
     flash(f'Bus {bus.display_name} registered successfully.', 'success')
     return redirect(url_for('buses'))
 
@@ -1298,6 +1334,7 @@ def edit_bus(bus_id):
         db.session.add(BusScheduleAssignment(bus_id=bus_id, schedule_type_id=int(sid),
                                              departure_time=dep_time))
     db.session.commit()
+    _audit('edit_bus', 'buses', bus.display_name)
     flash(f'Bus {bus.display_name} updated.', 'success')
     return redirect(url_for('buses'))
 
@@ -1308,6 +1345,7 @@ def delete_bus(bus_id):
     bus = Bus.query.get_or_404(bus_id)
     bus.active = False
     db.session.commit()
+    _audit('delete_bus', 'buses', bus.display_name)
     flash(f'Bus {bus.identifier} deactivated.', 'success')
     return redirect(url_for('buses'))
 
@@ -1844,6 +1882,7 @@ def add_user():
     u.set_password(password)
     db.session.add(u)
     db.session.commit()
+    _audit('add_user', 'users', username)
     flash(f'User "{username}" created.', 'success')
     return redirect(url_for('users'))
 
@@ -1870,6 +1909,7 @@ def edit_user(uid):
     pwd = request.form.get('new_password', '').strip()
     if pwd: u.set_password(pwd)
     db.session.commit()
+    _audit('edit_user', 'users', u.username)
     flash(f'User "{u.username}" updated.', 'success')
     return redirect(url_for('users'))
 
@@ -1884,9 +1924,11 @@ def delete_user(uid):
     if u.username == 'admin':
         flash('Cannot delete the default admin account.', 'error')
         return redirect(url_for('users'))
+    uname = u.username
     db.session.delete(u)
     db.session.commit()
-    flash(f'User "{u.username}" deleted.', 'success')
+    _audit('delete_user', 'users', uname)
+    flash(f'User "{uname}" deleted.', 'success')
     return redirect(url_for('users'))
 
 @app.route('/admin/groups/add', methods=['POST'])
@@ -1907,6 +1949,7 @@ def add_group():
         level = request.form.get(f'perm_{mod["key"]}', 'none')
         db.session.add(GroupPermission(group_id=g.id, module_key=mod['key'], access_level=level))
     db.session.commit()
+    _audit('add_group', 'users', name)
     flash(f'Group "{name}" created.', 'success')
     return redirect(url_for('users'))
 
@@ -1924,6 +1967,7 @@ def edit_group(gid):
             if perm: perm.access_level = level
             else: db.session.add(GroupPermission(group_id=gid, module_key=mod['key'], access_level=level))
     db.session.commit()
+    _audit('edit_group', 'users', g.name)
     flash(f'Group "{g.name}" updated.', 'success')
     return redirect(url_for('users'))
 
@@ -1941,9 +1985,11 @@ def delete_group(gid):
     if g.users:
         flash('Cannot delete: group has assigned users.', 'error')
         return redirect(url_for('users'))
+    gname = g.name
     db.session.delete(g)
     db.session.commit()
-    flash(f'Group "{g.name}" deleted.', 'success')
+    _audit('delete_group', 'users', gname)
+    flash(f'Group "{gname}" deleted.', 'success')
     return redirect(url_for('users'))
 
 
@@ -1992,6 +2038,7 @@ def add_subscriber():
     db.session.flush()
     _save_contacts(s.id, request.form)
     db.session.commit()
+    _audit('add_subscriber', 'notifications', s.full_name)
     flash(f'Enrollment "{s.full_name}" added.', 'success')
     return redirect(url_for('notifications'))
 
@@ -2006,6 +2053,7 @@ def edit_subscriber(sid):
     SubscriberContact.query.filter_by(subscriber_id=sid).delete()
     _save_contacts(sid, request.form)
     db.session.commit()
+    _audit('edit_subscriber', 'notifications', s.full_name)
     flash('Enrollment updated.', 'success')
     return redirect(url_for('notifications'))
 
@@ -2014,8 +2062,10 @@ def edit_subscriber(sid):
 @require_module('notifications', 'full')
 def delete_subscriber(sid):
     s = NotificationSubscriber.query.get_or_404(sid)
+    name = s.full_name
     db.session.delete(s)
     db.session.commit()
+    _audit('delete_subscriber', 'notifications', name)
     flash('Subscriber removed.', 'success')
     return redirect(url_for('notifications'))
 
@@ -2036,6 +2086,7 @@ def bulk_delete_subscribers():
             pass
     if count:
         db.session.commit()
+        _audit('bulk_delete_subscribers', 'notifications', f'{count} subscribers deleted')
         flash(f'{count} subscriber(s) deleted.', 'success')
     return redirect(url_for('notifications'))
 
@@ -2849,71 +2900,132 @@ def export_sql():
     return resp
 
 
+_IMPORT_TABLE_ORDER = [
+    'user_group', 'group_permission', 'user', 'configuration',
+    'bus_schedule_type', 'bus', 'bus_schedule_assignment', 'delay_reason',
+    'bus_incident_record', 'subscriber_group', 'group_bus_assignment',
+    'notification_subscriber', 'subscriber_contact',
+    'notification_bus_assignment', 'holiday', 'audit_log',
+]
+
+
 @app.route('/admin/config/import-db', methods=['POST'])
 @login_required
 @require_module('config', 'full')
 def import_db():
+    """Phase 1: parse the uploaded JSON and store job; return job_id via JSON."""
     f = request.files.get('backup_file')
     if not f or not f.filename.endswith('.json'):
-        flash('Please upload a valid .json backup file.', 'error')
-        return redirect(url_for('config_page', tab='data'))
+        return jsonify({'ok': False, 'error': 'Please upload a valid .json backup file.'})
     try:
-        raw = f.read().decode('utf-8')
-        dump = json.loads(raw)
+        dump = json.loads(f.read().decode('utf-8'))
     except Exception as e:
-        flash(f'Could not parse backup file: {e}', 'error')
-        return redirect(url_for('config_page', tab='data'))
+        return jsonify({'ok': False, 'error': f'Could not parse file: {e}'})
 
-    from sqlalchemy import inspect as sa_inspect, text as sa_text
+    from sqlalchemy import inspect as sa_inspect
     inspector = sa_inspect(db.engine)
     existing_tables = set(inspector.get_table_names())
-    db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
-    is_pg = db_url.startswith('postgresql')
-
-    # Tables to restore (only those that exist in current schema)
+    is_pg = app.config.get('SQLALCHEMY_DATABASE_URI', '').startswith('postgresql')
     SKIP = {'alembic_version'}
-    tables_to_restore = [
-        (t, rows) for t, rows in dump.items()
-        if t not in SKIP and t in existing_tables and isinstance(rows, list)
-    ]
-    try:
-        with db.engine.begin() as conn:
-            if is_pg:
-                # TRUNCATE CASCADE handles FK ordering without superuser privileges
-                for t, _ in tables_to_restore:
-                    conn.execute(sa_text(f'TRUNCATE TABLE "{t}" CASCADE'))
-            else:
-                conn.execute(sa_text('PRAGMA foreign_keys = OFF'))
-                for t, _ in tables_to_restore:
-                    conn.execute(sa_text(f'DELETE FROM "{t}"'))
 
-            for t, rows in tables_to_restore:
-                for row in rows:
-                    if not isinstance(row, dict) or not row:
-                        continue
-                    col_names = ', '.join(f'"{k}"' for k in row)
-                    placeholders = ', '.join(f':{k}' for k in row)
-                    conn.execute(
-                        sa_text(f'INSERT INTO "{t}" ({col_names}) VALUES ({placeholders})'),
-                        row
-                    )
-                # Reset PostgreSQL sequences after insert
-                if is_pg and rows and 'id' in rows[0]:
+    # Sort tables by known FK-safe order; unknown tables appended at end
+    known = [t for t in _IMPORT_TABLE_ORDER if t in dump and t not in SKIP and t in existing_tables]
+    rest  = [t for t in dump if t not in known and t not in SKIP and t in existing_tables and isinstance(dump[t], list)]
+    ordered = [(t, dump[t]) for t in known + rest if isinstance(dump.get(t), list)]
+
+    job_id = secrets.token_urlsafe(16)
+    _import_jobs[job_id] = {'tables': ordered, 'is_pg': is_pg}
+    _audit('import_db_start', 'config', f'{len(ordered)} tables', f'File: {f.filename}')
+    return jsonify({'ok': True, 'job_id': job_id, 'total': len(ordered)})
+
+
+@app.route('/admin/config/import-run/<job_id>')
+@login_required
+@require_module('config', 'full')
+def import_run(job_id):
+    """Phase 2: SSE stream that executes the restore and reports per-table progress."""
+    job = _import_jobs.get(job_id)
+    if not job:
+        def _err():
+            yield 'data: {"error":"Job not found or expired"}\n\n'
+        return app.response_class(_err(), mimetype='text/event-stream')
+
+    tables  = job['tables']
+    is_pg   = job['is_pg']
+    total   = len(tables)
+
+    def _generate():
+        from sqlalchemy import text as sa_text
+        errors   = []
+        restored = 0
+
+        yield f'data: {json.dumps({"status":"truncating","total":total})}\n\n'
+
+        try:
+            with db.engine.begin() as conn:
+                # ── TRUNCATE all tables first ─────────────────────────────
+                if is_pg:
+                    for t, _ in tables:
+                        try:
+                            conn.execute(sa_text(f'TRUNCATE TABLE "{t}" CASCADE'))
+                        except Exception as e:
+                            errors.append(f'TRUNCATE {t}: {e}')
+                else:
+                    conn.execute(sa_text('PRAGMA foreign_keys = OFF'))
+                    for t, _ in tables:
+                        try:
+                            conn.execute(sa_text(f'DELETE FROM "{t}"'))
+                        except Exception as e:
+                            errors.append(f'DELETE {t}: {e}')
+
+                # ── INSERT each table ─────────────────────────────────────
+                for step, (t, rows) in enumerate(tables, 1):
+                    inserted = 0
                     try:
-                        conn.execute(sa_text(
-                            f"SELECT setval(pg_get_serial_sequence('\"{t}\"','id'), "
-                            f"COALESCE(MAX(id),1), true) FROM \"{t}\""
-                        ))
-                    except Exception:
-                        pass
+                        for row in rows:
+                            if not isinstance(row, dict) or not row:
+                                continue
+                            col_names    = ', '.join(f'"{k}"' for k in row)
+                            placeholders = ', '.join(f':{k}' for k in row)
+                            conn.execute(
+                                sa_text(f'INSERT INTO "{t}" ({col_names}) VALUES ({placeholders})'),
+                                row
+                            )
+                            inserted += 1
+                        # Reset PG sequences
+                        if is_pg and rows and 'id' in rows[0]:
+                            try:
+                                conn.execute(sa_text(
+                                    f"SELECT setval(pg_get_serial_sequence('\"{t}\"','id'),"
+                                    f"COALESCE(MAX(id),1),true) FROM \"{t}\""
+                                ))
+                            except Exception:
+                                pass
+                        restored += 1
+                        ok = True
+                        err_msg = ''
+                    except Exception as e:
+                        ok = False
+                        err_msg = str(e)
+                        errors.append(f'{t}: {err_msg}')
 
-            if not is_pg:
-                conn.execute(sa_text('PRAGMA foreign_keys = ON'))
+                    yield f'data: {json.dumps({"step":step,"total":total,"table":t,"rows":inserted,"ok":ok,"error":err_msg})}\n\n'
 
-        flash('Database restored successfully from backup.', 'success')
-    except Exception as e:
-        flash(f'Restore failed: {e}', 'error')
-    return redirect(url_for('config_page', tab='data'))
+                if not is_pg:
+                    conn.execute(sa_text('PRAGMA foreign_keys = ON'))
+
+        except Exception as e:
+            errors.append(f'Transaction error: {e}')
+
+        _import_jobs.pop(job_id, None)
+        _audit('import_db_done', 'config', f'{restored}/{total} tables restored',
+               '; '.join(errors) if errors else 'no errors')
+        yield f'data: {json.dumps({"done":True,"restored":restored,"total":total,"errors":errors})}\n\n'
+
+    resp = app.response_class(_generate(), mimetype='text/event-stream')
+    resp.headers['Cache-Control'] = 'no-cache'
+    resp.headers['X-Accel-Buffering'] = 'no'
+    return resp
 
 @app.route('/admin/config/manual-commit', methods=['POST'])
 @login_required
@@ -2922,6 +3034,82 @@ def manual_commit():
     commit_pending_incidents()
     flash('All pending incidents committed to statistics.', 'success')
     return redirect(url_for('config_page', tab='operational'))
+
+
+# ── SYSTEM LOGS ───────────────────────────────────────────────────────────────
+
+@app.route('/admin/logs')
+@login_required
+@require_module('logs')
+def system_logs():
+    page     = request.args.get('page', 1, type=int)
+    module_f = request.args.get('module', '').strip()
+    user_f   = request.args.get('user', '').strip()
+    date_f   = request.args.get('date', '').strip()
+    search_f = request.args.get('q', '').strip()
+
+    q = AuditLog.query.order_by(AuditLog.created_at.desc())
+    if module_f:
+        q = q.filter(AuditLog.module == module_f)
+    if user_f:
+        q = q.filter(AuditLog.username.ilike(f'%{user_f}%'))
+    if search_f:
+        like = f'%{search_f}%'
+        q = q.filter(
+            db.or_(AuditLog.action.ilike(like), AuditLog.target.ilike(like),
+                   AuditLog.details.ilike(like))
+        )
+    if date_f:
+        try:
+            d = date.fromisoformat(date_f)
+            q = q.filter(func.date(AuditLog.created_at) == d)
+        except Exception:
+            pass
+
+    logs_page = q.paginate(page=page, per_page=50, error_out=False)
+    all_modules = [r[0] for r in db.session.query(AuditLog.module).distinct().order_by(AuditLog.module).all() if r[0]]
+    all_users   = [r[0] for r in db.session.query(AuditLog.username).distinct().order_by(AuditLog.username).all() if r[0]]
+    return render_template('admin/logs.html',
+                           logs=logs_page, all_modules=all_modules, all_users=all_users,
+                           module_f=module_f, user_f=user_f, date_f=date_f, search_f=search_f)
+
+
+@app.route('/admin/logs/export-csv')
+@login_required
+@require_module('logs')
+def export_logs_csv():
+    module_f = request.args.get('module', '').strip()
+    user_f   = request.args.get('user', '').strip()
+    date_f   = request.args.get('date', '').strip()
+    search_f = request.args.get('q', '').strip()
+
+    q = AuditLog.query.order_by(AuditLog.created_at.desc())
+    if module_f: q = q.filter(AuditLog.module == module_f)
+    if user_f:   q = q.filter(AuditLog.username.ilike(f'%{user_f}%'))
+    if search_f:
+        like = f'%{search_f}%'
+        q = q.filter(db.or_(AuditLog.action.ilike(like), AuditLog.target.ilike(like)))
+    if date_f:
+        try:
+            d = date.fromisoformat(date_f)
+            q = q.filter(func.date(AuditLog.created_at) == d)
+        except Exception:
+            pass
+
+    buf = io.StringIO()
+    buf.write('\ufeff')  # BOM for Excel
+    writer = csv.writer(buf)
+    writer.writerow(['Timestamp', 'Username', 'Action', 'Module', 'Target', 'Details', 'IP'])
+    for log in q.all():
+        writer.writerow([
+            log.created_at.strftime('%Y-%m-%d %H:%M:%S') if log.created_at else '',
+            log.username or '', log.action or '', log.module or '',
+            log.target or '', log.details or '', log.ip_address or '',
+        ])
+    resp = make_response(buf.getvalue())
+    resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    resp.headers['Content-Disposition'] = f'attachment; filename=audit_log_{date.today()}.csv'
+    return resp
 
 
 # ── PROFILE ───────────────────────────────────────────────────────────────────

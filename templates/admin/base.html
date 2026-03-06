@@ -75,7 +75,7 @@
     </a>
 
     {% for mod in current_user.accessible_modules() %}
-    {% set ep_map = {'buses':'buses','incidents':'incidents','statistics':'statistics','users':'users','notifications':'notifications','config':'config_page'} %}
+    {% set ep_map = {'buses':'buses','incidents':'incidents','statistics':'statistics','users':'users','notifications':'notifications','config':'config_page','logs':'system_logs'} %}
     {% set ep = ep_map.get(mod.key, mod.key) %}
     <a href="{{ url_for(ep) }}"
        class="sidebar-link {% if request.endpoint == ep %}active{% endif %}">

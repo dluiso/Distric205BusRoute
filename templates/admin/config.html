@@ -930,8 +930,9 @@
         <!-- Import -->
         <div>
           <p class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Import / Restore</p>
-          <form action="{{ url_for('import_db') }}" method="POST" enctype="multipart/form-data"
-                onsubmit="return confirm('This will OVERWRITE all current data with the backup. Are you sure?')">
+
+          <!-- File picker (hidden while progress is showing) -->
+          <div id="import-picker">
             <div class="border-2 border-dashed border-slate-200 rounded-xl p-4 text-center hover:border-orange-300 hover:bg-orange-50 transition-colors cursor-pointer"
                  onclick="document.getElementById('import-file').click()">
               <i class="fas fa-file-import text-2xl text-slate-300 mb-2"></i>
@@ -944,11 +945,28 @@
               <i class="fas fa-triangle-exclamation mr-1"></i>
               <strong>Warning:</strong> Restoring overwrites all current data. Export a backup first.
             </div>
-            <button type="submit"
+            <button type="button" onclick="startImport()"
               class="mt-3 w-full bg-orange-500 hover:bg-orange-600 text-white text-sm font-semibold px-4 py-2.5 rounded-xl transition-colors flex items-center justify-center gap-2">
               <i class="fas fa-upload"></i> Restore from Backup
             </button>
-          </form>
+          </div>
+
+          <!-- Progress panel (shown during restore) -->
+          <div id="import-progress" class="hidden">
+            <div class="flex items-center justify-between mb-2">
+              <p class="text-xs font-semibold text-slate-600" id="import-status-text">Preparing…</p>
+              <span class="text-xs text-slate-400" id="import-step-counter"></span>
+            </div>
+            <div class="w-full bg-slate-100 rounded-full h-2.5 mb-3">
+              <div id="import-bar" class="bg-orange-500 h-2.5 rounded-full transition-all duration-300" style="width:0%"></div>
+            </div>
+            <div id="import-log" class="bg-slate-900 text-slate-200 rounded-xl p-3 text-xs font-mono max-h-48 overflow-y-auto space-y-0.5"></div>
+            <div id="import-done" class="hidden mt-3 p-3 bg-green-50 border border-green-200 rounded-xl text-xs text-green-700 font-medium">
+              <i class="fas fa-circle-check mr-1"></i><span id="import-done-msg"></span>
+              <button onclick="location.reload()" class="ml-3 underline hover:no-underline">Refresh page</button>
+            </div>
+            <div id="import-error-box" class="hidden mt-3 p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-600"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -1314,6 +1332,94 @@ function loadDeps() {
         '<i class="fas fa-triangle-exclamation text-red-400 mr-2"></i>Failed to check dependencies.';
     })
     .finally(() => { if (btn) btn.disabled = false; });
+}
+
+// ── IMPORT with SSE progress ──────────────────────────────────────────────────
+function startImport() {
+  const fileInput = document.getElementById('import-file');
+  if (!fileInput.files.length) {
+    alert('Please select a JSON backup file first.');
+    return;
+  }
+  if (!confirm('This will OVERWRITE all current data with the backup. Are you sure?')) return;
+
+  const formData = new FormData();
+  formData.append('backup_file', fileInput.files[0]);
+
+  document.getElementById('import-picker').classList.add('hidden');
+  document.getElementById('import-progress').classList.remove('hidden');
+  document.getElementById('import-status-text').textContent = 'Uploading and parsing…';
+  document.getElementById('import-log').innerHTML = '';
+  document.getElementById('import-bar').style.width = '0%';
+  document.getElementById('import-done').classList.add('hidden');
+  document.getElementById('import-error-box').classList.add('hidden');
+
+  fetch('{{ url_for("import_db") }}', { method: 'POST', body: formData })
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ok) {
+        showImportError(data.error || 'Upload failed.');
+        return;
+      }
+      const total = data.total;
+      document.getElementById('import-status-text').textContent = `Restoring ${total} tables…`;
+      const es = new EventSource('/admin/config/import-run/' + data.job_id);
+      es.onmessage = function(e) {
+        const d = JSON.parse(e.data);
+        if (d.error) { showImportError(d.error); es.close(); return; }
+        if (d.status === 'truncating') {
+          appendLog('⟳ Clearing existing data…', 'text-slate-400');
+          return;
+        }
+        if (d.done) {
+          es.close();
+          document.getElementById('import-bar').style.width = '100%';
+          document.getElementById('import-status-text').textContent = 'Complete';
+          document.getElementById('import-step-counter').textContent = '';
+          const errCount = (d.errors || []).length;
+          document.getElementById('import-done-msg').textContent =
+            `${d.restored} of ${d.total} tables restored successfully.` +
+            (errCount ? ` ${errCount} error(s) — see log above.` : '');
+          document.getElementById('import-done').classList.remove('hidden');
+          if (errCount) {
+            d.errors.forEach(err => appendLog('✗ ' + err, 'text-red-400'));
+          }
+          return;
+        }
+        // per-table progress
+        const pct = Math.round((d.step / total) * 100);
+        document.getElementById('import-bar').style.width = pct + '%';
+        document.getElementById('import-step-counter').textContent = `${d.step} / ${total}`;
+        document.getElementById('import-status-text').textContent = `Restoring: ${d.table}`;
+        if (d.ok) {
+          appendLog(`✓ ${d.table} — ${d.rows} row${d.rows !== 1 ? 's' : ''}`, 'text-green-400');
+        } else {
+          appendLog(`✗ ${d.table} — ${d.error}`, 'text-red-400');
+        }
+      };
+      es.onerror = function() {
+        es.close();
+        showImportError('Connection lost. Check server logs.');
+      };
+    })
+    .catch(err => showImportError('Network error: ' + err));
+}
+
+function appendLog(msg, colorClass) {
+  const log = document.getElementById('import-log');
+  const line = document.createElement('div');
+  line.className = colorClass || 'text-slate-300';
+  line.textContent = msg;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+function showImportError(msg) {
+  document.getElementById('import-status-text').textContent = 'Failed';
+  const box = document.getElementById('import-error-box');
+  box.textContent = '✗ ' + msg;
+  box.classList.remove('hidden');
+  document.getElementById('import-done').classList.add('hidden');
 }
 
 // Auto-load data panels if data tab is active on page load

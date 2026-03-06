@@ -1,0 +1,227 @@
+{% extends 'admin/base.html' %}
+{% block title %}System Logs{% endblock %}
+{% block page_title %}System Logs{% endblock %}
+{% block page_subtitle %}Audit trail and user activity{% endblock %}
+
+{% block content %}
+
+{# Module badge colors #}
+{% set mod_colors = {
+  'auth':          'bg-slate-100 text-slate-700',
+  'buses':         'bg-blue-100 text-blue-700',
+  'incidents':     'bg-yellow-100 text-yellow-700',
+  'statistics':    'bg-indigo-100 text-indigo-700',
+  'users':         'bg-purple-100 text-purple-700',
+  'notifications': 'bg-green-100 text-green-700',
+  'config':        'bg-orange-100 text-orange-700',
+  'logs':          'bg-rose-100 text-rose-700',
+} %}
+
+<!-- ── Filter bar ──────────────────────────────────────────────────────────── -->
+<form method="GET" action="{{ url_for('system_logs') }}" id="filter-form">
+  <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 mb-5">
+    <div class="flex flex-wrap gap-3 items-end">
+
+      <!-- Module filter -->
+      <div class="flex-1 min-w-32">
+        <label class="block text-xs font-semibold text-slate-500 mb-1">Module</label>
+        <select name="module" onchange="this.form.submit()"
+                class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+          <option value="">All modules</option>
+          {% for m in all_modules %}
+          <option value="{{ m }}" {% if m == module_f %}selected{% endif %}>{{ m | capitalize }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <!-- User filter -->
+      <div class="flex-1 min-w-36">
+        <label class="block text-xs font-semibold text-slate-500 mb-1">User</label>
+        <input type="text" name="user" value="{{ user_f }}" placeholder="Username…"
+               class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+
+      <!-- Date filter -->
+      <div class="flex-1 min-w-36">
+        <label class="block text-xs font-semibold text-slate-500 mb-1">Date</label>
+        <input type="date" name="date" value="{{ date_f }}"
+               class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+
+      <!-- Keyword search -->
+      <div class="flex-1 min-w-40">
+        <label class="block text-xs font-semibold text-slate-500 mb-1">Search</label>
+        <input type="text" name="q" value="{{ search_f }}" placeholder="Action, target, details…"
+               class="w-full text-sm border border-slate-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+
+      <!-- Buttons -->
+      <div class="flex gap-2">
+        <button type="submit"
+          class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-xl transition-colors flex items-center gap-1.5">
+          <i class="fas fa-magnifying-glass text-xs"></i> Search
+        </button>
+        {% if module_f or user_f or date_f or search_f %}
+        <a href="{{ url_for('system_logs') }}"
+           class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 text-sm font-medium rounded-xl transition-colors flex items-center gap-1.5">
+          <i class="fas fa-xmark text-xs"></i> Clear
+        </a>
+        {% endif %}
+        <a href="{{ url_for('export_logs_csv', module=module_f, user=user_f, date=date_f, q=search_f) }}"
+           class="px-4 py-2 bg-slate-100 hover:bg-green-50 border border-slate-200 hover:border-green-300 text-slate-600 hover:text-green-700 text-sm font-medium rounded-xl transition-colors flex items-center gap-1.5">
+          <i class="fas fa-file-csv text-xs"></i> Export CSV
+        </a>
+      </div>
+    </div>
+  </div>
+</form>
+
+<!-- ── Log table ───────────────────────────────────────────────────────────── -->
+<div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
+
+  <!-- Header row -->
+  <div class="flex items-center justify-between px-5 py-3.5 border-b border-slate-100 bg-slate-50/60">
+    <p class="text-sm font-semibold text-slate-700">
+      {% if logs.total == 0 %}No entries found
+      {% elif logs.total == 1 %}1 entry
+      {% else %}{{ logs.total }} entries{% endif %}
+      {% if module_f or user_f or date_f or search_f %}<span class="text-slate-400 font-normal"> (filtered)</span>{% endif %}
+    </p>
+    <p class="text-xs text-slate-400">Page {{ logs.page }} of {{ logs.pages or 1 }}</p>
+  </div>
+
+  {% if logs.items %}
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-slate-100 text-xs font-semibold uppercase tracking-wider text-slate-400">
+          <th class="px-4 py-3 text-left whitespace-nowrap">Timestamp</th>
+          <th class="px-4 py-3 text-left">User</th>
+          <th class="px-4 py-3 text-left">Module</th>
+          <th class="px-4 py-3 text-left">Action</th>
+          <th class="px-4 py-3 text-left">Target</th>
+          <th class="px-4 py-3 text-left">Details</th>
+          <th class="px-4 py-3 text-left whitespace-nowrap">IP</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-50">
+        {% for log in logs.items %}
+        {% set mc = mod_colors.get(log.module or '', 'bg-slate-100 text-slate-600') %}
+        <tr class="hover:bg-slate-50/70 transition-colors group">
+
+          <!-- Timestamp -->
+          <td class="px-4 py-3 whitespace-nowrap text-xs text-slate-500 font-mono">
+            {% if log.created_at %}
+            <span title="{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}">
+              {{ log.created_at.strftime('%b %d') }}
+              <span class="text-slate-400">{{ log.created_at.strftime('%H:%M:%S') }}</span>
+            </span>
+            {% else %}—{% endif %}
+          </td>
+
+          <!-- User -->
+          <td class="px-4 py-3 whitespace-nowrap">
+            <span class="text-sm font-semibold text-slate-700">{{ log.username or '—' }}</span>
+          </td>
+
+          <!-- Module badge -->
+          <td class="px-4 py-3 whitespace-nowrap">
+            <span class="inline-flex items-center px-2 py-0.5 rounded-lg text-xs font-semibold {{ mc }}">
+              {{ (log.module or '—') | capitalize }}
+            </span>
+          </td>
+
+          <!-- Action -->
+          <td class="px-4 py-3 whitespace-nowrap">
+            <span class="font-mono text-xs text-slate-600 bg-slate-100 px-2 py-0.5 rounded-lg">
+              {{ log.action or '—' }}
+            </span>
+          </td>
+
+          <!-- Target -->
+          <td class="px-4 py-3 max-w-xs">
+            <span class="text-sm text-slate-700 truncate block" title="{{ log.target or '' }}">
+              {{ log.target or '—' }}
+            </span>
+          </td>
+
+          <!-- Details (expandable) -->
+          <td class="px-4 py-3 max-w-xs">
+            {% if log.details %}
+            <button onclick="this.closest('td').querySelector('.details-full').classList.toggle('hidden'); this.classList.toggle('opacity-50')"
+                    class="text-xs text-slate-400 hover:text-slate-600 truncate max-w-[160px] block text-left transition-opacity"
+                    title="Click to expand">
+              {{ log.details[:60] }}{% if log.details|length > 60 %}…{% endif %}
+            </button>
+            <p class="details-full hidden mt-1 text-xs text-slate-600 bg-slate-50 rounded-lg p-2 whitespace-pre-wrap break-words">{{ log.details }}</p>
+            {% else %}
+            <span class="text-slate-300 text-xs">—</span>
+            {% endif %}
+          </td>
+
+          <!-- IP -->
+          <td class="px-4 py-3 whitespace-nowrap font-mono text-xs text-slate-400">
+            {{ log.ip_address or '—' }}
+          </td>
+
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% else %}
+  <!-- Empty state -->
+  <div class="py-16 text-center">
+    <div class="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
+      <i class="fas fa-scroll text-slate-300 text-2xl"></i>
+    </div>
+    <p class="text-slate-500 font-medium">No log entries found</p>
+    <p class="text-slate-400 text-sm mt-1">
+      {% if module_f or user_f or date_f or search_f %}
+        Try clearing the filters.
+      {% else %}
+        Activity will appear here as users interact with the system.
+      {% endif %}
+    </p>
+  </div>
+  {% endif %}
+</div>
+
+<!-- ── Pagination ──────────────────────────────────────────────────────────── -->
+{% if logs.pages and logs.pages > 1 %}
+<div class="flex items-center justify-between mt-5">
+  <p class="text-xs text-slate-500">
+    Showing {{ ((logs.page - 1) * 50) + 1 }}–{{ [logs.page * 50, logs.total] | min }} of {{ logs.total }}
+  </p>
+  <div class="flex gap-2">
+    {% if logs.has_prev %}
+    <a href="{{ url_for('system_logs', page=logs.prev_num, module=module_f, user=user_f, date=date_f, q=search_f) }}"
+       class="px-4 py-2 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 hover:text-blue-600 text-sm rounded-xl transition-colors flex items-center gap-1.5">
+      <i class="fas fa-chevron-left text-xs"></i> Previous
+    </a>
+    {% endif %}
+
+    <!-- Page numbers (show up to 5) -->
+    {% set start = [logs.page - 2, 1] | max %}
+    {% set end   = [start + 4, logs.pages] | min %}
+    {% set start = [end - 4, 1] | max %}
+    {% for p in range(start, end + 1) %}
+    <a href="{{ url_for('system_logs', page=p, module=module_f, user=user_f, date=date_f, q=search_f) }}"
+       class="px-3 py-2 text-sm rounded-xl border transition-colors
+              {% if p == logs.page %}bg-blue-600 text-white border-blue-600{% else %}bg-white border-slate-200 text-slate-600 hover:border-blue-300{% endif %}">
+      {{ p }}
+    </a>
+    {% endfor %}
+
+    {% if logs.has_next %}
+    <a href="{{ url_for('system_logs', page=logs.next_num, module=module_f, user=user_f, date=date_f, q=search_f) }}"
+       class="px-4 py-2 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 hover:text-blue-600 text-sm rounded-xl transition-colors flex items-center gap-1.5">
+      Next <i class="fas fa-chevron-right text-xs"></i>
+    </a>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}
