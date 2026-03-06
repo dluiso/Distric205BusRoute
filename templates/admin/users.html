@@ -137,7 +137,9 @@
         </div>
         {% if can_write and not g.is_admin %}
         <div class="flex items-center space-x-2">
-          <button onclick="openEditGroup({{ g.id }}, {{ g.name | tojson }}, {{ (g.description or '') | tojson }}, {{ g.permissions | map(attribute='module_key') | list | tojson }}, {{ g.permissions | map(attribute='access_level') | list | tojson }})"
+          <button data-gid="{{ g.id }}"
+                  data-gdata="{{ {'name': g.name, 'desc': g.description or '', 'keys': g.permissions | map(attribute='module_key') | list, 'levels': g.permissions | map(attribute='access_level') | list} | tojson | forceescape }}"
+                  onclick="openEditGroupFromBtn(this)"
                   class="px-3 py-1.5 border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:border-blue-400 hover:text-blue-600 transition-colors">
             <i class="fas fa-edit mr-1"></i>Edit
           </button>
@@ -483,6 +485,11 @@ function buildPermMatrix(containerId, existing) {
 
 // Build add-group matrix on page load
 buildPermMatrix('add-group-perms');
+
+function openEditGroupFromBtn(btn) {
+  const d = JSON.parse(btn.dataset.gdata);
+  openEditGroup(parseInt(btn.dataset.gid), d.name, d.desc, d.keys, d.levels);
+}
 
 function openEditGroup(id, name, desc, permKeys, permLevels) {
   document.getElementById('form-edit-group').action = `/admin/groups/${id}/edit`;
