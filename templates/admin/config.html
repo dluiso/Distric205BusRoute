@@ -1194,7 +1194,7 @@
 
 {% block scripts %}
 <script>
-const TABS = ['general','theme','operational','language','email','data'];
+const TABS = ['general','theme','operational','language','email','sms','data'];
 function showTab(id) {
   TABS.forEach(t => {
     document.getElementById('tab-' + t).classList.toggle('hidden', t !== id);
