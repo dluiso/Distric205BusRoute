@@ -2701,6 +2701,28 @@ def delete_subscriber_group(gid):
     return redirect(url_for('notifications', tab='groups'))
 
 
+@app.route('/admin/notifications/groups/bulk-delete', methods=['POST'])
+@login_required
+@require_module('notifications', 'full')
+def bulk_delete_groups():
+    ids = request.form.getlist('group_ids')
+    count = 0
+    for gid in ids:
+        try:
+            g = SubscriberGroup.query.get(int(gid))
+            if g:
+                NotificationSubscriber.query.filter_by(group_id=g.id).update({'group_id': None})
+                db.session.delete(g)
+                count += 1
+        except (ValueError, TypeError):
+            pass
+    if count:
+        db.session.commit()
+        _audit('bulk_delete_groups', 'notifications', f'{count} groups deleted')
+        flash(f'{count} group(s) deleted.', 'success')
+    return redirect(url_for('notifications', tab='groups'))
+
+
 @app.route('/admin/notifications/groups/<int:gid>/edit', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')

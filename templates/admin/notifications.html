@@ -213,13 +213,28 @@
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
     <!-- Groups list -->
     <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-      <div class="px-5 py-4 border-b border-slate-100">
-        <h3 class="font-bold text-slate-700 flex items-center space-x-2">
-          <i class="fas fa-layer-group text-blue-500"></i><span>Subscriber Groups</span>
-        </h3>
+      <!-- Header + search + bulk delete bar -->
+      <div class="px-5 py-3 border-b border-slate-100 space-y-2">
+        <div class="flex items-center justify-between">
+          <h3 class="font-bold text-slate-700 flex items-center space-x-2">
+            <i class="fas fa-layer-group text-blue-500"></i><span>Subscriber Groups</span>
+          </h3>
+          {% if can_write %}
+          <button id="grp-bulk-del-btn" onclick="bulkDeleteGroups()" disabled
+                  class="flex items-center gap-1.5 px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg text-xs font-medium transition-colors">
+            <i class="fas fa-trash text-[10px]"></i><span id="grp-bulk-del-label">Delete selected</span>
+          </button>
+          {% endif %}
+        </div>
+        <div class="relative">
+          <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs"></i>
+          <input id="grp-search" type="text" placeholder="Filter groups…"
+                 oninput="filterGroups()"
+                 class="w-full pl-8 pr-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
       </div>
       {% if groups %}
-      <div class="divide-y divide-slate-50">
+      <div id="grp-list" class="divide-y divide-slate-50">
         {% set period_abbrev = {'Morning': 'AM', 'Midday': 'MD', 'Afternoon': 'PM'} %}
         {% set period_cls = {'Morning': 'bg-yellow-50 text-yellow-700 border-yellow-200', 'Midday': 'bg-orange-50 text-orange-700 border-orange-200', 'Afternoon': 'bg-indigo-50 text-indigo-700 border-indigo-200'} %}
         {% for grp in groups %}
@@ -227,12 +242,18 @@
         {% for s in subscribers if s.group_id == grp.id %}{% set count.v = count.v + 1 %}{% endfor %}
         {% set bus_scheds_data = [] %}
         {% for a in grp.bus_assignments %}{% set _ = bus_scheds_data.append({"bus_id": a.bus_id, "sched_id": a.schedule_type_id}) %}{% endfor %}
-        <div class="px-5 py-3 flex items-center space-x-3">
-          <span class="w-4 h-4 rounded-full flex-shrink-0"
+        <div class="grp-row px-4 py-3 flex items-center gap-2"
+             data-grp-name="{{ grp.name | lower }}"
+             data-grp-id="{{ grp.id }}">
+          {% if can_write %}
+          <input type="checkbox" class="grp-cb w-4 h-4 rounded border-slate-300 text-blue-600 cursor-pointer flex-shrink-0"
+                 data-grp-id="{{ grp.id }}" onchange="onGrpCheck()">
+          {% endif %}
+          <span class="w-3.5 h-3.5 rounded-full flex-shrink-0"
                 style="background-color: {{ {'blue':'#3b82f6','purple':'#8b5cf6','green':'#10b981','orange':'#f97316','red':'#ef4444','pink':'#ec4899','indigo':'#6366f1'}.get(grp.color,'#3b82f6') }}"></span>
-          <div class="flex-1">
+          <div class="flex-1 min-w-0">
             <p class="font-medium text-slate-800 text-sm">{{ grp.name }}</p>
-            {% if grp.description %}<p class="text-xs text-slate-400">{{ grp.description }}</p>{% endif %}
+            {% if grp.description %}<p class="text-xs text-slate-400 truncate">{{ grp.description }}</p>{% endif %}
             {% if grp.bus_assignments %}
             <div class="flex flex-wrap gap-1 mt-1">
               {% for a in grp.bus_assignments %}
@@ -248,16 +269,16 @@
             </div>
             {% endif %}
           </div>
-          <span class="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full">{{ count.v }} member{{ 's' if count.v != 1 }}</span>
+          <span class="text-xs text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full flex-shrink-0">{{ count.v }}</span>
           {% if can_write %}
           <button onclick="openEditGroup(this)"
                   data-group='{{ {"id": grp.id, "name": grp.name, "color": grp.color, "description": grp.description or "", "bus_schedules": bus_scheds_data} | tojson }}'
-                  class="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg text-sm transition-colors">
+                  class="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg text-sm transition-colors flex-shrink-0">
             <i class="fas fa-edit"></i>
           </button>
           <form method="POST" action="{{ url_for('delete_subscriber_group', gid=grp.id) }}"
                 onsubmit="return confirm('Delete group {{ grp.name }}? Subscribers will be ungrouped.')">
-            <button type="submit" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg text-sm transition-colors">
+            <button type="submit" class="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg text-sm transition-colors flex-shrink-0">
               <i class="fas fa-trash"></i>
             </button>
           </form>
@@ -265,11 +286,17 @@
         </div>
         {% endfor %}
       </div>
+      <div id="grp-no-results" class="hidden py-8 text-center text-slate-400 text-sm">No groups match your search</div>
       {% else %}
       <div class="py-12 text-center text-slate-400">
         <i class="fas fa-layer-group text-3xl mb-2 block text-slate-200"></i>
         <p class="text-sm">No groups yet</p>
       </div>
+      {% endif %}
+      {% if can_write %}
+      <form id="grp-bulk-del-form" method="POST" action="{{ url_for('bulk_delete_groups') }}" class="hidden">
+        <div id="grp-bulk-ids"></div>
+      </form>
       {% endif %}
     </div>
 
@@ -372,34 +399,31 @@
           </div>
           <div>
             <label class="block text-xs font-semibold text-slate-600 mb-1.5">Assigned Buses &amp; Periods</label>
-            <p class="text-[10px] text-slate-400 mb-2">Check the period(s) each bus applies to for this group.</p>
+            <p class="text-[10px] text-slate-400 mb-1.5">Assigned buses appear first. Check the period(s) for this group.</p>
             {% if all_buses %}
-            <div class="space-y-1 max-h-48 overflow-y-auto p-1 border border-slate-200 rounded-xl" id="eg-bus-container">
+            <div class="relative mb-1.5">
+              <i class="fas fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
+              <input type="text" id="eg-bus-search" placeholder="Search buses…" oninput="filterEgBuses()"
+                     class="w-full pl-7 pr-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <!-- Bus data rendered in hidden divs; JS reorders assigned-first then renders into eg-bus-container -->
+            <div class="hidden" id="eg-bus-data">
               {% set eg_period_abbrev = {'Morning': 'AM', 'Midday': 'MD', 'Afternoon': 'PM'} %}
               {% set eg_period_cls = {'Morning': 'bg-yellow-50 text-yellow-700 border-yellow-200 hover:bg-yellow-100', 'Midday': 'bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100', 'Afternoon': 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100'} %}
               {% for bus in all_buses %}
               {% set bus_periods = bus.schedule_assignments | map(attribute='schedule_type') | list %}
-              <div class="p-1.5 rounded-lg border border-slate-100">
-                <p class="text-xs font-semibold text-slate-700 mb-1"><i class="fas fa-bus text-slate-400 mr-1 text-[10px]"></i>{{ bus.display_name }}</p>
+              <div class="eg-bus-tpl" data-bus-id="{{ bus.id }}" data-bus-name="{{ bus.display_name | lower }}" data-bus-display="{{ bus.display_name }}">
                 {% if bus_periods %}
-                <div class="flex flex-wrap gap-1 pl-4">
-                  {% for st in bus_periods %}
-                  <label class="cursor-pointer">
-                    <input type="checkbox" name="bus_sched" value="{{ bus.id }}_{{ st.id }}"
-                           class="sr-only eg-bus-sched-cb" data-bus-id="{{ bus.id }}" data-sched-id="{{ st.id }}">
-                    <span class="period-badge px-2 py-0.5 text-[10px] font-bold rounded border cursor-pointer select-none transition-all {{ eg_period_cls.get(st.name, 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200') }}"
-                          data-unchecked-cls="opacity-40">
-                      {{ eg_period_abbrev.get(st.name, st.name[:2].upper()) }}
-                    </span>
-                  </label>
-                  {% endfor %}
-                </div>
-                {% else %}
-                <p class="text-[10px] text-slate-400 pl-4">No periods assigned to this bus</p>
+                {% for st in bus_periods %}
+                <span class="eg-period-tpl" data-sched-id="{{ st.id }}"
+                      data-period-abbrev="{{ eg_period_abbrev.get(st.name, st.name[:2].upper()) }}"
+                      data-period-cls="{{ eg_period_cls.get(st.name, 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200') }}"></span>
+                {% endfor %}
                 {% endif %}
               </div>
               {% endfor %}
             </div>
+            <div class="space-y-1 max-h-48 overflow-y-auto p-1 border border-slate-200 rounded-xl" id="eg-bus-container"></div>
             {% else %}
             <p class="text-xs text-slate-400">No buses available</p>
             {% endif %}
@@ -1123,15 +1147,110 @@ function openEditGroup(btn) {
     r.checked = (r.value === grp.color);
     if (r.nextElementSibling) updateColorDot(r.nextElementSibling, r.checked);
   });
-  // Restore bus+period checkboxes — match on bus_id + sched_id pair
+  // Build bus list: assigned first, with correct checked state
   const schedSet = new Set((grp.bus_schedules || []).map(s => s.bus_id + '_' + (s.sched_id ?? '')));
-  document.querySelectorAll('.eg-bus-sched-cb').forEach(cb => {
-    const key = cb.dataset.busId + '_' + cb.dataset.schedId;
-    cb.checked = schedSet.has(key);
-    applyPeriodBadge(cb);
-  });
+  const searchEl = document.getElementById('eg-bus-search');
+  if (searchEl) searchEl.value = '';
+  buildEgBusList(schedSet);
   document.getElementById('edit-group-card').classList.remove('hidden');
   document.getElementById('edit-group-card').scrollIntoView({behavior:'smooth'});
+}
+
+// ─── Groups: filter, bulk select/delete ─────────────────────────────────────
+function filterGroups() {
+  const q = (document.getElementById('grp-search')?.value || '').trim().toLowerCase();
+  let visible = 0;
+  document.querySelectorAll('.grp-row').forEach(row => {
+    const match = !q || row.dataset.grpName.includes(q);
+    row.classList.toggle('hidden', !match);
+    if (match) visible++;
+  });
+  const noRes = document.getElementById('grp-no-results');
+  if (noRes) noRes.classList.toggle('hidden', visible > 0);
+}
+
+function onGrpCheck() {
+  const checked = document.querySelectorAll('.grp-cb:checked');
+  const btn = document.getElementById('grp-bulk-del-btn');
+  const lbl = document.getElementById('grp-bulk-del-label');
+  if (btn) {
+    btn.disabled = checked.length === 0;
+    if (lbl) lbl.textContent = checked.length > 0 ? `Delete ${checked.length} selected` : 'Delete selected';
+  }
+}
+
+function bulkDeleteGroups() {
+  const checked = document.querySelectorAll('.grp-cb:checked');
+  if (!checked.length) return;
+  const names = Array.from(checked).map(cb => cb.closest('.grp-row')?.querySelector('.font-medium')?.textContent?.trim() || '').filter(Boolean);
+  const msg = `Delete ${checked.length} group(s)?\n\n${names.join('\n')}\n\nSubscribers will be ungrouped.`;
+  if (!confirm(msg)) return;
+  const container = document.getElementById('grp-bulk-ids');
+  container.innerHTML = '';
+  checked.forEach(cb => {
+    const inp = document.createElement('input');
+    inp.type = 'hidden'; inp.name = 'group_ids'; inp.value = cb.dataset.grpId;
+    container.appendChild(inp);
+  });
+  document.getElementById('grp-bulk-del-form').submit();
+}
+
+// ─── Edit group: bus search + assigned-first reorder ────────────────────────
+function buildEgBusList(assignedSchedSet) {
+  const tpls = Array.from(document.querySelectorAll('#eg-bus-data .eg-bus-tpl'));
+  // Sort: assigned buses first, then alphabetical
+  tpls.sort((a, b) => {
+    const aAssigned = Array.from(a.querySelectorAll('.eg-period-tpl')).some(
+      p => assignedSchedSet.has(a.dataset.busId + '_' + p.dataset.schedId));
+    const bAssigned = Array.from(b.querySelectorAll('.eg-period-tpl')).some(
+      p => assignedSchedSet.has(b.dataset.busId + '_' + p.dataset.schedId));
+    if (aAssigned !== bAssigned) return aAssigned ? -1 : 1;
+    return a.dataset.busName.localeCompare(b.dataset.busName);
+  });
+
+  const container = document.getElementById('eg-bus-container');
+  container.innerHTML = '';
+  const q = (document.getElementById('eg-bus-search')?.value || '').trim().toLowerCase();
+  tpls.forEach(tpl => {
+    if (q && !tpl.dataset.busName.includes(q)) return;
+    const busId = tpl.dataset.busId;
+    const periods = tpl.querySelectorAll('.eg-period-tpl');
+    const div = document.createElement('div');
+    div.className = 'p-1.5 rounded-lg border border-slate-100 eg-bus-row';
+    div.dataset.busName = tpl.dataset.busName;
+    const hasAny = Array.from(periods).some(p => assignedSchedSet.has(busId + '_' + p.dataset.schedId));
+    div.innerHTML = `<p class="text-xs font-semibold ${hasAny ? 'text-blue-700' : 'text-slate-700'} mb-1"><i class="fas fa-bus ${hasAny ? 'text-blue-400' : 'text-slate-400'} mr-1 text-[10px]"></i>${escHtml(tpl.dataset.busDisplay || tpl.dataset.busName)}</p>`;
+    if (periods.length) {
+      const flex = document.createElement('div');
+      flex.className = 'flex flex-wrap gap-1 pl-4';
+      periods.forEach(p => {
+        const key = busId + '_' + p.dataset.schedId;
+        const checked = assignedSchedSet.has(key);
+        const lbl = document.createElement('label');
+        lbl.className = 'cursor-pointer';
+        lbl.innerHTML = `<input type="checkbox" name="bus_sched" value="${key}" class="sr-only eg-bus-sched-cb" data-bus-id="${busId}" data-sched-id="${p.dataset.schedId}">
+          <span class="period-badge px-2 py-0.5 text-[10px] font-bold rounded border cursor-pointer select-none transition-all ${p.dataset.periodCls}" style="opacity:${checked?'1':'0.35'};${checked?'outline:2px solid currentColor;outline-offset:1px':''}">
+            ${escHtml(p.dataset.periodAbbrev)}
+          </span>`;
+        flex.appendChild(lbl);
+      });
+      div.appendChild(flex);
+    } else {
+      div.innerHTML += `<p class="text-[10px] text-slate-400 pl-4">No periods assigned to this bus</p>`;
+    }
+    container.appendChild(div);
+  });
+  // Re-wire change events
+  container.querySelectorAll('.eg-bus-sched-cb').forEach(cb => {
+    cb.addEventListener('change', () => applyPeriodBadge(cb));
+  });
+}
+
+function filterEgBuses() {
+  const q = (document.getElementById('eg-bus-search')?.value || '').trim().toLowerCase();
+  document.querySelectorAll('#eg-bus-container .eg-bus-row').forEach(row => {
+    row.classList.toggle('hidden', q !== '' && !row.dataset.busName.includes(q));
+  });
 }
 
 // ─── Period badge toggle (visual checkbox for bus period selection) ──────────
@@ -1142,9 +1261,9 @@ function applyPeriodBadge(cb) {
   badge.style.outline  = cb.checked ? '2px solid currentColor' : 'none';
   badge.style.outlineOffset = '1px';
 }
-// Wire up all period checkboxes (add form + edit form)
-document.querySelectorAll('.add-bus-sched-cb, .eg-bus-sched-cb').forEach(cb => {
-  applyPeriodBadge(cb); // initial state
+// Wire up add-form period checkboxes only (edit form uses buildEgBusList)
+document.querySelectorAll('.add-bus-sched-cb').forEach(cb => {
+  applyPeriodBadge(cb);
   cb.addEventListener('change', () => applyPeriodBadge(cb));
 });
 
