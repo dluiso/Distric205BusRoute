@@ -2577,6 +2577,74 @@ def export_subscribers_csv():
         headers={'Content-Disposition': 'attachment;filename=subscribers.csv'})
 
 
+def _auto_create_group_from_name(group_name):
+    """Parse a group name like 'PC 01 AM PM' to auto-create a SubscriberGroup
+    with the appropriate GroupBusAssignment records.
+
+    Token rules:
+      - Tokens before the first AM/MD/PM keyword → bus identifier
+      - AM/MD/PM tokens → schedule periods (Morning/Midday/Afternoon)
+    Returns the created SubscriberGroup, or None if the bus can't be found.
+    """
+    PERIOD_MAP = {'AM': 'Morning', 'MD': 'Midday', 'PM': 'Afternoon'}
+    tokens = group_name.strip().split()
+
+    bus_tokens = []
+    period_tokens = []
+    for tok in tokens:
+        if tok.upper() in PERIOD_MAP and bus_tokens:   # only after we have some bus tokens
+            period_tokens.append(tok.upper())
+        elif not period_tokens:
+            bus_tokens.append(tok)
+
+    bus_identifier = ' '.join(bus_tokens).strip()
+    period_names   = [PERIOD_MAP[t] for t in period_tokens]
+
+    if not bus_identifier:
+        return None
+
+    # Find bus by identifier (case-insensitive exact), then by display_name contains
+    bus = Bus.query.filter(
+        db.func.lower(Bus.identifier) == bus_identifier.lower()
+    ).first()
+    if not bus:
+        bus = Bus.query.filter(
+            Bus.identifier.ilike(f'%{bus_identifier}%')
+        ).first()
+    if not bus:
+        return None
+
+    # Create the group
+    grp = SubscriberGroup(name=group_name)
+    db.session.add(grp)
+    db.session.flush()   # get grp.id
+
+    # Determine which schedule_type records to link
+    bus_period_ids = {bsa.schedule_type_id for bsa in bus.schedule_assignments}
+
+    if period_names:
+        sched_types = BusScheduleType.query.filter(
+            BusScheduleType.name.in_(period_names)
+        ).all()
+        assigned_any = False
+        for st in sched_types:
+            if st.id in bus_period_ids:
+                db.session.add(GroupBusAssignment(
+                    group_id=grp.id, bus_id=bus.id, schedule_type_id=st.id))
+                assigned_any = True
+        if not assigned_any:
+            # Periods specified but none matched → assign all (NULL)
+            db.session.add(GroupBusAssignment(
+                group_id=grp.id, bus_id=bus.id, schedule_type_id=None))
+    else:
+        # No period tokens → assign all (NULL = all periods)
+        db.session.add(GroupBusAssignment(
+            group_id=grp.id, bus_id=bus.id, schedule_type_id=None))
+
+    db.session.flush()
+    return grp
+
+
 @app.route('/admin/notifications/import-csv', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
@@ -2600,6 +2668,7 @@ def import_subscribers_csv():
     households = OrderedDict()
     row_errors = []
     skipped = 0
+    auto_created_groups = []
 
     for i, row in enumerate(reader, 2):   # row 1 = header
         group_name = (row.get('group') or '').strip()
@@ -2617,9 +2686,15 @@ def import_subscribers_csv():
 
         group_obj = groups_cache.get(group_name.lower()) if group_name else None
         if group_name and not group_obj:
-            row_errors.append(f'Row {i}: group "{group_name}" not found — skipped')
-            skipped += 1
-            continue
+            group_obj = _auto_create_group_from_name(group_name)
+            if group_obj:
+                groups_cache[group_name.lower()] = group_obj
+                if group_name not in auto_created_groups:
+                    auto_created_groups.append(group_name)
+            else:
+                row_errors.append(f'Row {i}: group "{group_name}" not found and could not be auto-created (bus not found) — skipped')
+                skipped += 1
+                continue
 
         group_id = group_obj.id if group_obj else None
         key = (group_id, household if household else f'__row_{i}__')
@@ -2649,6 +2724,8 @@ def import_subscribers_csv():
 
     db.session.commit()
     parts = [f'{imported} subscriber(s) imported.']
+    if auto_created_groups:
+        parts.append(f'{len(auto_created_groups)} group(s) auto-created: {", ".join(auto_created_groups[:5])}.')
     if skipped:
         parts.append(f'{skipped} row(s) skipped.')
     if row_errors:
