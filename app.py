@@ -342,11 +342,13 @@ class SubscriberGroup(db.Model):
 
 class GroupBusAssignment(db.Model):
     __tablename__ = 'group_bus_assignment'
-    id       = db.Column(db.Integer, primary_key=True)
-    group_id = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'), nullable=False)
-    bus_id   = db.Column(db.Integer, db.ForeignKey('bus.id'), nullable=False)
-    bus      = db.relationship('Bus')
-    __table_args__ = (db.UniqueConstraint('group_id', 'bus_id'),)
+    id               = db.Column(db.Integer, primary_key=True)
+    group_id         = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'), nullable=False)
+    bus_id           = db.Column(db.Integer, db.ForeignKey('bus.id'), nullable=False)
+    schedule_type_id = db.Column(db.Integer, db.ForeignKey('bus_schedule_type.id'), nullable=True)
+    bus              = db.relationship('Bus')
+    schedule_type    = db.relationship('BusScheduleType')
+    __table_args__ = (db.UniqueConstraint('group_id', 'bus_id', 'schedule_type_id'),)
 
 
 class NotificationSubscriber(db.Model):
@@ -382,7 +384,7 @@ class SubscriberContact(db.Model):
     subscriber_id = db.Column(db.Integer, db.ForeignKey('notification_subscriber.id'), nullable=False)
     first_name    = db.Column(db.String(80))
     last_name     = db.Column(db.String(80))
-    email         = db.Column(db.String(120))
+    email         = db.Column(db.String(500))
     phone         = db.Column(db.String(30))
     role          = db.Column(db.String(20), default='parent')  # 'parent' | 'student'
     sort_order    = db.Column(db.Integer, default=0)
@@ -559,6 +561,7 @@ def _migrate_add_columns():
         ('configuration',           'twilio_auth_token',      "VARCHAR(60) DEFAULT ''"),
         ('configuration',           'twilio_from_number',     "VARCHAR(20) DEFAULT ''"),
         ('configuration',           'twilio_sms_cost_per_seg','REAL DEFAULT 0.0079'),
+        ('group_bus_assignment',    'schedule_type_id',       'INTEGER'),
     ]
     # Use a separate connection per column so a failed ALTER TABLE (column already
     # exists) never leaves a shared connection in an aborted-transaction state.
@@ -569,6 +572,99 @@ def _migrate_add_columns():
                 conn.commit()
         except Exception:
             pass  # column already exists — safe to ignore
+
+
+def _migrate_email_column():
+    """Widen subscriber_contact.email to VARCHAR(500) on PostgreSQL."""
+    db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+    if not db_url.startswith('postgresql'):
+        return  # SQLite doesn't enforce VARCHAR length — no action needed
+    from sqlalchemy import text
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(text('ALTER TABLE subscriber_contact ALTER COLUMN email TYPE VARCHAR(500)'))
+            conn.commit()
+    except Exception:
+        pass  # already wide enough or column doesn't exist yet
+
+
+def _migrate_group_bus_period():
+    """Change group_bus_assignment unique constraint to (group_id, bus_id, schedule_type_id)."""
+    from sqlalchemy import text
+    db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+    is_pg  = db_url.startswith('postgresql')
+    try:
+        if is_pg:
+            with db.engine.connect() as conn:
+                # Find and drop any unique constraint that covers group_id+bus_id but NOT schedule_type_id
+                rows = conn.execute(text("""
+                    SELECT tc.constraint_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_name = kcu.table_name
+                    WHERE tc.table_name = 'group_bus_assignment'
+                      AND tc.constraint_type = 'UNIQUE'
+                    GROUP BY tc.constraint_name
+                    HAVING COUNT(*) = 2
+                       AND SUM(CASE WHEN kcu.column_name = 'group_id' THEN 1 ELSE 0 END) = 1
+                       AND SUM(CASE WHEN kcu.column_name = 'bus_id' THEN 1 ELSE 0 END) = 1
+                """)).fetchall()
+                for row in rows:
+                    try:
+                        conn.execute(text(f'ALTER TABLE group_bus_assignment DROP CONSTRAINT "{row[0]}"'))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                try:
+                    conn.execute(text(
+                        'ALTER TABLE group_bus_assignment ADD CONSTRAINT uq_gba_grp_bus_period '
+                        'UNIQUE (group_id, bus_id, schedule_type_id)'
+                    ))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()  # constraint already exists
+        else:
+            # SQLite: check if the current unique index covers schedule_type_id
+            with db.engine.connect() as conn:
+                indexes = conn.execute(text("PRAGMA index_list('group_bus_assignment')")).fetchall()
+                needs_migration = False
+                for idx in indexes:
+                    if idx[2]:  # unique flag
+                        cols = [r[2] for r in conn.execute(
+                            text(f"PRAGMA index_info('{idx[1]}')")).fetchall()]
+                        if 'group_id' in cols and 'bus_id' in cols and 'schedule_type_id' not in cols:
+                            needs_migration = True
+                            break
+                if needs_migration:
+                    conn.execute(text("""
+                        CREATE TABLE group_bus_assignment_new (
+                            id INTEGER NOT NULL,
+                            group_id INTEGER NOT NULL,
+                            bus_id INTEGER NOT NULL,
+                            schedule_type_id INTEGER,
+                            PRIMARY KEY (id),
+                            FOREIGN KEY(group_id) REFERENCES subscriber_group(id),
+                            FOREIGN KEY(bus_id) REFERENCES bus(id),
+                            FOREIGN KEY(schedule_type_id) REFERENCES bus_schedule_type(id),
+                            UNIQUE (group_id, bus_id, schedule_type_id)
+                        )
+                    """))
+                    conn.execute(text("""
+                        INSERT INTO group_bus_assignment_new (id, group_id, bus_id, schedule_type_id)
+                        SELECT id, group_id, bus_id,
+                               CASE WHEN EXISTS (
+                                   SELECT 1 FROM pragma_table_info('group_bus_assignment')
+                                   WHERE name='schedule_type_id'
+                               ) THEN schedule_type_id ELSE NULL END
+                        FROM group_bus_assignment
+                    """))
+                    conn.execute(text('DROP TABLE group_bus_assignment'))
+                    conn.execute(text('ALTER TABLE group_bus_assignment_new RENAME TO group_bus_assignment'))
+                    conn.commit()
+                    print('[Migration] group_bus_assignment: unique constraint updated to include schedule_type_id')
+    except Exception as e:
+        print(f'[Migration] group_bus_period skipped: {e}')
 
 
 def _migrate_subscriber_contacts():
@@ -596,6 +692,8 @@ def init_db():
     _migrate_bus_table()
     db.create_all()
     _migrate_add_columns()
+    _migrate_email_column()
+    _migrate_group_bus_period()
     _seed_defaults()
     _migrate_subscriber_contacts()
 
@@ -883,15 +981,17 @@ def _send_bus_notifications(rec):
                 db.session.rollback()
                 print(f'[NotifLog] log error: {le}')
 
-        def _try_email(name, email, sub, grp_id, grp_name):
-            if not email or email in sent_emails or not email_enabled: return
-            sent_emails.add(email)
-            try:
-                mail.send(Message(subject=subject, recipients=[email], body=email_body))
-                _log('email', name, email, sub, grp_id, grp_name, 'sent')
-            except Exception as e:
-                print(f'[Notifications] email error to {email}: {e}')
-                _log('email', name, email, sub, grp_id, grp_name, 'failed', error=str(e))
+        def _try_email(name, email_field, sub, grp_id, grp_name):
+            if not email_field or not email_enabled: return
+            for email in [e.strip() for e in email_field.split(',') if e.strip()]:
+                if email in sent_emails: continue
+                sent_emails.add(email)
+                try:
+                    mail.send(Message(subject=subject, recipients=[email], body=email_body))
+                    _log('email', name, email, sub, grp_id, grp_name, 'sent')
+                except Exception as e:
+                    print(f'[Notifications] email error to {email}: {e}')
+                    _log('email', name, email, sub, grp_id, grp_name, 'failed', error=str(e))
 
         def _try_sms(name, phone, sub, grp_id, grp_name):
             if not phone or phone in sent_phones or not twilio_on: return
@@ -907,8 +1007,15 @@ def _send_bus_notifications(rec):
                 _log('sms', name, phone, sub, grp_id, grp_name, 'failed', error=str(e))
 
         # Primary path: group-level bus assignment → contacts
+        # Only notify groups whose period matches the incident's period (or has no period = all periods)
         group_ids = {a.group_id for a in
-                     GroupBusAssignment.query.filter_by(bus_id=rec.bus_id).all()}
+                     GroupBusAssignment.query.filter(
+                         GroupBusAssignment.bus_id == rec.bus_id,
+                         db.or_(
+                             GroupBusAssignment.schedule_type_id == None,
+                             GroupBusAssignment.schedule_type_id == rec.schedule_type_id
+                         )
+                     ).all()}
         if group_ids:
             groups_map = {g.id: g for g in
                           SubscriberGroup.query.filter(SubscriberGroup.id.in_(group_ids)).all()}
@@ -2345,14 +2452,16 @@ def delete_group(gid):
 @login_required
 @require_module('notifications')
 def notifications():
-    subs        = NotificationSubscriber.query.order_by(NotificationSubscriber.last_name).all()
-    groups      = SubscriberGroup.query.order_by(SubscriberGroup.name).all()
-    all_buses   = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
-    admin_users = User.query.filter_by(active=True).order_by(User.username).all()
-    can_write   = current_user.has_access('notifications', 'full')
+    subs           = NotificationSubscriber.query.order_by(NotificationSubscriber.last_name).all()
+    groups         = SubscriberGroup.query.order_by(SubscriberGroup.name).all()
+    all_buses      = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
+    admin_users    = User.query.filter_by(active=True).order_by(User.username).all()
+    schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
+    can_write      = current_user.has_access('notifications', 'full')
     return render_template('admin/notifications.html',
                            subscribers=subs, groups=groups,
                            all_buses=all_buses, admin_users=admin_users,
+                           schedule_types=schedule_types,
                            can_write=can_write)
 
 def _save_contacts(subscriber_id, form):
@@ -2566,9 +2675,12 @@ def add_subscriber_group():
     g = SubscriberGroup(name=name, color=color, description=desc)
     db.session.add(g)
     db.session.flush()
-    for bid in request.form.getlist('bus_ids'):
+    for val in request.form.getlist('bus_sched'):
         try:
-            db.session.add(GroupBusAssignment(group_id=g.id, bus_id=int(bid)))
+            parts  = val.split('_', 1)
+            bid    = int(parts[0])
+            sid    = int(parts[1]) if len(parts) > 1 and parts[1] else None
+            db.session.add(GroupBusAssignment(group_id=g.id, bus_id=bid, schedule_type_id=sid))
         except Exception:
             pass
     db.session.commit()
@@ -2606,9 +2718,12 @@ def edit_subscriber_group(gid):
     g.color       = request.form.get('color', g.color)
     g.description = request.form.get('description', '').strip()
     GroupBusAssignment.query.filter_by(group_id=gid).delete()
-    for bid in request.form.getlist('bus_ids'):
+    for val in request.form.getlist('bus_sched'):
         try:
-            db.session.add(GroupBusAssignment(group_id=gid, bus_id=int(bid)))
+            parts  = val.split('_', 1)
+            bid    = int(parts[0])
+            sid    = int(parts[1]) if len(parts) > 1 and parts[1] else None
+            db.session.add(GroupBusAssignment(group_id=gid, bus_id=bid, schedule_type_id=sid))
         except Exception:
             pass
     db.session.commit()
@@ -2629,12 +2744,16 @@ def _build_recipient_list(target, group_ids, subscriber_id, user_id):
             recipients.append((name, email))
 
     def add_sub(s):
-        """Add all contacts of a subscriber, or legacy email if no contacts."""
+        """Add all contacts of a subscriber (all emails per contact), or legacy email."""
         if s.contacts:
             for c in s.contacts:
-                add(c.full_name, c.email)
+                if c.email:
+                    for em in [e.strip() for e in c.email.split(',') if e.strip()]:
+                        add(c.full_name, em)
         else:
-            add(s.full_name, s.email)
+            if s.email:
+                for em in [e.strip() for e in s.email.split(',') if e.strip()]:
+                    add(s.full_name, em)
 
     if target in ('all', 'subscribers', 'group'):
         query = NotificationSubscriber.query.filter_by(active=True)
