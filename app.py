@@ -2661,6 +2661,153 @@ def _auto_create_group_from_name(group_name):
     return grp
 
 
+@app.route('/admin/notifications/import-csv/preview', methods=['POST'])
+@login_required
+@require_module('notifications', 'full')
+def preview_import_csv():
+    """Dry-run CSV parse — returns JSON report without writing to the database."""
+    import csv, io
+    from collections import OrderedDict
+
+    file = request.files.get('csv_file')
+    if not file or not file.filename:
+        return jsonify({'ok': False, 'message': 'No file selected.'})
+    try:
+        content = file.read().decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return jsonify({'ok': False, 'message': 'File must be UTF-8 encoded.'})
+
+    PERIOD_MAP = {'AM': 'Morning', 'MD': 'Midday', 'PM': 'Afternoon'}
+
+    def _resolve_bus(group_name):
+        """Return (bus, period_names) for a group name without touching the DB."""
+        tokens = group_name.strip().split()
+        bus_tokens, period_tokens = [], []
+        for tok in tokens:
+            if tok.upper() in PERIOD_MAP and bus_tokens:
+                period_tokens.append(tok.upper())
+            elif not period_tokens:
+                bus_tokens.append(tok)
+        bus_identifier = ' '.join(bus_tokens).strip()
+        period_names   = [PERIOD_MAP[t] for t in period_tokens]
+        if not bus_identifier:
+            return None, []
+        bus = None
+        parts = bus_identifier.rsplit(' ', 1)
+        if len(parts) == 2:
+            prefix, number = parts
+            bus = Bus.query.filter(
+                db.func.lower(Bus.identifier) == prefix.lower(),
+                db.func.lower(Bus.name) == number.lower()
+            ).first()
+            if not bus:
+                stripped = number.lstrip('0') or '0'
+                if stripped != number:
+                    bus = Bus.query.filter(
+                        db.func.lower(Bus.identifier) == prefix.lower(),
+                        db.func.lower(Bus.name) == stripped.lower()
+                    ).first()
+        if not bus:
+            bus = Bus.query.filter(
+                db.func.lower(Bus.identifier) == bus_identifier.lower()
+            ).first()
+        return bus, period_names
+
+    existing_groups = {g.name.strip().lower(): g for g in SubscriberGroup.query.all()}
+
+    # Per-group analysis (resolved once per unique group name)
+    groups_info   = {}   # lower_name → dict
+    households    = OrderedDict()
+    total_rows    = 0
+    skipped_blank = 0
+    warn_no_email = 0
+    warn_no_phone = 0
+    skipped_bus   = 0
+
+    reader = csv.DictReader(io.StringIO(content))
+    for i, row in enumerate(reader, 2):
+        total_rows += 1
+        group_name = (row.get('group') or '').strip()
+        household  = (row.get('household_label') or '').strip()
+        first_name = (row.get('first_name') or '').strip()
+        last_name  = (row.get('last_name') or '').strip()
+        email      = (row.get('email') or '').strip()
+        phone      = (row.get('phone') or '').strip()
+        if phone.endswith('.0') and phone[:-2].lstrip('+-').isdigit():
+            phone = phone[:-2]
+        if phone and not phone.startswith('+'):
+            phone = '+' + phone
+
+        if not first_name and not email:
+            skipped_blank += 1
+            continue
+
+        gkey = group_name.lower() if group_name else ''
+
+        # Resolve group once
+        if group_name and gkey not in groups_info:
+            if gkey in existing_groups:
+                groups_info[gkey] = {'name': group_name, 'status': 'existing',
+                                     'bus': None, 'periods': [], 'rows': 0}
+            else:
+                bus, period_names = _resolve_bus(group_name)
+                if bus:
+                    bus_period_ids = {bsa.schedule_type_id for bsa in bus.schedule_assignments}
+                    matched = []
+                    if period_names:
+                        sts = BusScheduleType.query.filter(BusScheduleType.name.in_(period_names)).all()
+                        matched = [st.name for st in sts if st.id in bus_period_ids]
+                    groups_info[gkey] = {
+                        'name':    group_name,
+                        'status':  'create',
+                        'bus':     f'{bus.identifier} - {bus.name}',
+                        'periods': matched or ['All periods'],
+                        'rows':    0,
+                    }
+                else:
+                    groups_info[gkey] = {'name': group_name, 'status': 'error',
+                                         'bus': None, 'periods': [], 'rows': 0}
+
+        # Skip rows whose group has an unresolvable bus
+        if group_name and groups_info.get(gkey, {}).get('status') == 'error':
+            skipped_bus += 1
+            groups_info[gkey]['rows'] += 1
+            continue
+
+        if group_name and gkey in groups_info:
+            groups_info[gkey]['rows'] += 1
+
+        if not email:
+            warn_no_email += 1
+        if not phone:
+            warn_no_phone += 1
+
+        hh_key = (gkey or '__none__', household if household else f'__row_{i}__')
+        if hh_key not in households:
+            households[hh_key] = 0
+        households[hh_key] += 1
+
+    critical = [
+        f'Group "{v["name"]}": bus not found — {v["rows"]} row(s) will be skipped'
+        for v in groups_info.values() if v['status'] == 'error'
+    ]
+
+    return jsonify({
+        'ok':            True,
+        'total_rows':    total_rows,
+        'skipped_blank': skipped_blank,
+        'skipped_bus':   skipped_bus,
+        'households':    len(households),
+        'contacts':      sum(households.values()),
+        'groups_create': [v for v in groups_info.values() if v['status'] == 'create'],
+        'groups_existing': [v['name'] for v in groups_info.values() if v['status'] == 'existing'],
+        'critical':      critical,
+        'warn_no_email': warn_no_email,
+        'warn_no_phone': warn_no_phone,
+        'can_import':    len(critical) == 0,
+    })
+
+
 @app.route('/admin/notifications/import-csv', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')

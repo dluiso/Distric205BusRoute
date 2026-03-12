@@ -786,53 +786,122 @@
 
 <!-- ── MODAL: Import CSV ── -->
 <div id="modal-import" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg">
-    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between px-6 py-4 border-b border-slate-100 shrink-0">
       <h2 class="font-bold text-slate-800">Import Subscribers from CSV</h2>
-      <button onclick="document.getElementById('modal-import').classList.add('hidden')" class="text-slate-400 hover:text-slate-600">
-        <i class="fas fa-times"></i>
-      </button>
+      <button onclick="csvImportClose()" class="text-slate-400 hover:text-slate-600"><i class="fas fa-times"></i></button>
     </div>
-    <div class="px-6 py-5 space-y-4">
-      <!-- Requirements -->
-      <div class="bg-blue-50 border border-blue-100 rounded-xl p-4 text-sm space-y-2">
-        <p class="font-semibold text-blue-800"><i class="fas fa-info-circle mr-1"></i>CSV Format Requirements</p>
-        <ul class="text-xs text-blue-700 space-y-1 list-disc list-inside">
-          <li>Required columns: <code class="bg-blue-100 px-1 rounded">group</code>, <code class="bg-blue-100 px-1 rounded">first_name</code> or <code class="bg-blue-100 px-1 rounded">email</code></li>
-          <li>Optional: <code class="bg-blue-100 px-1 rounded">household_label</code>, <code class="bg-blue-100 px-1 rounded">role</code>, <code class="bg-blue-100 px-1 rounded">last_name</code>, <code class="bg-blue-100 px-1 rounded">phone</code></li>
-          <li><code class="bg-blue-100 px-1 rounded">role</code> must be <strong>parent</strong> or <strong>student</strong> (default: parent)</li>
-          <li>Rows with the same <strong>group</strong> + <strong>household_label</strong> are merged into one enrollment with multiple contacts</li>
-          <li>Groups must be created first — unknown group names are skipped</li>
-          <li>File must be UTF-8 encoded (Excel exports as UTF-8 with BOM work fine)</li>
-        </ul>
-      </div>
-      <!-- Download template -->
-      <div class="flex items-center justify-between p-3 bg-slate-50 border border-slate-200 rounded-xl">
-        <div>
-          <p class="text-sm font-medium text-slate-700">Download template / current data</p>
-          <p class="text-xs text-slate-400">Export current subscribers as a starting point</p>
+
+    <!-- Scrollable body -->
+    <div class="overflow-y-auto flex-1 px-6 py-5 space-y-4">
+
+      <!-- ── STEP 1: Upload ── -->
+      <div id="csv-step-upload">
+        <!-- Format info -->
+        <div class="bg-blue-50 border border-blue-100 rounded-xl p-4 text-sm space-y-2 mb-4">
+          <p class="font-semibold text-blue-800"><i class="fas fa-info-circle mr-1"></i>CSV Format Requirements</p>
+          <ul class="text-xs text-blue-700 space-y-1 list-disc list-inside">
+            <li>Required columns: <code class="bg-blue-100 px-1 rounded">group</code>, <code class="bg-blue-100 px-1 rounded">first_name</code> or <code class="bg-blue-100 px-1 rounded">email</code></li>
+            <li>Optional: <code class="bg-blue-100 px-1 rounded">household_label</code>, <code class="bg-blue-100 px-1 rounded">role</code>, <code class="bg-blue-100 px-1 rounded">last_name</code>, <code class="bg-blue-100 px-1 rounded">phone</code></li>
+            <li><code class="bg-blue-100 px-1 rounded">role</code> must be <strong>parent</strong> or <strong>student</strong> (default: parent)</li>
+            <li>Rows with the same <strong>group</strong> + <strong>household_label</strong> are merged into one enrollment</li>
+            <li>Unknown group names are auto-created if a matching bus is found</li>
+            <li>File must be UTF-8 encoded (Excel UTF-8 with BOM works fine)</li>
+          </ul>
         </div>
-        <a href="{{ url_for('export_subscribers_csv') }}"
-           class="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-200 hover:border-emerald-400 text-slate-600 hover:text-emerald-700 rounded-xl text-sm font-medium transition-colors">
-          <i class="fas fa-download text-xs"></i>Export CSV
-        </a>
-      </div>
-      <!-- Upload form -->
-      <form method="POST" action="{{ url_for('import_subscribers_csv') }}" enctype="multipart/form-data">
+        <!-- Export link -->
+        <div class="flex items-center justify-between p-3 bg-slate-50 border border-slate-200 rounded-xl mb-4">
+          <div>
+            <p class="text-sm font-medium text-slate-700">Download template / current data</p>
+            <p class="text-xs text-slate-400">Export current subscribers as a starting point</p>
+          </div>
+          <a href="{{ url_for('export_subscribers_csv') }}"
+             class="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-200 hover:border-emerald-400 text-slate-600 hover:text-emerald-700 rounded-xl text-sm font-medium transition-colors">
+            <i class="fas fa-download text-xs"></i>Export CSV
+          </a>
+        </div>
+        <!-- File picker -->
         <div>
           <label class="block text-xs font-semibold text-slate-600 mb-1.5">Select CSV File</label>
-          <input type="file" name="csv_file" accept=".csv"
+          <input id="csv-file-input" type="file" name="csv_file" accept=".csv"
+                 onchange="csvFileSelected()"
                  class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
         </div>
-        <div class="flex justify-end space-x-2 pt-4 border-t border-slate-100 mt-4">
-          <button type="button" onclick="document.getElementById('modal-import').classList.add('hidden')"
-                  class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
-          <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
-            <i class="fas fa-file-import mr-1"></i>Import
-          </button>
+      </div>
+
+      <!-- ── STEP 2: Preview report (hidden until analyzed) ── -->
+      <div id="csv-step-preview" class="hidden space-y-4">
+
+        <!-- Summary cards -->
+        <div id="csv-summary" class="grid grid-cols-3 gap-3"></div>
+
+        <!-- Critical errors -->
+        <div id="csv-critical-block" class="hidden">
+          <div class="flex items-center gap-2 mb-2">
+            <i class="fas fa-times-circle text-red-500"></i>
+            <span class="text-sm font-semibold text-red-700">Critical Errors — Import Blocked</span>
+          </div>
+          <div id="csv-critical-list" class="space-y-1"></div>
         </div>
-      </form>
+
+        <!-- Warnings -->
+        <div id="csv-warnings-block" class="hidden">
+          <div class="flex items-center gap-2 mb-2">
+            <i class="fas fa-exclamation-triangle text-amber-500"></i>
+            <span class="text-sm font-semibold text-amber-700">Warnings — Import will proceed but review recommended</span>
+          </div>
+          <div id="csv-warnings-list" class="space-y-1"></div>
+        </div>
+
+        <!-- Groups to be created -->
+        <div id="csv-groups-block" class="hidden">
+          <div class="flex items-center gap-2 mb-2">
+            <i class="fas fa-plus-circle text-emerald-500"></i>
+            <span class="text-sm font-semibold text-slate-700">Groups to be auto-created</span>
+          </div>
+          <div id="csv-groups-list" class="space-y-1 max-h-48 overflow-y-auto pr-1"></div>
+        </div>
+
+        <!-- Existing groups -->
+        <div id="csv-existing-block" class="hidden">
+          <div class="flex items-center gap-2 mb-2">
+            <i class="fas fa-check-circle text-blue-400"></i>
+            <span class="text-sm font-semibold text-slate-700">Existing groups (subscribers will be added)</span>
+          </div>
+          <div id="csv-existing-list" class="flex flex-wrap gap-1.5"></div>
+        </div>
+
+      </div>
+    </div><!-- end scrollable body -->
+
+    <!-- Footer buttons -->
+    <div class="shrink-0 flex justify-between items-center px-6 py-4 border-t border-slate-100 bg-slate-50 rounded-b-2xl">
+      <!-- Left: Analyze / Back -->
+      <div>
+        <button id="csv-btn-analyze" onclick="csvAnalyze()"
+                class="hidden px-4 py-2 bg-slate-700 hover:bg-slate-800 text-white rounded-xl text-sm font-medium">
+          <i class="fas fa-search mr-1"></i>Analyze File
+        </button>
+        <button id="csv-btn-back" onclick="csvResetToUpload()"
+                class="hidden px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-white">
+          <i class="fas fa-arrow-left mr-1"></i>Back
+        </button>
+      </div>
+      <!-- Right: Cancel / Confirm -->
+      <div class="flex gap-2">
+        <button type="button" onclick="csvImportClose()"
+                class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-white">Cancel</button>
+        <form id="csv-confirm-form" method="POST" action="{{ url_for('import_subscribers_csv') }}" enctype="multipart/form-data">
+          <button id="csv-btn-confirm" type="submit"
+                  class="hidden px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
+            <i class="fas fa-file-import mr-1"></i>Confirm Import
+          </button>
+        </form>
+      </div>
     </div>
+
   </div>
 </div>
 {% endblock %}
@@ -1360,5 +1429,155 @@ function escHtml(str) {
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 filterAndPage();
+
+// ─── CSV Import Modal ────────────────────────────────────────────────────────
+function csvImportClose() {
+  document.getElementById('modal-import').classList.add('hidden');
+  csvResetToUpload();
+}
+
+function csvFileSelected() {
+  const input = document.getElementById('csv-file-input');
+  const btn   = document.getElementById('csv-btn-analyze');
+  btn.classList.toggle('hidden', !input.files.length);
+}
+
+function csvResetToUpload() {
+  document.getElementById('csv-step-upload').classList.remove('hidden');
+  document.getElementById('csv-step-preview').classList.add('hidden');
+  document.getElementById('csv-btn-analyze').classList.add('hidden');
+  document.getElementById('csv-btn-back').classList.add('hidden');
+  document.getElementById('csv-btn-confirm').classList.add('hidden');
+  document.getElementById('csv-file-input').value = '';
+}
+
+async function csvAnalyze() {
+  const input = document.getElementById('csv-file-input');
+  if (!input.files.length) return;
+
+  const btn = document.getElementById('csv-btn-analyze');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>Analyzing…';
+
+  const fd = new FormData();
+  fd.append('csv_file', input.files[0]);
+
+  let data;
+  try {
+    const resp = await fetch('{{ url_for("preview_import_csv") }}', { method: 'POST', body: fd });
+    data = await resp.json();
+  } catch(e) {
+    alert('Network error — could not analyze file.');
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-search mr-1"></i>Analyze File';
+    return;
+  }
+
+  if (!data.ok) {
+    alert(data.message || 'Could not parse file.');
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-search mr-1"></i>Analyze File';
+    return;
+  }
+
+  // ── Render Summary cards ──
+  const importable = data.contacts - (data.skipped_bus || 0);
+  document.getElementById('csv-summary').innerHTML = `
+    <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+      <p class="text-2xl font-bold text-slate-800">${data.total_rows}</p>
+      <p class="text-xs text-slate-500 mt-0.5">Total rows</p>
+    </div>
+    <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+      <p class="text-2xl font-bold text-blue-600">${data.households}</p>
+      <p class="text-xs text-slate-500 mt-0.5">Enrollments</p>
+    </div>
+    <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+      <p class="text-2xl font-bold text-emerald-600">${data.contacts}</p>
+      <p class="text-xs text-slate-500 mt-0.5">Contacts</p>
+    </div>
+    ${data.skipped_blank > 0 ? `
+    <div class="col-span-3 flex items-center gap-2 text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+      <i class="fas fa-minus-circle text-slate-400"></i>
+      ${data.skipped_blank} row(s) skipped — no name or email
+    </div>` : ''}`;
+
+  // ── Critical errors ──
+  const critBlock = document.getElementById('csv-critical-block');
+  const critList  = document.getElementById('csv-critical-list');
+  if (data.critical.length) {
+    critList.innerHTML = data.critical.map(e =>
+      `<div class="flex items-start gap-2 bg-red-50 border border-red-100 rounded-lg px-3 py-2 text-xs text-red-700">
+        <i class="fas fa-times-circle mt-0.5 shrink-0"></i><span>${escHtml(e)}</span>
+      </div>`).join('');
+    critBlock.classList.remove('hidden');
+  } else {
+    critBlock.classList.add('hidden');
+  }
+
+  // ── Warnings ──
+  const warnBlock = document.getElementById('csv-warnings-block');
+  const warnList  = document.getElementById('csv-warnings-list');
+  const warns = [];
+  if (data.warn_no_email > 0)
+    warns.push(`${data.warn_no_email} contact(s) have no email — they will not receive email notifications`);
+  if (data.warn_no_phone > 0)
+    warns.push(`${data.warn_no_phone} contact(s) have no phone — they will not receive SMS notifications`);
+  if (warns.length) {
+    warnList.innerHTML = warns.map(w =>
+      `<div class="flex items-start gap-2 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 text-xs text-amber-700">
+        <i class="fas fa-exclamation-triangle mt-0.5 shrink-0"></i><span>${escHtml(w)}</span>
+      </div>`).join('');
+    warnBlock.classList.remove('hidden');
+  } else {
+    warnBlock.classList.add('hidden');
+  }
+
+  // ── Groups to create ──
+  const grpBlock = document.getElementById('csv-groups-block');
+  const grpList  = document.getElementById('csv-groups-list');
+  if (data.groups_create.length) {
+    grpList.innerHTML = data.groups_create.map(g =>
+      `<div class="flex items-center justify-between bg-emerald-50 border border-emerald-100 rounded-lg px-3 py-2 text-xs">
+        <span class="font-medium text-slate-700">${escHtml(g.name)}</span>
+        <span class="text-slate-500">Bus <strong>${escHtml(g.bus)}</strong> &middot; ${g.periods.map(p => escHtml(p)).join(', ')}</span>
+      </div>`).join('');
+    grpBlock.classList.remove('hidden');
+  } else {
+    grpBlock.classList.add('hidden');
+  }
+
+  // ── Existing groups ──
+  const exBlock = document.getElementById('csv-existing-block');
+  const exList  = document.getElementById('csv-existing-list');
+  if (data.groups_existing.length) {
+    exList.innerHTML = data.groups_existing.map(n =>
+      `<span class="inline-block bg-blue-50 border border-blue-100 text-blue-700 text-xs rounded-lg px-2 py-1">${escHtml(n)}</span>`
+    ).join('');
+    exBlock.classList.remove('hidden');
+  } else {
+    exBlock.classList.add('hidden');
+  }
+
+  // ── Switch to preview step ──
+  document.getElementById('csv-step-upload').classList.add('hidden');
+  document.getElementById('csv-step-preview').classList.remove('hidden');
+  document.getElementById('csv-btn-analyze').classList.add('hidden');
+  document.getElementById('csv-btn-back').classList.remove('hidden');
+
+  if (data.can_import) {
+    // Wire the actual file into the confirm form
+    const confirmForm = document.getElementById('csv-confirm-form');
+    const newInput = document.createElement('input');
+    newInput.type = 'file';
+    newInput.name = 'csv_file';
+    newInput.style.display = 'none';
+    const dt = new DataTransfer();
+    dt.items.add(input.files[0]);
+    newInput.files = dt.files;
+    confirmForm.querySelectorAll('input[name="csv_file"]').forEach(el => el.remove());
+    confirmForm.appendChild(newInput);
+    document.getElementById('csv-btn-confirm').classList.remove('hidden');
+  }
+}
 </script>
 {% endblock %}
