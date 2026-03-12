@@ -2603,13 +2603,29 @@ def _auto_create_group_from_name(group_name):
     if not bus_identifier:
         return None
 
-    # Find bus by identifier (case-insensitive exact), then by display_name contains
-    bus = Bus.query.filter(
-        db.func.lower(Bus.identifier) == bus_identifier.lower()
-    ).first()
-    if not bus:
+    # Bus identifier from group name is "PREFIX NUMBER" (e.g. "PC 01", "TT 55").
+    # The DB stores these as separate fields: Bus.identifier="PC", Bus.name="1".
+    # Strategy: split into prefix + number, try exact name match first, then
+    # strip leading zeros (CSV may zero-pad numbers that the DB stores without zeros).
+    bus = None
+    parts = bus_identifier.rsplit(' ', 1)
+    if len(parts) == 2:
+        prefix, number = parts
         bus = Bus.query.filter(
-            Bus.identifier.ilike(f'%{bus_identifier}%')
+            db.func.lower(Bus.identifier) == prefix.lower(),
+            db.func.lower(Bus.name) == number.lower()
+        ).first()
+        if not bus:
+            stripped = number.lstrip('0') or '0'
+            if stripped != number:
+                bus = Bus.query.filter(
+                    db.func.lower(Bus.identifier) == prefix.lower(),
+                    db.func.lower(Bus.name) == stripped.lower()
+                ).first()
+    if not bus:
+        # Fallback: match identifier field exactly (single-token group names)
+        bus = Bus.query.filter(
+            db.func.lower(Bus.identifier) == bus_identifier.lower()
         ).first()
     if not bus:
         return None
@@ -2677,6 +2693,9 @@ def import_subscribers_csv():
         last_name  = (row.get('last_name') or '').strip()
         email      = (row.get('email') or '').strip()
         phone      = (row.get('phone') or '').strip()
+        # CSV exported from spreadsheets may store phone as float (e.g. "17082504810.0")
+        if phone.endswith('.0') and phone[:-2].lstrip('+-').isdigit():
+            phone = phone[:-2]
         role_raw   = (row.get('role') or 'parent').strip().lower()
         role       = role_raw if role_raw in ('parent', 'student') else 'parent'
 
