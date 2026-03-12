@@ -2696,6 +2696,9 @@ def import_subscribers_csv():
         # CSV exported from spreadsheets may store phone as float (e.g. "17082504810.0")
         if phone.endswith('.0') and phone[:-2].lstrip('+-').isdigit():
             phone = phone[:-2]
+        # Ensure phone has leading + for SMS delivery (e.g. "13312308587" → "+13312308587")
+        if phone and not phone.startswith('+'):
+            phone = '+' + phone
         role_raw   = (row.get('role') or 'parent').strip().lower()
         role       = role_raw if role_raw in ('parent', 'student') else 'parent'
 
