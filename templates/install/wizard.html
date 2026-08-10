@@ -58,83 +58,32 @@
           <h2 class="font-bold text-white text-lg flex items-center space-x-2">
             <i class="fas fa-database text-blue-400"></i><span>Database Configuration</span>
           </h2>
-          <p class="text-slate-400 text-sm mt-1">Choose the database engine for your installation.</p>
+          <p class="text-slate-400 text-sm mt-1">Verify the database configured by the server administrator.</p>
         </div>
         <div class="px-8 py-6 space-y-5">
-
-          <!-- DB type selector -->
           <div>
-            <label class="block text-xs font-semibold text-slate-300 mb-3">Database Type</label>
-            <div class="grid grid-cols-2 gap-3">
-              <label class="db-type-opt flex items-center space-x-3 p-4 rounded-xl border-2 border-blue-500 bg-blue-600/10 cursor-pointer">
-                <input type="radio" name="db_type" value="sqlite" checked class="w-4 h-4 text-blue-600" onchange="onDbType('sqlite')">
-                <div>
-                  <p class="font-semibold text-white text-sm">SQLite</p>
-                  <p class="text-xs text-slate-400">File-based · Simple setup</p>
-                </div>
-              </label>
-              <label class="db-type-opt flex items-center space-x-3 p-4 rounded-xl border-2 border-slate-600 cursor-pointer hover:border-slate-500">
-                <input type="radio" name="db_type" value="postgresql" class="w-4 h-4 text-blue-600" onchange="onDbType('postgresql')">
-                <div>
-                  <p class="font-semibold text-white text-sm">PostgreSQL</p>
-                  <p class="text-xs text-slate-400">Recommended for production</p>
-                </div>
-              </label>
-            </div>
+            <label class="block text-xs font-semibold text-slate-300 mb-1.5">Installation Token <span class="text-red-400">*</span></label>
+            <input type="password" id="install-token" autocomplete="off"
+                   placeholder="Token configured by the server administrator"
+                   class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
+            {% if not install_ready %}
+            <p class="mt-2 text-xs text-red-300 bg-red-900/30 border border-red-700/50 rounded-lg p-2">
+              Installation is locked until INSTALL_TOKEN is configured and the service is restarted.
+            </p>
+            {% endif %}
           </div>
 
-          <!-- SQLite options -->
-          <div id="sqlite-opts" class="space-y-3">
-            <div class="bg-emerald-900/30 border border-emerald-700/50 rounded-xl p-4 text-sm text-emerald-300 flex items-start space-x-2">
-              <i class="fas fa-circle-check mt-0.5 flex-shrink-0"></i>
-              <span>SQLite requires no extra configuration. The database file <code class="bg-slate-900/50 px-1 rounded">bustrack.db</code> will be created automatically in the application directory.</span>
-            </div>
+          <div class="bg-slate-900/60 border border-slate-600 rounded-xl p-4">
+            <p class="text-xs uppercase tracking-wider text-slate-500 font-semibold">Configured database</p>
+            <p class="text-sm text-white font-medium mt-1">{{ database_label }}</p>
+            <p class="text-xs text-slate-400 mt-2">Database credentials and destinations are managed only through the server environment, not through the public setup page.</p>
           </div>
-
-          <!-- PostgreSQL options -->
-          <div id="pg-opts" class="hidden space-y-4">
-            <div class="grid grid-cols-2 gap-4">
-              <div>
-                <label class="block text-xs font-semibold text-slate-300 mb-1.5">Host</label>
-                <input type="text" id="pg-host" value="localhost" placeholder="localhost"
-                       class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
-              </div>
-              <div>
-                <label class="block text-xs font-semibold text-slate-300 mb-1.5">Port</label>
-                <input type="number" id="pg-port" value="5432" placeholder="5432"
-                       class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
-              </div>
-            </div>
-            <div>
-              <label class="block text-xs font-semibold text-slate-300 mb-1.5">Database Name</label>
-              <input type="text" id="pg-name" value="bustrack" placeholder="bustrack"
-                     class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
-            </div>
-            <div class="grid grid-cols-2 gap-4">
-              <div>
-                <label class="block text-xs font-semibold text-slate-300 mb-1.5">Username</label>
-                <input type="text" id="pg-user" placeholder="postgres"
-                       class="w-full px-3 py-2.5 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
-              </div>
-              <div>
-                <label class="block text-xs font-semibold text-slate-300 mb-1.5">Password</label>
-                <div class="relative">
-                  <input type="password" id="pg-pass" placeholder="••••••••"
-                         class="w-full px-3 py-2.5 pr-10 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
-                  <button type="button" onclick="toggleVis('pg-pass',this)" class="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
-                    <i class="fas fa-eye text-xs"></i>
-                  </button>
-                </div>
-              </div>
-            </div>
-            <!-- Test result -->
-            <div id="db-test-result" class="hidden rounded-xl p-3 text-sm"></div>
-            <button type="button" onclick="testDb()"
-                    class="flex items-center space-x-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 border border-slate-600 text-slate-200 rounded-xl text-sm font-medium transition-colors">
-              <i class="fas fa-plug text-xs" id="test-icon"></i>
-              <span id="test-btn-lbl">Test Connection</span>
-            </button>
-          </div>
+          <div id="db-test-result" class="hidden rounded-xl p-3 text-sm"></div>
+          <button type="button" onclick="testDb()"
+                  class="flex items-center space-x-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 border border-slate-600 text-slate-200 rounded-xl text-sm font-medium transition-colors">
+            <i class="fas fa-plug text-xs" id="test-icon"></i>
+            <span id="test-btn-lbl">Test Configured Connection</span>
+          </button>
 
           <!-- Nav -->
           <div class="flex justify-end pt-2">
@@ -171,7 +120,7 @@
             <div>
               <label class="block text-xs font-semibold text-slate-300 mb-1.5">Password <span class="text-red-400">*</span></label>
               <div class="relative">
-                <input type="password" id="adm-pass" placeholder="Min. 8 characters" autocomplete="new-password"
+                <input type="password" id="adm-pass" placeholder="Min. 12 characters" autocomplete="new-password"
                        oninput="checkPwdStrength()"
                        class="w-full px-3 py-2.5 pr-10 bg-slate-900 border border-slate-600 rounded-xl text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500">
                 <button type="button" onclick="toggleVis('adm-pass',this)" class="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
@@ -218,7 +167,7 @@
           <div class="bg-slate-900/60 rounded-xl border border-slate-700 divide-y divide-slate-700">
             <div class="flex items-center justify-between px-4 py-3 text-sm">
               <span class="text-slate-400 flex items-center space-x-2"><i class="fas fa-database text-blue-400 w-4"></i><span>Database</span></span>
-              <span class="text-white font-medium" id="sum-db">SQLite (default)</span>
+              <span class="text-white font-medium" id="sum-db">{{ database_label }}</span>
             </div>
             <div class="flex items-center justify-between px-4 py-3 text-sm">
               <span class="text-slate-400 flex items-center space-x-2"><i class="fas fa-user text-blue-400 w-4"></i><span>Admin Username</span></span>
@@ -267,8 +216,6 @@
 
 <script>
 let _step = 1;
-let _dbType = 'sqlite';
-let _pgTested = false;
 
 // ── Step navigation ──────────────────────────────────────────────────────────
 function goStep(n) {
@@ -297,21 +244,6 @@ function goStep(n) {
   if (n === 3) fillSummary();
 }
 
-// ── DB type toggle ───────────────────────────────────────────────────────────
-function onDbType(type) {
-  _dbType = type;
-  _pgTested = false;
-  document.getElementById('sqlite-opts').classList.toggle('hidden', type !== 'sqlite');
-  document.getElementById('pg-opts').classList.toggle('hidden', type !== 'postgresql');
-  document.querySelectorAll('.db-type-opt').forEach(l => {
-    const radio = l.querySelector('input');
-    const active = radio.value === type;
-    l.classList.toggle('border-blue-500', active);
-    l.classList.toggle('bg-blue-600/10', active);
-    l.classList.toggle('border-slate-600', !active);
-  });
-}
-
 // ── Test DB connection ────────────────────────────────────────────────────────
 async function testDb() {
   const btn = document.getElementById('test-btn-lbl');
@@ -321,7 +253,7 @@ async function testDb() {
   icon.className = 'fas fa-spinner fa-spin text-xs';
   res.className = 'hidden rounded-xl p-3 text-sm';
 
-  const payload = buildDbPayload();
+  const payload = {install_token: document.getElementById('install-token').value};
   try {
     const r = await fetch('/install/test-db', {
       method: 'POST',
@@ -332,31 +264,18 @@ async function testDb() {
     res.classList.remove('hidden');
     if (j.ok) {
       res.className = 'rounded-xl p-3 text-sm bg-emerald-900/40 border border-emerald-700/50 text-emerald-300';
-      res.innerHTML = '<i class="fas fa-check-circle mr-2"></i>' + j.message;
-      _pgTested = true;
+      res.replaceChildren(Object.assign(document.createElement('span'), {textContent: '✓ ' + j.message}));
     } else {
       res.className = 'rounded-xl p-3 text-sm bg-red-900/40 border border-red-700/60 text-red-300';
-      res.innerHTML = '<i class="fas fa-exclamation-circle mr-2"></i>' + j.message;
+      res.replaceChildren(Object.assign(document.createElement('span'), {textContent: '⚠ ' + j.message}));
     }
   } catch (e) {
     res.classList.remove('hidden');
     res.className = 'rounded-xl p-3 text-sm bg-red-900/40 border border-red-700/60 text-red-300';
-    res.innerHTML = '<i class="fas fa-exclamation-circle mr-2"></i>Network error: ' + e.message;
+    res.textContent = 'Network error: ' + e.message;
   }
-  btn.textContent = 'Test Connection';
+  btn.textContent = 'Test Configured Connection';
   icon.className = 'fas fa-plug text-xs';
-}
-
-function buildDbPayload() {
-  if (_dbType === 'sqlite') return {type: 'sqlite'};
-  return {
-    type: 'postgresql',
-    host: document.getElementById('pg-host').value,
-    port: document.getElementById('pg-port').value,
-    name: document.getElementById('pg-name').value,
-    user: document.getElementById('pg-user').value,
-    password: document.getElementById('pg-pass').value,
-  };
 }
 
 // ── Password strength ─────────────────────────────────────────────────────────
@@ -387,7 +306,7 @@ function validateStep2() {
   err.classList.add('hidden');
   if (!u || u.length < 3)  { showErr(err, 'Username must be at least 3 characters.'); return; }
   if (!/^[a-zA-Z0-9_.-]+$/.test(u)) { showErr(err, 'Username can only contain letters, numbers, underscores, dots and hyphens.'); return; }
-  if (!p || p.length < 8)  { showErr(err, 'Password must be at least 8 characters.'); return; }
+  if (!p || p.length < 12) { showErr(err, 'Password must be at least 12 characters.'); return; }
   if (p !== p2)             { showErr(err, 'Passwords do not match.'); return; }
   goStep(3);
 }
@@ -397,11 +316,16 @@ function showErr(el, msg) {
   el.classList.remove('hidden');
 }
 
+function showInstallResult(el, iconClass, prefix, message) {
+  const icon = document.createElement('i');
+  icon.className = iconClass;
+  const label = document.createElement('strong');
+  label.textContent = prefix;
+  el.replaceChildren(icon, label, document.createTextNode(message));
+}
+
 // ── Summary fill ─────────────────────────────────────────────────────────────
 function fillSummary() {
-  const db = _dbType === 'sqlite' ? 'SQLite (default)'
-    : `PostgreSQL — ${document.getElementById('pg-host').value}:${document.getElementById('pg-port').value}/${document.getElementById('pg-name').value}`;
-  document.getElementById('sum-db').textContent   = db;
   document.getElementById('sum-user').textContent  = document.getElementById('adm-user').value || '—';
   document.getElementById('sum-email').textContent = document.getElementById('adm-email').value || 'None';
 }
@@ -430,7 +354,7 @@ async function runInstall() {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
-        db: buildDbPayload(),
+        install_token: document.getElementById('install-token').value,
         username: document.getElementById('adm-user').value.trim(),
         email:    document.getElementById('adm-email').value.trim() || null,
         password: document.getElementById('adm-pass').value,
@@ -444,7 +368,8 @@ async function runInstall() {
       bar.className = 'h-full bg-emerald-500 rounded-full transition-all duration-700';
       msg.textContent = j.message;
       res.className = 'rounded-xl p-4 text-sm bg-emerald-900/40 border border-emerald-700/50 text-emerald-300';
-      res.innerHTML = '<i class="fas fa-circle-check mr-2 text-lg"></i><strong>Installation complete!</strong> Redirecting to login…';
+      showInstallResult(res, 'fas fa-circle-check mr-2 text-lg',
+                        'Installation complete! ', 'Redirecting to login…');
       res.classList.remove('hidden');
       document.getElementById('install-nav').classList.add('hidden');
       setTimeout(() => { window.location.href = '/admin/login'; }, 2500);
@@ -453,7 +378,7 @@ async function runInstall() {
       bar.className = 'h-full bg-red-500 rounded-full transition-all duration-700';
       msg.textContent = '';
       res.className = 'rounded-xl p-4 text-sm bg-red-900/40 border border-red-700/60 text-red-300';
-      res.innerHTML = '<i class="fas fa-circle-xmark mr-2"></i><strong>Error:</strong> ' + j.message;
+      showInstallResult(res, 'fas fa-circle-xmark mr-2', 'Error: ', j.message);
       res.classList.remove('hidden');
       document.getElementById('btn-install').disabled = false;
       document.getElementById('btn-install').innerHTML = '<i class="fas fa-redo text-xs mr-2"></i>Retry';
@@ -462,7 +387,7 @@ async function runInstall() {
   } catch (e) {
     clearInterval(ticker);
     res.className = 'rounded-xl p-4 text-sm bg-red-900/40 border border-red-700/60 text-red-300';
-    res.innerHTML = '<i class="fas fa-circle-xmark mr-2"></i>Network error: ' + e.message;
+    showInstallResult(res, 'fas fa-circle-xmark mr-2', 'Network error: ', e.message);
     res.classList.remove('hidden');
     document.getElementById('btn-install').disabled = false;
     document.getElementById('btn-install').innerHTML = '<i class="fas fa-redo text-xs mr-2"></i>Retry';

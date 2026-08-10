@@ -247,10 +247,10 @@
 
 {% block scripts %}
 <script>
-const byType   = {{ by_type_json|safe }};
-const byTypeCl = {{ by_type_colors_json|safe }};
-const byBus    = {{ by_bus_json|safe }};
-const byDay    = {{ by_day_json|safe }};
+const byType   = {{ by_type_json|tojson }};
+const byTypeCl = {{ by_type_colors_json|tojson }};
+const byBus    = {{ by_bus_json|tojson }};
+const byDay    = {{ by_day_json|tojson }};
 
 let mainChart = null;
 

@@ -1,5 +1,3 @@
-version: '3.9'
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Bus Tracker — Docker Compose
 #
@@ -19,8 +17,19 @@ services:
       - "${PORT:-5000}:5000"
     environment:
       FLASK_ENV: production
-      SECRET_KEY: "${SECRET_KEY:-changeme-set-in-env}"
-      DATABASE_URL: "postgresql://${DB_USER:-bususer}:${DB_PASS:-buspass}@db:5432/${DB_NAME:-bustrack}"
+      SECRET_KEY: "${SECRET_KEY:?SECRET_KEY must be set}"
+      DATABASE_URL: "postgresql://${DB_USER:-bususer}:${DB_PASS:?DB_PASS must be set}@db:5432/${DB_NAME:-bustrack}"
+      INSTALL_TOKEN: "${INSTALL_TOKEN:-}"
+      BACKUP_ENCRYPTION_KEY: "${BACKUP_ENCRYPTION_KEY:-}"
+      RESTORE_JOB_TTL_SECONDS: "${RESTORE_JOB_TTL_SECONDS:-1800}"
+      RESTORE_SNAPSHOT_RETENTION_DAYS: "${RESTORE_SNAPSHOT_RETENTION_DAYS:-30}"
+      SMTP_ALLOWED_HOSTS: "${SMTP_ALLOWED_HOSTS:-}"
+      TRUSTED_PROXY_X_FOR: "${TRUSTED_PROXY_X_FOR:-0}"
+      TRUSTED_PROXY_X_PROTO: "${TRUSTED_PROXY_X_PROTO:-0}"
+      TRUSTED_PROXY_X_HOST: "${TRUSTED_PROXY_X_HOST:-0}"
+      LOGIN_RATE_LIMIT_ATTEMPTS: "${LOGIN_RATE_LIMIT_ATTEMPTS:-5}"
+      LOGIN_RATE_LIMIT_WINDOW_SECONDS: "${LOGIN_RATE_LIMIT_WINDOW_SECONDS:-300}"
+      LOGIN_RATE_LIMIT_LOCK_SECONDS: "${LOGIN_RATE_LIMIT_LOCK_SECONDS:-300}"
     volumes:
       - ./instance:/app/instance          # wizard lock file + instance .env
       - ./static/uploads:/app/static/uploads  # logos / icons
@@ -41,7 +50,7 @@ services:
     environment:
       POSTGRES_DB:       "${DB_NAME:-bustrack}"
       POSTGRES_USER:     "${DB_USER:-bususer}"
-      POSTGRES_PASSWORD: "${DB_PASS:-buspass}"
+      POSTGRES_PASSWORD: "${DB_PASS:?DB_PASS must be set}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

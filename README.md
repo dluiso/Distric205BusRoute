@@ -70,18 +70,26 @@ cd Distric205BusRoute
 cp .env.example .env
 ```
 
-Edit `.env` and set a strong secret key:
+Edit `.env` and set independent strong values before starting:
 
 ```env
 SECRET_KEY=your-very-long-random-secret-key-here
 DB_NAME=bustrack
 DB_USER=bususer
 DB_PASS=a-strong-database-password
+INSTALL_TOKEN=a-one-time-random-bootstrap-token
+BACKUP_ENCRYPTION_KEY=a-valid-fernet-key
 ```
 
 Generate a secure key with:
 ```bash
 python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Generate the dedicated backup-encryption key separately:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
 ```bash
@@ -150,11 +158,15 @@ Edit `instance/.env`:
 
 ```env
 SECRET_KEY=your-very-long-random-secret-key-here
+INSTALL_TOKEN=a-one-time-random-bootstrap-token
+BACKUP_ENCRYPTION_KEY=a-valid-fernet-key
 # For SQLite (simplest):
 DATABASE_URL=sqlite:///bustrack.db
 # For PostgreSQL:
 # DATABASE_URL=postgresql://bususer:buspass@localhost:5432/bustrack
 ```
+
+Protect the environment file before starting the service: `chmod 600 instance/.env`.
 
 ```bash
 # 5. Run the application
@@ -185,6 +197,9 @@ WorkingDirectory=/opt/Distric205BusRoute
 ExecStart=/opt/Distric205BusRoute/venv/bin/gunicorn -w 4 -b 127.0.0.1:5000 app:app
 Restart=always
 EnvironmentFile=/opt/Distric205BusRoute/instance/.env
+Environment=TRUSTED_PROXY_X_FOR=1
+Environment=TRUSTED_PROXY_X_PROTO=1
+Environment=TRUSTED_PROXY_X_HOST=1
 
 [Install]
 WantedBy=multi-user.target
@@ -222,15 +237,22 @@ server {
 
 ## Installation Wizard
 
-On first launch, the app automatically redirects to the **Installation Wizard** at `/install`.
+On first launch, the app redirects to the **Installation Wizard** at `/install`. The
+operator must enter the one-time `INSTALL_TOKEN` configured in the server environment.
 
 The wizard guides you through:
 
-1. **Database Configuration** — choose SQLite (zero config) or PostgreSQL (enter host, port, database name, user, password) and test the connection before proceeding
-2. **Admin Account** — set the username, email, and password for the initial administrator
+1. **Database Verification** — test only the database already configured by the server's `DATABASE_URL`; the browser cannot choose a host or filesystem path
+2. **Admin Account** — set the username, email, and a password of at least 12 characters
 3. **Review & Install** — summary of settings, then one-click install
 
-After successful installation, the wizard is **permanently locked** — the `/install` route becomes inaccessible to prevent unauthorized reconfiguration.
+After successful installation, all installation and database-test routes return 404.
+Remove `INSTALL_TOKEN` from the runtime environment after confirming installation.
+
+Full backups and restores are administrator-only and require `BACKUP_ENCRYPTION_KEY`.
+Operational exports are redacted and never include passwords, hashes, notification
+contacts, users, or audit data. Store the encryption key outside the repository and
+back it up independently; losing it makes encrypted backups unrecoverable.
 
 ---
 
@@ -238,13 +260,24 @@ After successful installation, the wizard is **permanently locked** — the `/in
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SECRET_KEY` | Flask session signing key (must be long and random) | Auto-generated (not persistent) |
+| `SECRET_KEY` | Flask session signing key; required in production | Development-only ephemeral value |
 | `DATABASE_URL` | SQLAlchemy database URL | `sqlite:///bustrack.db` |
+| `INSTALL_TOKEN` | One-time authorization for initial setup | Required while uninstalled |
+| `BACKUP_ENCRYPTION_KEY` | Dedicated Fernet key for full backups/restores | Required for full backup operations |
+| `SMTP_ALLOWED_HOSTS` | Exact custom SMTP relays allowed for save/test | Preset providers only |
+| `TRUSTED_PROXY_X_FOR` | Trusted proxy hops for client IP | `0` |
+| `TRUSTED_PROXY_X_PROTO` | Trusted proxy hops for scheme | `0` |
+| `TRUSTED_PROXY_X_HOST` | Trusted proxy hops for host | `0` |
+| `LOGIN_RATE_LIMIT_ATTEMPTS` | Failed attempts per client/identifier window | `5` |
+| `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | Login failure window | `300` |
+| `LOGIN_RATE_LIMIT_LOCK_SECONDS` | Login lock duration | `300` |
+| `RESTORE_JOB_TTL_SECONDS` | Validity of staged restore jobs | `1800` |
+| `RESTORE_SNAPSHOT_RETENTION_DAYS` | Encrypted pre-restore snapshot retention | `30` |
 | `FLASK_ENV` | Set to `production` to enable secure cookies | `development` |
 | `PORT` | Port to expose (Docker only) | `5000` |
 | `DB_NAME` | PostgreSQL database name (Docker only) | `bustrack` |
 | `DB_USER` | PostgreSQL user (Docker only) | `bususer` |
-| `DB_PASS` | PostgreSQL password (Docker only) | `buspass` |
+| `DB_PASS` | PostgreSQL password (Docker only) | Required |
 
 > **Important:** Never commit your real `.env` file. It is listed in `.gitignore`.
 

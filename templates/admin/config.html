@@ -363,10 +363,11 @@
               {% if can_write %}
               <td class="px-4 py-2.5">
                 <div class="flex items-center justify-end gap-2">
-                  <button onclick="openEditHoliday({{ h.id }}, '{{ h.holiday_date }}', {{ h.name | tojson }}, '{{ h.holiday_type }}', {{ (h.custom_message or '') | tojson }})"
+                  <button data-holiday='{{ {"id": h.id, "date": h.holiday_date.isoformat(), "name": h.name, "type": h.holiday_type, "message": h.custom_message or ""} | tojson }}'
+                          onclick="openEditHolidayFromButton(this)"
                           class="text-slate-400 hover:text-blue-600 text-xs p-1"><i class="fas fa-edit"></i></button>
                   <form method="POST" action="{{ url_for('delete_holiday', hid=h.id) }}"
-                        onsubmit="return confirm('Remove {{ h.name }}?')">
+                        onsubmit="return confirm('Remove this holiday?')">
                     <button type="submit" class="text-slate-400 hover:text-red-600 text-xs p-1"><i class="fas fa-trash"></i></button>
                   </form>
                 </div>
@@ -1105,14 +1106,26 @@
         <div>
           <p class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Export / Download</p>
           <div class="space-y-2">
+            <a href="{{ url_for('export_operational_json') }}"
+               class="flex items-center gap-3 p-3 bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-300 rounded-xl transition-colors group">
+              <div class="w-9 h-9 bg-blue-500 rounded-lg flex items-center justify-center flex-shrink-0">
+                <i class="fas fa-file-shield text-white text-sm"></i>
+              </div>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-medium text-slate-800">Operational Export</p>
+                <p class="text-xs text-slate-500">Redacted — no users, credentials, contacts, or audit data</p>
+              </div>
+              <i class="fas fa-download text-slate-300 text-xs"></i>
+            </a>
+            {% if current_user.is_admin %}
             <a href="{{ url_for('export_json') }}"
                class="flex items-center gap-3 p-3 bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-300 rounded-xl transition-colors group">
               <div class="w-9 h-9 bg-blue-500 rounded-lg flex items-center justify-center flex-shrink-0">
                 <i class="fas fa-file-code text-white text-sm"></i>
               </div>
               <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium text-slate-800">Export as JSON</p>
-                <p class="text-xs text-slate-500">All tables — portable format</p>
+                <p class="text-sm font-medium text-slate-800">Encrypted Full Backup</p>
+                <p class="text-xs text-slate-500">Administrator-only disaster recovery</p>
               </div>
               <i class="fas fa-download text-slate-300 text-xs"></i>
             </a>
@@ -1122,8 +1135,8 @@
                 <i class="fas fa-file-lines text-white text-sm"></i>
               </div>
               <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium text-slate-800">Export as SQL</p>
-                <p class="text-xs text-slate-500">INSERT statements — universal</p>
+                <p class="text-sm font-medium text-slate-800">Encrypted SQL Export</p>
+                <p class="text-xs text-slate-500">Encrypted INSERT statements</p>
               </div>
               <i class="fas fa-download text-slate-300 text-xs"></i>
             </a>
@@ -1135,17 +1148,19 @@
                 <i class="fas fa-hard-drive text-white text-sm"></i>
               </div>
               <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium text-slate-800">Download SQLite File</p>
-                <p class="text-xs text-slate-500">Raw .db binary — SQLite only</p>
+                <p class="text-sm font-medium text-slate-800">Encrypted SQLite File</p>
+                <p class="text-xs text-slate-500">Encrypted database binary</p>
               </div>
               <i class="fas fa-download text-slate-300 text-xs"></i>
             </a>
+            {% endif %}
             {% endif %}
           </div>
         </div>
 
         <!-- Import -->
         <div>
+          {% if current_user.is_admin %}
           <p class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Import / Restore</p>
 
           <!-- File picker (hidden while progress is showing) -->
@@ -1153,9 +1168,9 @@
             <div class="border-2 border-dashed border-slate-200 rounded-xl p-4 text-center hover:border-orange-300 hover:bg-orange-50 transition-colors cursor-pointer"
                  onclick="document.getElementById('import-file').click()">
               <i class="fas fa-file-import text-2xl text-slate-300 mb-2"></i>
-              <p class="text-sm font-medium text-slate-600">Click to select JSON backup</p>
+              <p class="text-sm font-medium text-slate-600">Select encrypted full backup</p>
               <p class="text-xs text-slate-400 mt-1" id="import-filename">No file selected</p>
-              <input type="file" id="import-file" name="backup_file" accept=".json" class="hidden"
+              <input type="file" id="import-file" name="backup_file" accept=".bustrack" class="hidden"
                      onchange="document.getElementById('import-filename').textContent = this.files[0]?.name || 'No file selected'">
             </div>
             <div class="mt-3 p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-600">
@@ -1184,6 +1199,11 @@
             </div>
             <div id="import-error-box" class="hidden mt-3 p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-600"></div>
           </div>
+          {% else %}
+          <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-500">
+            Full restore is reserved for administrators. Operational exports remain available.
+          </div>
+          {% endif %}
         </div>
       </div>
     </div>
@@ -1216,6 +1236,11 @@ function openEditHoliday(id, date, name, type, message) {
   const card = document.getElementById('edit-holiday-card');
   card.classList.remove('hidden');
   card.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+
+function openEditHolidayFromButton(button) {
+  const holiday = JSON.parse(button.dataset.holiday);
+  openEditHoliday(holiday.id, holiday.date, holiday.name, holiday.type, holiday.message);
 }
 
 // Time format selector visual
@@ -1383,9 +1408,20 @@ async function checkSmtp() {
       const icon = s.ok === true ? 'fa-check-circle' : s.ok === false ? 'fa-times-circle' : 'fa-minus-circle';
       const row = document.createElement('div');
       row.className = 'flex items-start space-x-2 text-xs ' + ok;
-      row.innerHTML = `<i class="fas ${icon} mt-0.5 flex-shrink-0"></i>
-        <div><span class="font-medium">${s.label}</span>
-        ${s.detail ? `<p class="text-xs opacity-80 mt-0.5">${s.detail}</p>` : ''}</div>`;
+      const iconEl = document.createElement('i');
+      iconEl.className = `fas ${icon} mt-0.5 flex-shrink-0`;
+      const body = document.createElement('div');
+      const label = document.createElement('span');
+      label.className = 'font-medium';
+      label.textContent = s.label || '';
+      body.appendChild(label);
+      if (s.detail) {
+        const detail = document.createElement('p');
+        detail.className = 'text-xs opacity-80 mt-0.5';
+        detail.textContent = s.detail;
+        body.appendChild(detail);
+      }
+      row.append(iconEl, body);
       steps.appendChild(row);
     });
     if (json.ok) {
@@ -1395,7 +1431,9 @@ async function checkSmtp() {
       steps.appendChild(fin);
     }
   } catch (e) {
-    steps.innerHTML = `<p class="text-xs text-red-600">Network error: ${e.message}</p>`;
+    steps.replaceChildren(Object.assign(document.createElement('p'), {
+      className: 'text-xs text-red-600', textContent: 'Network error: ' + e.message
+    }));
   } finally {
     btn.disabled = false;
     btn.innerHTML = '<i class="fas fa-network-wired mr-1"></i>Run Diagnostics';
@@ -1556,7 +1594,10 @@ function loadStatus() {
       Object.entries(tables).sort((a,b) => a[0].localeCompare(b[0])).forEach(([t, c]) => {
         const badge = document.createElement('span');
         badge.className = 'inline-flex items-center gap-1 text-xs bg-slate-100 border border-slate-200 text-slate-600 px-2.5 py-1 rounded-lg font-mono';
-        badge.innerHTML = `<span class="font-semibold text-slate-800">${c}</span> ${t}`;
+        const count = document.createElement('span');
+        count.className = 'font-semibold text-slate-800';
+        count.textContent = String(c);
+        badge.replaceChildren(count, document.createTextNode(' ' + String(t)));
         tablesEl.appendChild(badge);
       });
 
@@ -1619,11 +1660,11 @@ function loadDeps() {
     .finally(() => { if (btn) btn.disabled = false; });
 }
 
-// ── IMPORT with SSE progress ──────────────────────────────────────────────────
+// ── Atomic encrypted restore ─────────────────────────────────────────────────
 function startImport() {
   const fileInput = document.getElementById('import-file');
   if (!fileInput.files.length) {
-    alert('Please select a JSON backup file first.');
+    alert('Please select an encrypted .bustrack backup first.');
     return;
   }
   if (!confirm('This will OVERWRITE all current data with the backup. Are you sure?')) return;
@@ -1647,47 +1688,25 @@ function startImport() {
         return;
       }
       const total = data.total;
-      document.getElementById('import-status-text').textContent = `Restoring ${total} tables…`;
-      const es = new EventSource('/admin/config/import-run/' + data.job_id);
-      es.onmessage = function(e) {
-        const d = JSON.parse(e.data);
-        if (d.error) { showImportError(d.error); es.close(); return; }
-        if (d.status === 'truncating') {
-          appendLog('⟳ Clearing existing data…', 'text-slate-400');
-          return;
-        }
-        if (d.done) {
-          es.close();
-          document.getElementById('import-bar').style.width = '100%';
-          document.getElementById('import-status-text').textContent = 'Complete';
-          document.getElementById('import-step-counter').textContent = '';
-          const errCount = (d.errors || []).length;
-          document.getElementById('import-done-msg').textContent =
-            `${d.restored} of ${d.total} tables restored successfully.` +
-            (errCount ? ` ${errCount} error(s) — see log above.` : '');
-          document.getElementById('import-done').classList.remove('hidden');
-          if (errCount) {
-            d.errors.forEach(err => appendLog('✗ ' + err, 'text-red-400'));
-          }
-          return;
-        }
-        // per-table progress
-        const pct = Math.round((d.step / total) * 100);
-        document.getElementById('import-bar').style.width = pct + '%';
-        document.getElementById('import-step-counter').textContent = `${d.step} / ${total}`;
-        document.getElementById('import-status-text').textContent = `Restoring: ${d.table}`;
-        if (d.ok) {
-          appendLog(`✓ ${d.table} — ${d.rows} row${d.rows !== 1 ? 's' : ''}`, 'text-green-400');
-        } else {
-          appendLog(`✗ ${d.table} — ${d.error}`, 'text-red-400');
-        }
-      };
-      es.onerror = function() {
-        es.close();
-        showImportError('Connection lost. Check server logs.');
-      };
+      document.getElementById('import-status-text').textContent = `Creating recovery snapshot and restoring ${total} tables atomically…`;
+      appendLog('✓ Backup authenticated and schema validated.', 'text-green-400');
+      document.getElementById('import-bar').style.width = '35%';
+      return fetch('/admin/config/import-run/' + encodeURIComponent(data.job_id), {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
+      }).then(async response => {
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || 'Restore failed.');
+        document.getElementById('import-bar').style.width = '100%';
+        document.getElementById('import-status-text').textContent = 'Complete';
+        document.getElementById('import-step-counter').textContent = `${result.restored} / ${result.total}`;
+        appendLog('✓ Pre-restore encrypted snapshot created.', 'text-green-400');
+        appendLog(`✓ ${result.restored} tables restored in one transaction.`, 'text-green-400');
+        document.getElementById('import-done-msg').textContent =
+          `${result.restored} tables restored successfully. Recovery snapshot: ${result.snapshot}`;
+        document.getElementById('import-done').classList.remove('hidden');
+      });
     })
-    .catch(err => showImportError('Network error: ' + err));
+    .catch(err => showImportError(err.message || 'Restore failed.'));
 }
 
 function appendLog(msg, colorClass) {

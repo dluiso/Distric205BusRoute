@@ -4,18 +4,23 @@
 # ============================================================
 
 from flask import (Flask, render_template, request, redirect, url_for,
-                   jsonify, flash, make_response, send_file, session, g)
+                   jsonify, flash, make_response, send_file, session, g, abort)
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from flask_mail import Mail, Message
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from functools import wraps
 from sqlalchemy import func
-import os, json, csv, io, pytz, re, threading, uuid, time, secrets, html, tempfile, math
-from collections import defaultdict
+from sqlalchemy.exc import IntegrityError
+from urllib.parse import urlsplit
+import hashlib, hmac, os, json, csv, io, pytz, re, threading, time, secrets, html, math, tempfile
+
+
+def _utcnow():
+    """Return naive UTC for compatibility with the application's existing DB columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -46,57 +51,108 @@ except ImportError:
 # ── APP SETUP ────────────────────────────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INSTANCE_DIR = os.path.realpath(os.environ.get('INSTANCE_DIR', os.path.join(BASE_DIR, 'instance')))
 
 # Load instance-level config (.env written by the install wizard or admin)
 try:
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(BASE_DIR, 'instance', '.env'), override=False)
+    load_dotenv(os.path.join(INSTANCE_DIR, '.env'), override=False)
 except ImportError:
     pass
 app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
+def _env_int(name, default, minimum=0, maximum=None):
+    """Read a bounded integer setting without accepting malformed configuration."""
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f'{name} must be an integer') from exc
+    if value < minimum or (maximum is not None and value > maximum):
+        raise RuntimeError(f'{name} is outside the allowed range')
+    return value
+
+
+# ProxyFix is disabled unless deployment explicitly declares trusted proxy hops.
+# This prevents arbitrary X-Forwarded-* headers from becoming security inputs.
+app.wsgi_app = ProxyFix(
+    app.wsgi_app,
+    x_for=_env_int('TRUSTED_PROXY_X_FOR', 0, 0, 5),
+    x_proto=_env_int('TRUSTED_PROXY_X_PROTO', 0, 0, 5),
+    x_host=_env_int('TRUSTED_PROXY_X_HOST', 0, 0, 5),
+)
 _secret = os.environ.get('SECRET_KEY', '')
+_secret_generated = False
 if not _secret or _secret == 'changeme-set-in-env':
-    _secret = secrets.token_hex(32)   # auto-generate for dev; wizard writes a real key
+    if os.environ.get('FLASK_ENV') == 'production':
+        raise RuntimeError('SECRET_KEY must be configured in production.')
+    _secret = secrets.token_hex(32)   # ephemeral development-only key
+    _secret_generated = True
 app.config['SECRET_KEY'] = _secret
 _db_url = os.environ.get('DATABASE_URL', f'sqlite:///{os.path.join(BASE_DIR, "bustrack.db")}')
 if _db_url.startswith('postgres://'):
     _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'static', 'uploads')
+app.config['UPLOAD_FOLDER'] = os.path.realpath(
+    os.environ.get('UPLOAD_FOLDER', os.path.join(BASE_DIR, 'static', 'uploads')))
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
 # Secure session cookies
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE']  = 'Lax'
 app.config['SESSION_COOKIE_SECURE']    = os.environ.get('FLASK_ENV') == 'production'
 app.config['PERMANENT_SESSION_LIFETIME'] = 86400  # 24 h
+app.config['LOGIN_RATE_LIMIT_ATTEMPTS'] = _env_int('LOGIN_RATE_LIMIT_ATTEMPTS', 5, 1, 100)
+app.config['LOGIN_RATE_LIMIT_WINDOW_SECONDS'] = _env_int('LOGIN_RATE_LIMIT_WINDOW_SECONDS', 300, 30, 86400)
+app.config['LOGIN_RATE_LIMIT_LOCK_SECONDS'] = _env_int('LOGIN_RATE_LIMIT_LOCK_SECONDS', 300, 30, 86400)
+app.config['RESTORE_JOB_TTL_SECONDS'] = _env_int('RESTORE_JOB_TTL_SECONDS', 1800, 60, 86400)
+app.config['RESTORE_SNAPSHOT_RETENTION_DAYS'] = _env_int(
+    'RESTORE_SNAPSHOT_RETENTION_DAYS', 30, 1, 3650)
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, 'static', 'exports'), exist_ok=True)
-os.makedirs(os.path.join(BASE_DIR, 'instance'), exist_ok=True)
+os.makedirs(INSTANCE_DIR, exist_ok=True)
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 mail = Mail(app)
 broadcast_jobs  = {}   # job_id -> {total, sent, failed, done, errors}
-_login_attempts = defaultdict(list)   # {ip: [epoch_timestamps]}
 
 # ── INSTALLATION LOCK ─────────────────────────────────────────────────────────
-INSTANCE_DIR   = os.path.join(BASE_DIR, 'instance')
 INSTALLED_FILE = os.path.join(INSTANCE_DIR, '.installed')
 
 def is_installed():
-    return os.path.exists(INSTALLED_FILE)
+    if os.path.exists(INSTALLED_FILE):
+        return True
+    # The database is authoritative if the filesystem marker is lost. This
+    # keeps setup closed instead of exposing a second administrator bootstrap.
+    try:
+        return db.session.query(User.id).first() is not None
+    except Exception:
+        db.session.rollback()
+        return False
 
 def _mark_installed():
     os.makedirs(INSTANCE_DIR, exist_ok=True)
-    with open(INSTALLED_FILE, 'w') as f:
+    with open(INSTALLED_FILE, 'w', encoding='utf-8') as f:
         f.write('installed')
+    os.chmod(INSTALLED_FILE, 0o600)
 
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico'}
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'ico'}
 def allowed_file(fn): return '.' in fn and fn.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def _csv_safe_cell(value):
+    """Neutralize spreadsheet formulas while preserving ordinary CSV values."""
+    if not isinstance(value, str):
+        return value
+    probe = value.lstrip(' \t\r\n\v\f')
+    return "'" + value if probe.startswith(('=', '+', '-', '@')) else value
+
+
+def _csv_safe_row(values):
+    return [_csv_safe_cell(value) for value in values]
 
 
 # ── MODELS ───────────────────────────────────────────────────────────────────
@@ -151,7 +207,7 @@ class OperationalSchedule(db.Model):
     start_time  = db.Column(db.String(5), nullable=False)       # HH:MM
     end_time    = db.Column(db.String(5), nullable=False)
     is_active   = db.Column(db.Boolean, default=True)
-    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at  = db.Column(db.DateTime, default=_utcnow)
 
 
 class Holiday(db.Model):
@@ -162,7 +218,7 @@ class Holiday(db.Model):
     is_recurring    = db.Column(db.Boolean, default=False)
     is_active       = db.Column(db.Boolean, default=True)
     custom_message  = db.Column(db.Text)   # displayed on public page on the holiday day
-    created_at      = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at      = db.Column(db.DateTime, default=_utcnow)
 
 
 class UserGroup(db.Model):
@@ -170,7 +226,7 @@ class UserGroup(db.Model):
     name        = db.Column(db.String(100), unique=True, nullable=False)
     description = db.Column(db.String(255))
     is_admin    = db.Column(db.Boolean, default=False)
-    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at  = db.Column(db.DateTime, default=_utcnow)
     users       = db.relationship('User', backref='group', lazy=True)
     permissions = db.relationship('GroupPermission', backref='group', lazy=True, cascade='all, delete-orphan')
 
@@ -204,7 +260,18 @@ class AuditLog(db.Model):
     target     = db.Column(db.String(200))
     details    = db.Column(db.Text)
     ip_address = db.Column(db.String(45))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+
+class LoginThrottle(db.Model):
+    """Database-backed login throttling shared by every application worker."""
+    id                = db.Column(db.Integer, primary_key=True)
+    throttle_key      = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    failed_count      = db.Column(db.Integer, nullable=False, default=0)
+    window_started_at = db.Column(db.DateTime, nullable=False, default=_utcnow)
+    locked_until      = db.Column(db.DateTime)
+    updated_at        = db.Column(db.DateTime, nullable=False, default=_utcnow,
+                                  onupdate=_utcnow, index=True)
 
 
 class User(UserMixin, db.Model):
@@ -222,7 +289,8 @@ class User(UserMixin, db.Model):
     receive_notifications = db.Column(db.Boolean, default=True)
     avatar_initials     = db.Column(db.String(4))
     active              = db.Column(db.Boolean, default=True)
-    created_at          = db.Column(db.DateTime, default=datetime.utcnow)
+    session_version     = db.Column(db.Integer, nullable=False, default=1)
+    created_at          = db.Column(db.DateTime, default=_utcnow)
     last_login          = db.Column(db.DateTime)
 
     @property
@@ -271,7 +339,7 @@ class IncidentType(db.Model):
     is_default  = db.Column(db.Boolean, default=False)   # On Time = default
     is_system   = db.Column(db.Boolean, default=False)   # Cannot delete
     sort_order  = db.Column(db.Integer, default=0)
-    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at  = db.Column(db.DateTime, default=_utcnow)
 
 
 class Bus(db.Model):
@@ -282,7 +350,7 @@ class Bus(db.Model):
     capacity     = db.Column(db.Integer)
     description  = db.Column(db.Text)
     active       = db.Column(db.Boolean, default=True)
-    created_at   = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at   = db.Column(db.DateTime, default=_utcnow)
     schedule_assignments = db.relationship('BusScheduleAssignment', backref='bus', lazy=True, cascade='all, delete-orphan')
     incident_records     = db.relationship('BusIncidentRecord', backref='bus', lazy=True)
     __table_args__ = (db.UniqueConstraint('identifier', 'name', name='uq_bus_identifier_name'),)
@@ -304,7 +372,7 @@ class DelayReason(db.Model):
     id         = db.Column(db.Integer, primary_key=True)
     reason     = db.Column(db.String(200), unique=True, nullable=False)
     sort_order = db.Column(db.Integer, default=0)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=_utcnow)
 
 
 class BusIncidentRecord(db.Model):
@@ -321,8 +389,8 @@ class BusIncidentRecord(db.Model):
     is_pending        = db.Column(db.Boolean, default=True)
     committed_at      = db.Column(db.DateTime)
     created_by_id     = db.Column(db.Integer, db.ForeignKey('user.id'))
-    created_at        = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at        = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at        = db.Column(db.DateTime, default=_utcnow)
+    updated_at        = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
     incident_type     = db.relationship('IncidentType')
     schedule_type     = db.relationship('BusScheduleType')
     delay_reason      = db.relationship('DelayReason')
@@ -334,7 +402,7 @@ class SubscriberGroup(db.Model):
     name            = db.Column(db.String(100), unique=True, nullable=False)
     description     = db.Column(db.String(200), default='')
     color           = db.Column(db.String(20), default='blue')
-    created_at      = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at      = db.Column(db.DateTime, default=_utcnow)
     subscribers     = db.relationship('NotificationSubscriber', backref='group', lazy=True)
     bus_assignments = db.relationship('GroupBusAssignment', backref='group',
                                       lazy=True, cascade='all, delete-orphan')
@@ -355,7 +423,7 @@ class NotificationSubscriber(db.Model):
     id          = db.Column(db.Integer, primary_key=True)
     notes       = db.Column(db.String(200))        # optional household label
     active      = db.Column(db.Boolean, default=True)
-    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at  = db.Column(db.DateTime, default=_utcnow)
     group_id    = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'), nullable=True)
     # Legacy columns — kept for DB compat, migrated to SubscriberContact on startup
     first_name  = db.Column(db.String(80))
@@ -405,7 +473,7 @@ class NotificationLog(db.Model):
     __tablename__ = 'notification_log'
     id                 = db.Column(db.Integer, primary_key=True)
     incident_record_id = db.Column(db.Integer, db.ForeignKey('bus_incident_record.id'), nullable=True)
-    sent_at            = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    sent_at            = db.Column(db.DateTime, default=_utcnow, index=True)
     channel            = db.Column(db.String(10), nullable=False)   # 'email' | 'sms'
     recipient_name     = db.Column(db.String(160))
     recipient_address  = db.Column(db.String(160))                  # email or phone
@@ -422,7 +490,12 @@ class NotificationLog(db.Model):
 
 
 @login_manager.user_loader
-def load_user(uid): return User.query.get(int(uid))
+def load_user(uid):
+    try:
+        user = db.session.get(User, int(uid))
+    except (TypeError, ValueError):
+        return None
+    return user if user and user.active else None
 
 
 # ── JINJA2 GLOBALS ───────────────────────────────────────────────────────────
@@ -562,13 +635,14 @@ def _migrate_add_columns():
         ('configuration',           'twilio_from_number',     "VARCHAR(20) DEFAULT ''"),
         ('configuration',           'twilio_sms_cost_per_seg','REAL DEFAULT 0.0079'),
         ('group_bus_assignment',    'schedule_type_id',       'INTEGER'),
+        ('user',                    'session_version',        'INTEGER NOT NULL DEFAULT 1'),
     ]
     # Use a separate connection per column so a failed ALTER TABLE (column already
     # exists) never leaves a shared connection in an aborted-transaction state.
     for table, col, coltype in cols:
         try:
             with db.engine.connect() as conn:
-                conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {col} {coltype}'))
+                conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {coltype}'))
                 conn.commit()
         except Exception:
             pass  # column already exists — safe to ignore
@@ -697,8 +771,18 @@ def init_db():
     _seed_defaults()
     _migrate_subscriber_contacts()
 
+    from sqlalchemy import inspect as sa_inspect
+    inspector = sa_inspect(db.engine)
+    user_columns = {column['name'] for column in inspector.get_columns('user')}
+    throttle_columns = ({column['name'] for column in inspector.get_columns('login_throttle')}
+                        if 'login_throttle' in inspector.get_table_names() else set())
+    if 'session_version' not in user_columns or not {
+            'throttle_key', 'failed_count', 'window_started_at', 'locked_until'
+    }.issubset(throttle_columns):
+        raise RuntimeError('Security schema migration did not complete; refusing to start.')
+
     # Auto-detect existing installations: if users exist but no lock file, create it.
-    if not is_installed() and User.query.count() > 0:
+    if not os.path.exists(INSTALLED_FILE) and User.query.count() > 0:
         _mark_installed()
 
 
@@ -813,34 +897,62 @@ def bus_list_today(period=None, admin=False):
                        'current_period': current_period})
     return result
 
+SMTP_PRESET_SERVERS = {
+    'office365': 'smtp.office365.com',
+    'google': 'smtp.gmail.com',
+}
+
+
+def _smtp_allowed_hosts():
+    configured = {host.strip().lower().rstrip('.') for host in
+                  os.environ.get('SMTP_ALLOWED_HOSTS', '').split(',') if host.strip()}
+    return configured | set(SMTP_PRESET_SERVERS.values())
+
+
+def _validated_smtp_host(provider, server):
+    if provider not in {'custom', *SMTP_PRESET_SERVERS.keys()}:
+        raise ValueError('Unsupported mail provider.')
+    host = (SMTP_PRESET_SERVERS.get(provider) or server or '').strip().lower().rstrip('.')
+    if not host or not re.fullmatch(r'(?=.{1,253}$)[A-Za-z0-9.-]+', host):
+        raise ValueError('A valid SMTP server hostname is required.')
+    if host not in _smtp_allowed_hosts():
+        raise ValueError('SMTP server is not in SMTP_ALLOWED_HOSTS.')
+    return host
+
+
+def _validated_smtp_port(value):
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('SMTP port must be numeric.') from exc
+    if not 1 <= port <= 65535:
+        raise ValueError('SMTP port is outside the valid range.')
+    return port
+
+
 def configure_mail(cfg, override=None):
     """Apply SMTP settings to Flask-Mail. Pass override dict to use custom values without DB save.
 
     Flask-Mail caches its state in app.extensions['mail'] at startup, so we must call
     mail.init_app(app) after every app.config.update() to force it to reload.
     """
-    # Presets supply the server hostname; port/security can be overridden by the user
-    PRESET_SERVERS = {
-        'office365': 'smtp.office365.com',
-        'google':    'smtp.gmail.com',
-    }
     o = override or {}
     provider = o.get('provider', cfg.mail_provider)
 
     if override:
         # Live test: use form values; derive server from preset if applicable
-        srv  = PRESET_SERVERS.get(provider) or o.get('server', cfg.mail_server) or ''
-        port = int(o.get('port', None) or cfg.mail_port or 587)
+        srv  = _validated_smtp_host(provider, o.get('server', cfg.mail_server))
+        port = _validated_smtp_port(o.get('port', None) or cfg.mail_port or 587)
         tls  = bool(o.get('use_tls', cfg.mail_use_tls))
         ssl  = bool(o.get('use_ssl', getattr(cfg, 'mail_use_ssl', False)))
         username   = o.get('username',   cfg.mail_username) or ''
-        password   = o.get('password',   '') or cfg.mail_password or ''
+        password   = o.get('password', '') or ''
         from_email = o.get('from_email', cfg.mail_from_email) or ''
         from_name  = o.get('from_name',  cfg.mail_from_name)  or 'Bus Tracker'
     else:
         # Normal send: use DB values; derive server from preset if applicable
-        srv  = PRESET_SERVERS.get(cfg.mail_provider) or cfg.mail_server or ''
-        port = cfg.mail_port or 587
+        srv  = _validated_smtp_host(cfg.mail_provider, cfg.mail_server)
+        port = _validated_smtp_port(cfg.mail_port or 587)
         tls  = bool(cfg.mail_use_tls)
         ssl  = bool(getattr(cfg, 'mail_use_ssl', False))
         username   = cfg.mail_username   or ''
@@ -880,6 +992,18 @@ def require_module(module_key, level='limited'):
     return decorator
 
 
+def require_admin(f):
+    """Reserve identity, secret, and disaster-recovery operations for admins."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login', next=request.url))
+        if not current_user.is_admin:
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated
+
+
 # ── AUDIT HELPER ─────────────────────────────────────────────────────────────
 
 def _audit(action, module, target='', details=''):
@@ -905,14 +1029,14 @@ def commit_pending_incidents():
         try:
             cfg = Configuration.query.first()
             delay = cfg.commit_delay_min if cfg else 5
-            cutoff = datetime.utcnow() - timedelta(minutes=delay)
+            cutoff = _utcnow() - timedelta(minutes=delay)
             pending = BusIncidentRecord.query.filter(
                 BusIncidentRecord.is_pending == True,
                 BusIncidentRecord.created_at <= cutoff
             ).all()
             for rec in pending:
                 rec.is_pending = False
-                rec.committed_at = datetime.utcnow()
+                rec.committed_at = _utcnow()
                 _send_bus_notifications(rec)
             if pending:
                 db.session.commit()
@@ -1051,7 +1175,7 @@ def _start_scheduler_once():
     """Start the scheduler in only ONE gunicorn worker using a file lock.
     Falls back to unconditional start on Windows (dev) where fcntl is unavailable."""
     global _sched_lock_fh
-    if not SCHEDULER_AVAILABLE:
+    if not SCHEDULER_AVAILABLE or os.environ.get('DISABLE_SCHEDULER') == '1':
         return
     sched = BackgroundScheduler(daemon=True)
     sched.add_job(commit_pending_incidents, 'interval', minutes=1, id='commit_pending')
@@ -1085,7 +1209,18 @@ def pre_request_checks():
         if not is_installed():
             return redirect(url_for('install_wizard'))
 
-    # 2. CSRF validation on all admin state-changing requests
+    # 2. Revalidate account state and the session generation on every request.
+    if current_user.is_authenticated:
+        expected_version = int(current_user.session_version or 1)
+        if (not current_user.active or
+                session.get('session_version') != expected_version):
+            logout_user()
+            session.clear()
+            if request.path.startswith('/admin/'):
+                flash('Your session is no longer valid. Please sign in again.', 'error')
+                return redirect(url_for('login'))
+
+    # 3. CSRF validation on all admin state-changing requests
     if request.path.startswith('/admin/') and request.method == 'POST':
         token  = request.form.get('_csrf') or request.headers.get('X-CSRF-Token', '')
         stored = session.get('_csrf', '')
@@ -1100,6 +1235,9 @@ def security_headers(resp):
     resp.headers['X-XSS-Protection']        = '1; mode=block'
     resp.headers['Referrer-Policy']         = 'strict-origin-when-cross-origin'
     resp.headers['Permissions-Policy']      = 'geolocation=(), microphone=(), camera=()'
+    if request.path.startswith('/static/uploads/') and request.path.lower().endswith('.svg'):
+        resp.headers['Content-Disposition'] = 'attachment'
+        resp.headers['Content-Security-Policy'] = "sandbox; default-src 'none'"
     return resp
 
 
@@ -1130,58 +1268,86 @@ def health():
 @app.route('/install')
 def install_wizard():
     if is_installed():
-        return redirect(url_for('login'))
-    return render_template('install/wizard.html')
+        abort(404)
+    database_label = db.engine.url.get_backend_name().replace('postgresql', 'PostgreSQL').replace('sqlite', 'SQLite')
+    return render_template('install/wizard.html',
+                           install_ready=bool(os.environ.get('INSTALL_TOKEN', '').strip()),
+                           database_label=database_label)
+
+
+def _install_token_valid(data=None):
+    """Fail closed unless the operator supplied the server-side bootstrap token."""
+    expected = os.environ.get('INSTALL_TOKEN', '').strip()
+    supplied = request.headers.get('X-Install-Token', '').strip()
+    if not supplied and isinstance(data, dict):
+        supplied = str(data.get('install_token', '')).strip()
+    return bool(expected and supplied and
+                secrets.compare_digest(expected.encode('utf-8'), supplied.encode('utf-8')))
+
+
+def _install_guard(data=None):
+    if is_installed():
+        abort(404)
+    if not os.environ.get('INSTALL_TOKEN', '').strip():
+        return jsonify({'ok': False, 'message':
+                        'Installation is locked. Configure INSTALL_TOKEN and restart the service.'}), 503
+    if not _install_token_valid(data):
+        return jsonify({'ok': False, 'message': 'Invalid installation authorization.'}), 403
+    return None
 
 
 @app.route('/install/test-db', methods=['POST'])
 def install_test_db():
-    """AJAX: test a DB connection using sqlalchemy without changing the running app."""
-    from sqlalchemy import create_engine, text as sa_text
+    """Test only the server-configured database; caller input cannot select a destination."""
+    from sqlalchemy import text as sa_text
     data   = request.get_json(silent=True) or {}
-    db_url = _build_db_url(data)
-    if not db_url:
-        return jsonify({'ok': False, 'message': 'Invalid database configuration.'})
+    denied = _install_guard(data)
+    if denied:
+        return denied
     try:
-        engine = create_engine(db_url, connect_args={'connect_timeout': 5} if 'postgresql' in db_url else {})
-        with engine.connect() as conn:
+        with db.engine.connect() as conn:
             conn.execute(sa_text('SELECT 1'))
         return jsonify({'ok': True, 'message': 'Connection successful.'})
-    except Exception as e:
-        return jsonify({'ok': False, 'message': str(e)})
+    except Exception:
+        return jsonify({'ok': False, 'message':
+                        'Connection failed. Verify the approved database settings and server logs.'}), 400
 
 
 @app.route('/install/run', methods=['POST'])
 def install_run():
-    if is_installed():
-        return jsonify({'ok': False, 'message': 'Already installed.'})
-
     data     = request.get_json(silent=True) or {}
-    username = data.get('username', '').strip()
-    password = data.get('password', '').strip()
-    email    = data.get('email', '').strip() or None
+    denied = _install_guard(data)
+    if denied:
+        return denied
+    username_value = data.get('username', '')
+    password_value = data.get('password', '')
+    email_value = data.get('email', '')
+    username = username_value.strip() if isinstance(username_value, str) else ''
+    password = password_value if isinstance(password_value, str) else ''
+    email = email_value.strip() if isinstance(email_value, str) else ''
+    email = email or None
 
     # Validate admin credentials
-    if not username or len(username) < 3:
-        return jsonify({'ok': False, 'message': 'Username must be at least 3 characters.'})
-    if not password or len(password) < 8:
-        return jsonify({'ok': False, 'message': 'Password must be at least 8 characters.'})
+    if not 3 <= len(username) <= 80 or not re.fullmatch(r'[A-Za-z0-9_.-]+', username):
+        return jsonify({'ok': False, 'message':
+                        'Username must be 3–80 characters using letters, numbers, dots, hyphens or underscores.'}), 400
+    if not 12 <= len(password) <= 1024:
+        return jsonify({'ok': False, 'message': 'Password must be 12–1024 characters.'}), 400
+    if email and (len(email) > 120 or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email)):
+        return jsonify({'ok': False, 'message': 'Enter a valid email address.'}), 400
+
+    install_lock = os.path.join(INSTANCE_DIR, '.installing')
+    try:
+        lock_fd = os.open(install_lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(lock_fd, str(os.getpid()).encode('ascii'))
+    except FileExistsError:
+        return jsonify({'ok': False, 'message': 'Installation is already in progress.'}), 409
 
     try:
-        # Write instance/.env (DB URL + SECRET_KEY) if provided
-        db_data = data.get('db', {})
-        new_db_url = _build_db_url(db_data) if db_data.get('type') else None
-        secret_key = secrets.token_hex(32)
-        _write_instance_env(secret_key, new_db_url)
-
-        # Re-apply SECRET_KEY immediately
-        app.config['SECRET_KEY'] = secret_key
-
-        # If DB changed, reinitialize engine
-        if new_db_url and new_db_url != app.config['SQLALCHEMY_DATABASE_URI']:
-            app.config['SQLALCHEMY_DATABASE_URI'] = new_db_url
-            with app.app_context():
-                db.engine.dispose()
+        # Persist only a development-generated session key. Explicit deployment
+        # configuration remains owned by the operator and is never rewritten here.
+        if _secret_generated:
+            _write_instance_env(app.config['SECRET_KEY'])
 
         # Create all tables and default data
         db.create_all()
@@ -1201,36 +1367,71 @@ def install_run():
 
         _mark_installed()
         return jsonify({'ok': True, 'message': 'Installation complete. Redirecting to login…'})
-    except Exception as e:
+    except (ValueError, TypeError) as e:
         db.session.rollback()
-        return jsonify({'ok': False, 'message': f'Installation failed: {str(e)}'})
+        return jsonify({'ok': False, 'message': str(e)}), 400
+    except Exception:
+        db.session.rollback()
+        return jsonify({'ok': False, 'message':
+                        'Installation failed. Review the server log; no installation lock was created.'}), 500
+    finally:
+        os.close(lock_fd)
+        try:
+            os.remove(install_lock)
+        except FileNotFoundError:
+            pass
 
 
-def _build_db_url(d):
-    """Build a SQLAlchemy DB URL from wizard form data dict."""
-    db_type = d.get('type', 'sqlite')
-    if db_type == 'sqlite':
-        path = d.get('path') or os.path.join(BASE_DIR, 'bustrack.db')
-        return f'sqlite:///{path}'
-    if db_type == 'postgresql':
-        host = d.get('host', 'localhost')
-        port = int(d.get('port') or 5432)
-        name = d.get('name', 'bustrack')
-        user = d.get('user', '')
-        pwd  = d.get('password', '')
-        return f'postgresql://{user}:{pwd}@{host}:{port}/{name}'
-    return None
-
-
-def _write_instance_env(secret_key, db_url=None):
-    """Persist SECRET_KEY (and optionally DATABASE_URL) to instance/.env."""
+def _write_instance_env(secret_key):
+    """Atomically persist one setting without discarding existing instance config."""
     os.makedirs(INSTANCE_DIR, exist_ok=True)
     env_path = os.path.join(INSTANCE_DIR, '.env')
-    lines = [f'SECRET_KEY={secret_key}\n']
-    if db_url:
-        lines.append(f'DATABASE_URL={db_url}\n')
-    with open(env_path, 'w') as f:
-        f.writelines(lines)
+    existing_lines = []
+    try:
+        with open(env_path, 'r', encoding='utf-8') as current:
+            existing_lines = current.readlines()
+    except FileNotFoundError:
+        pass
+
+    replacement = f'SECRET_KEY={json.dumps(secret_key)}\n'
+    updated_lines = []
+    replaced = False
+    setting_pattern = re.compile(r'^\s*(?:export\s+)?SECRET_KEY\s*=')
+    for line in existing_lines:
+        if setting_pattern.match(line):
+            if not replaced:
+                updated_lines.append(replacement)
+                replaced = True
+            continue
+        updated_lines.append(line)
+    if not replaced:
+        if updated_lines and not updated_lines[-1].endswith(('\n', '\r')):
+            updated_lines[-1] += '\n'
+        updated_lines.append(replacement)
+
+    temp_fd, temp_path = tempfile.mkstemp(prefix='.env.', dir=INSTANCE_DIR, text=True)
+    try:
+        os.fchmod(temp_fd, 0o600)
+        with os.fdopen(temp_fd, 'w', encoding='utf-8') as temp_file:
+            temp_fd = None
+            temp_file.writelines(updated_lines)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, env_path)
+        os.chmod(env_path, 0o600)
+        dir_fd = os.open(INSTANCE_DIR, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _seed_defaults():
@@ -1357,36 +1558,101 @@ def api_buses():
 
 # ── AUTH ROUTES ───────────────────────────────────────────────────────────────
 
+def _login_throttle_key(ip, identifier):
+    material = f'{ip}\0{identifier.casefold()}'.encode('utf-8', 'replace')
+    return hmac.new(app.config['SECRET_KEY'].encode('utf-8'), material,
+                    hashlib.sha256).hexdigest()
+
+
+def _login_throttle_state(ip, identifier):
+    key = _login_throttle_key(ip, identifier)
+    record = LoginThrottle.query.filter_by(throttle_key=key).first()
+    now = _utcnow()
+    if record and record.locked_until and record.locked_until > now:
+        return record, True
+    return record, False
+
+
+def _record_login_failure(ip, identifier):
+    key = _login_throttle_key(ip, identifier)
+    now = _utcnow()
+    window = timedelta(seconds=app.config['LOGIN_RATE_LIMIT_WINDOW_SECONDS'])
+    lock_for = timedelta(seconds=app.config['LOGIN_RATE_LIMIT_LOCK_SECONDS'])
+    stale_before = now - max(window, lock_for) * 2
+    LoginThrottle.query.filter(LoginThrottle.updated_at < stale_before).delete(
+        synchronize_session=False)
+    record = LoginThrottle.query.filter_by(throttle_key=key).with_for_update().first()
+    if not record:
+        record = LoginThrottle(throttle_key=key, failed_count=0,
+                               window_started_at=now)
+        db.session.add(record)
+    elif now - record.window_started_at >= window:
+        record.failed_count = 0
+        record.window_started_at = now
+        record.locked_until = None
+    record.failed_count += 1
+    if record.failed_count >= app.config['LOGIN_RATE_LIMIT_ATTEMPTS']:
+        record.locked_until = now + lock_for
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # A concurrent worker created the same key. Retry against that row.
+        db.session.rollback()
+        record = LoginThrottle.query.filter_by(throttle_key=key).with_for_update().one()
+        if now - record.window_started_at >= window:
+            record.failed_count = 0
+            record.window_started_at = now
+        record.failed_count += 1
+        if record.failed_count >= app.config['LOGIN_RATE_LIMIT_ATTEMPTS']:
+            record.locked_until = now + lock_for
+        db.session.commit()
+
+
+def _clear_login_failures(ip, identifier):
+    key = _login_throttle_key(ip, identifier)
+    LoginThrottle.query.filter_by(throttle_key=key).delete()
+    db.session.commit()
+
+
+def _safe_local_redirect(target):
+    if not target:
+        return None
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc or not target.startswith('/') or target.startswith('//'):
+        return None
+    return target
+
 @app.route('/admin/login', methods=['GET', 'POST'])
 def login():
     if current_user.is_authenticated:
         return redirect(url_for('dashboard'))
     if request.method == 'POST':
         ip  = request.remote_addr or '0.0.0.0'
-        now = time.time()
-        # Purge attempts older than 5 minutes, then enforce limit
-        _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < 300]
-        if len(_login_attempts[ip]) >= 5:
-            flash('Too many failed attempts. Please wait 5 minutes and try again.', 'error')
-            return render_template('admin/login.html')
-
         identifier = request.form.get('username', '').strip()
+        _, locked = _login_throttle_state(ip, identifier)
+        if locked:
+            wait_minutes = math.ceil(app.config['LOGIN_RATE_LIMIT_LOCK_SECONDS'] / 60)
+            flash(f'Too many failed attempts. Please wait {wait_minutes} minute(s) and try again.', 'error')
+            return render_template('admin/login.html'), 429
+
         password   = request.form.get('password', '')
         user = User.query.filter_by(username=identifier).first()
         if not user:
             user = User.query.filter_by(email=identifier, use_email_auth=True).first()
         if user and user.check_password(password) and user.active:
-            _login_attempts[ip].clear()
+            _clear_login_failures(ip, identifier)
             login_user(user)
-            user.last_login = datetime.utcnow()
+            session['session_version'] = int(user.session_version or 1)
+            session.permanent = True
+            user.last_login = _utcnow()
             db.session.commit()
             _audit('login', 'auth', user.username)
             # Prevent open-redirect: only allow relative next URLs
-            next_url = request.args.get('next', '')
-            if next_url and next_url.startswith('/'):
+            next_url = _safe_local_redirect(request.args.get('next', ''))
+            if next_url:
                 return redirect(next_url)
             return redirect(url_for('dashboard'))
-        _login_attempts[ip].append(now)
+        _record_login_failure(ip, identifier)
         _audit('login_failed', 'auth', identifier or '(empty)')
         flash('Invalid credentials. Please try again.', 'error')
     return render_template('admin/login.html')
@@ -1487,10 +1753,10 @@ def dashboard():
         buses_today=buses_today,
         recent=recent, period=period,
         date_from=d_from.isoformat(), date_to=d_to.isoformat(),
-        by_type_json=json.dumps(by_type),
-        by_type_colors_json=json.dumps(list(by_type_colors.values())),
-        by_bus_json=json.dumps(by_bus),
-        by_day_json=json.dumps(by_day),
+        by_type_json=by_type,
+        by_type_colors_json=list(by_type_colors.values()),
+        by_bus_json=by_bus,
+        by_day_json=by_day,
         incident_types=incident_types, all_buses=all_buses,
         today=today,
     )
@@ -1660,9 +1926,14 @@ def add_incident_type():
     if IncidentType.query.filter_by(name=name).first():
         flash(f'"{name}" already exists.', 'error')
         return redirect(url_for('incidents'))
-    it = IncidentType(name=name, color=request.form.get('color', '#6b7280'),
-                      icon=request.form.get('icon', 'fa-circle'),
-                      description=request.form.get('description', '').strip() or None)
+    color = request.form.get('color', '#6b7280').strip()
+    icon = request.form.get('icon', 'fa-circle').strip()
+    description = request.form.get('description', '').strip() or None
+    if (len(name) > 100 or not re.fullmatch(r'#[0-9A-Fa-f]{6}', color) or
+            not re.fullmatch(r'fa-[a-z0-9-]{1,47}', icon) or
+            (description and len(description) > 255)):
+        abort(400)
+    it = IncidentType(name=name, color=color, icon=icon, description=description)
     db.session.add(it)
     db.session.commit()
     flash(f'Status type "{name}" created.', 'success')
@@ -1673,10 +1944,18 @@ def add_incident_type():
 @require_module('incidents', 'full')
 def edit_incident_type(type_id):
     it = IncidentType.query.get_or_404(type_id)
-    it.name        = request.form.get('name', it.name).strip()
-    it.color       = request.form.get('color', it.color)
-    it.icon        = request.form.get('icon', it.icon)
-    it.description = request.form.get('description', '').strip() or None
+    name = request.form.get('name', it.name).strip()
+    color = request.form.get('color', it.color).strip()
+    icon = request.form.get('icon', it.icon).strip()
+    description = request.form.get('description', '').strip() or None
+    if (not name or len(name) > 100 or not re.fullmatch(r'#[0-9A-Fa-f]{6}', color) or
+            not re.fullmatch(r'fa-[a-z0-9-]{1,47}', icon) or
+            (description and len(description) > 255)):
+        abort(400)
+    it.name = name
+    it.color = color
+    it.icon = icon
+    it.description = description
     db.session.commit()
     flash('Status type updated.', 'success')
     return redirect(url_for('incidents'))
@@ -1814,14 +2093,19 @@ def statistics():
     all_types  = IncidentType.query.order_by(IncidentType.sort_order).all()
     can_export = current_user.has_access('statistics', 'limited')
 
-    # ── Notification Log stats ─────────────────────────────────────────────
-    notif_q = NotificationLog.query.filter(
-        NotificationLog.sent_at >= datetime.combine(d_from, datetime.min.time()),
-        NotificationLog.sent_at <= datetime.combine(d_to,   datetime.max.time()),
-    )
-    if bus_id:
-        notif_q = notif_q.filter_by(bus_id=bus_id)
-    notif_logs = notif_q.order_by(NotificationLog.sent_at.desc()).all()
+    # Notification delivery data contains parent/contact PII and belongs to the
+    # notifications capability even when displayed alongside statistics.
+    can_view_notifications = current_user.has_access('notifications', 'limited')
+    can_delete_notifications = current_user.has_access('notifications', 'full')
+    notif_logs = []
+    if can_view_notifications:
+        notif_q = NotificationLog.query.filter(
+            NotificationLog.sent_at >= datetime.combine(d_from, datetime.min.time()),
+            NotificationLog.sent_at <= datetime.combine(d_to,   datetime.max.time()),
+        )
+        if bus_id:
+            notif_q = notif_q.filter_by(bus_id=bus_id)
+        notif_logs = notif_q.order_by(NotificationLog.sent_at.desc()).all()
 
     notif_by_channel = {}; notif_by_day = {}; notif_by_group = {}
     notif_sent = 0; notif_failed = 0; notif_total_cost = 0.0
@@ -1847,28 +2131,30 @@ def statistics():
         records=records, period=period,
         date_from=d_from.isoformat(), date_to=d_to.isoformat(),
         bus_id=bus_id, type_id=type_id,
-        by_type_json=json.dumps(by_type),
-        by_type_colors_json=json.dumps(list(by_type_colors.values())),
-        by_bus_json=json.dumps(by_bus),
-        by_day_json=json.dumps(by_day),
-        avg_delay_json=json.dumps(avg_delay_final),
-        period_bus_json=json.dumps(period_bus_data),
-        record_buses_json=json.dumps(record_buses),
-        bus_audit_json=json.dumps(bus_audit),
-        audit_datasets_json=json.dumps(audit_datasets),
-        audit_bus_order_json=json.dumps(audit_bus_order),
+        by_type_json=by_type,
+        by_type_colors_json=list(by_type_colors.values()),
+        by_bus_json=by_bus,
+        by_day_json=by_day,
+        avg_delay_json=avg_delay_final,
+        period_bus_json=period_bus_data,
+        record_buses_json=record_buses,
+        bus_audit_json=bus_audit,
+        audit_datasets_json=audit_datasets,
+        audit_bus_order_json=audit_bus_order,
         default_type_name=(default_type.name if default_type else 'On Time'),
         total_days_in_range=total_days_in_range,
         total=len(records), all_buses=all_buses, all_types=all_types,
         can_export=can_export, can_write=current_user.has_access('statistics', 'full'),
         today=today,
         notif_logs=notif_logs,
-        notif_by_channel_json=json.dumps(notif_by_channel),
-        notif_by_day_json=json.dumps(notif_by_day),
-        notif_by_group_json=json.dumps(notif_by_group),
+        notif_by_channel_json=notif_by_channel,
+        notif_by_day_json=notif_by_day,
+        notif_by_group_json=notif_by_group,
         notif_sent=notif_sent, notif_failed=notif_failed,
         notif_email_sent=notif_email_sent, notif_sms_sent=notif_sms_sent,
         notif_total_cost=notif_total_cost,
+        can_view_notifications=can_view_notifications,
+        can_delete_notifications=can_delete_notifications,
     )
 
 def _parse_period(period, d_from_s, d_to_s, today):
@@ -1937,13 +2223,15 @@ def export_statistics(fmt):
                            total_days_exp, ot_d, inc_d, rate, avg_d, sum(bdel)])
 
     # ── Notification log for general export ──────────────────────────────────
-    notif_exp_q = NotificationLog.query.filter(
-        NotificationLog.sent_at >= datetime.combine(d_from, datetime.min.time()),
-        NotificationLog.sent_at <= datetime.combine(d_to,   datetime.max.time()),
-    )
-    if bus_id:
-        notif_exp_q = notif_exp_q.filter_by(bus_id=bus_id)
-    notif_exp = notif_exp_q.order_by(NotificationLog.sent_at.desc()).all()
+    notif_exp = []
+    if current_user.has_access('notifications', 'limited'):
+        notif_exp_q = NotificationLog.query.filter(
+            NotificationLog.sent_at >= datetime.combine(d_from, datetime.min.time()),
+            NotificationLog.sent_at <= datetime.combine(d_to,   datetime.max.time()),
+        )
+        if bus_id:
+            notif_exp_q = notif_exp_q.filter_by(bus_id=bus_id)
+        notif_exp = notif_exp_q.order_by(NotificationLog.sent_at.desc()).all()
     notif_headers = ['Sent At (UTC)', 'Channel', 'Bus', 'Recipient', 'Address',
                      'Group', 'Status', 'SMS SID', 'Segments', 'Cost (USD)', 'Error']
     notif_rows = [[
@@ -1959,15 +2247,15 @@ def export_statistics(fmt):
         output = io.StringIO()
         w = csv.writer(output)
         w.writerow(headers)
-        w.writerows(rows)
+        w.writerows(_csv_safe_row(row) for row in rows)
         w.writerow([])
         w.writerow(['Bus Audit Summary'])
         w.writerow(audit_headers)
-        w.writerows(audit_rows)
+        w.writerows(_csv_safe_row(row) for row in audit_rows)
         w.writerow([])
         w.writerow(['Notification Log'])
         w.writerow(notif_headers)
-        w.writerows(notif_rows)
+        w.writerows(_csv_safe_row(row) for row in notif_rows)
         resp = make_response(output.getvalue())
         resp.headers['Content-Type'] = 'text/csv'
         resp.headers['Content-Disposition'] = f'attachment; filename="bus_report_{d_from}_{d_to}.csv"'
@@ -2211,6 +2499,8 @@ def reset_statistics():
         return redirect(url_for('statistics'))
 
     include_notifs = request.form.get('include_notifications') == '1'
+    if include_notifs and not current_user.has_access('notifications', 'full'):
+        abort(403)
 
     # Collect the incident IDs that will be deleted
     incident_ids = [r.id for r in BusIncidentRecord.query.filter(
@@ -2256,6 +2546,7 @@ def reset_statistics():
 @app.route('/admin/statistics/export/notifications')
 @login_required
 @require_module('statistics', 'limited')
+@require_module('notifications', 'limited')
 def export_notification_stats():
     today    = date.today()
     period   = request.args.get('period', 'today')
@@ -2277,7 +2568,7 @@ def export_notification_stats():
     w.writerow(['Sent At (UTC)', 'Channel', 'Bus', 'Recipient', 'Address',
                 'Group', 'Status', 'SMS SID', 'Segments', 'Cost (USD)', 'Error'])
     for nl in logs:
-        w.writerow([
+        w.writerow(_csv_safe_row([
             nl.sent_at.strftime('%Y-%m-%d %H:%M:%S'),
             nl.channel, nl.bus_label or '',
             nl.recipient_name or '', nl.recipient_address or '',
@@ -2285,7 +2576,7 @@ def export_notification_stats():
             nl.sms_sid or '', nl.sms_segments or '',
             f'{nl.sms_cost_usd:.6f}' if nl.sms_cost_usd else '',
             nl.error_message or '',
-        ])
+        ]))
     resp = make_response(output.getvalue())
     resp.headers['Content-Type'] = 'text/csv'
     resp.headers['Content-Disposition'] = (
@@ -2296,14 +2587,62 @@ def export_notification_stats():
 
 # ── USERS MODULE ──────────────────────────────────────────────────────────────
 
+_ACCESS_RANK = {'none': 0, 'limited': 1, 'full': 2}
+
+
+def _group_access_level(group, module_key):
+    if group.is_admin:
+        return 'full'
+    perm = GroupPermission.query.filter_by(group_id=group.id, module_key=module_key).first()
+    return perm.access_level if perm and perm.access_level in _ACCESS_RANK else 'none'
+
+
+def _can_assign_group(actor, group):
+    if not group:
+        return True
+    if actor.is_admin:
+        return True
+    if group.is_admin:
+        return False
+    return all(_ACCESS_RANK[_group_access_level(group, mod['key'])] <=
+               _ACCESS_RANK['full' if actor.has_access(mod['key'], 'full') else
+                            'limited' if actor.has_access(mod['key'], 'limited') else 'none']
+               for mod in MODULES)
+
+
+def _requested_group(group_id):
+    if not group_id:
+        return None
+    group = db.session.get(UserGroup, group_id)
+    if not group:
+        abort(400)
+    if not _can_assign_group(current_user, group):
+        abort(403)
+    return group
+
+
+def _requested_permission_level(module_key):
+    level = request.form.get(f'perm_{module_key}', 'none')
+    if level not in _ACCESS_RANK:
+        abort(400)
+    if current_user.is_admin:
+        return level
+    actor_level = ('full' if current_user.has_access(module_key, 'full') else
+                   'limited' if current_user.has_access(module_key, 'limited') else 'none')
+    if _ACCESS_RANK[level] > _ACCESS_RANK[actor_level]:
+        abort(403)
+    return level
+
 @app.route('/admin/users')
 @login_required
 @require_module('users')
 def users():
     all_users  = User.query.order_by(User.username).all()
     all_groups = UserGroup.query.order_by(UserGroup.name).all()
+    assignable_groups = [group for group in all_groups if _can_assign_group(current_user, group)]
     can_write  = current_user.has_access('users', 'full')
     return render_template('admin/users.html', users=all_users, groups=all_groups,
+                           assignable_groups=assignable_groups,
                            MODULES=MODULES, can_write=can_write)
 
 @app.route('/admin/users/add', methods=['POST'])
@@ -2322,13 +2661,17 @@ def add_user():
     if email and User.query.filter_by(email=email).first():
         flash('Email already in use.', 'error')
         return redirect(url_for('users'))
+    if len(password) < 12:
+        flash('Password must be at least 12 characters.', 'error')
+        return redirect(url_for('users'))
+    group = _requested_group(request.form.get('group_id', type=int))
     u = User(username=username, email=email,
              first_name=request.form.get('first_name', '').strip() or None,
              last_name=request.form.get('last_name', '').strip() or None,
              phone=request.form.get('phone', '').strip() or None,
              workplace=request.form.get('workplace', '').strip() or None,
              job_title=request.form.get('job_title', '').strip() or None,
-             group_id=request.form.get('group_id', type=int) or None,
+             group_id=group.id if group else None,
              use_email_auth='use_email_auth' in request.form,
              receive_notifications='receive_notifications' in request.form,
              active=True)
@@ -2356,11 +2699,27 @@ def edit_user(uid):
     u.job_title   = request.form.get('job_title', '').strip() or None
     u.use_email_auth        = 'use_email_auth' in request.form
     u.receive_notifications = 'receive_notifications' in request.form
+    security_changed = False
     if current_user.is_admin:
-        u.group_id = request.form.get('group_id', type=int) or None
-        u.active   = 'active' in request.form
+        group = _requested_group(request.form.get('group_id', type=int))
+        new_group_id = group.id if group else None
+        new_active = 'active' in request.form
+        if uid == current_user.id and not new_active:
+            abort(400)
+        security_changed = u.group_id != new_group_id or u.active != new_active
+        u.group_id = new_group_id
+        u.active = new_active
     pwd = request.form.get('new_password', '').strip()
-    if pwd: u.set_password(pwd)
+    if pwd:
+        if len(pwd) < 12:
+            flash('Password must be at least 12 characters.', 'error')
+            return redirect(url_for('users'))
+        u.set_password(pwd)
+        security_changed = True
+    if security_changed:
+        u.session_version = int(u.session_version or 1) + 1
+        if uid == current_user.id:
+            session['session_version'] = u.session_version
     db.session.commit()
     _audit('edit_user', 'users', u.username)
     flash(f'User "{u.username}" updated.', 'success')
@@ -2374,8 +2733,12 @@ def delete_user(uid):
         flash('Only administrators can delete users.', 'error')
         return redirect(url_for('users'))
     u = User.query.get_or_404(uid)
-    if u.username == 'admin':
-        flash('Cannot delete the default admin account.', 'error')
+    if uid == current_user.id:
+        flash('You cannot delete your own signed-in account.', 'error')
+        return redirect(url_for('users'))
+    if u.is_admin and User.query.join(UserGroup).filter(
+            UserGroup.is_admin == True, User.active == True).count() <= 1:
+        flash('Cannot delete the last active administrator.', 'error')
         return redirect(url_for('users'))
     uname = u.username
     db.session.delete(u)
@@ -2399,7 +2762,7 @@ def add_group():
     db.session.add(g)
     db.session.flush()
     for mod in MODULES:
-        level = request.form.get(f'perm_{mod["key"]}', 'none')
+        level = _requested_permission_level(mod['key'])
         db.session.add(GroupPermission(group_id=g.id, module_key=mod['key'], access_level=level))
     db.session.commit()
     _audit('add_group', 'users', name)
@@ -2411,11 +2774,13 @@ def add_group():
 @require_module('users', 'full')
 def edit_group(gid):
     g = UserGroup.query.get_or_404(gid)
+    if g.is_admin and not current_user.is_admin:
+        abort(403)
     g.name        = request.form.get('name', g.name).strip()
     g.description = request.form.get('description', '').strip() or None
     if not g.is_admin:
         for mod in MODULES:
-            level = request.form.get(f'perm_{mod["key"]}', 'none')
+            level = _requested_permission_level(mod['key'])
             perm  = GroupPermission.query.filter_by(group_id=gid, module_key=mod['key']).first()
             if perm: perm.access_level = level
             else: db.session.add(GroupPermission(group_id=gid, module_key=mod['key'], access_level=level))
@@ -2562,13 +2927,17 @@ def export_subscribers_csv():
         active_str = 'yes' if sub.active else 'no'
         if sub.contacts:
             for c in sub.contacts:
-                writer.writerow([sub.id, sub.notes or '', group_name, active_str,
-                                 c.role or 'parent', c.first_name or '',
-                                 c.last_name or '', c.email or '', c.phone or ''])
+                writer.writerow(_csv_safe_row([
+                    sub.id, sub.notes or '', group_name, active_str,
+                    c.role or 'parent', c.first_name or '', c.last_name or '',
+                    c.email or '', c.phone or '',
+                ]))
         else:
-            writer.writerow([sub.id, sub.notes or '', group_name, active_str,
-                             'parent', sub.first_name or '', sub.last_name or '',
-                             sub.email or '', sub.phone or ''])
+            writer.writerow(_csv_safe_row([
+                sub.id, sub.notes or '', group_name, active_str,
+                'parent', sub.first_name or '', sub.last_name or '',
+                sub.email or '', sub.phone or '',
+            ]))
     output.seek(0)
     from flask import Response
     return Response(
@@ -3089,9 +3458,9 @@ def send_broadcast():
     if not recipients:
         return jsonify({'ok': False, 'message': 'No valid recipients found.'})
 
-    job_id = str(uuid.uuid4())[:8]
+    job_id = secrets.token_urlsafe(24)
     broadcast_jobs[job_id] = {'total': len(recipients), 'sent': 0, 'failed': 0,
-                               'done': False, 'errors': []}
+                               'done': False, 'errors': [], 'owner_id': current_user.id}
 
     t = threading.Thread(target=_broadcast_worker,
                          args=(job_id, recipients, subject, body, interval_sec),
@@ -3102,11 +3471,14 @@ def send_broadcast():
 
 @app.route('/admin/notifications/broadcast/<job_id>/status')
 @login_required
+@require_module('notifications', 'full')
 def broadcast_status(job_id):
     job = broadcast_jobs.get(job_id)
     if not job:
-        return jsonify({'done': True, 'sent': 0, 'failed': 0, 'total': 0, 'errors': []})
-    return jsonify(job)
+        abort(404)
+    if job.get('owner_id') != current_user.id and not current_user.is_admin:
+        abort(403)
+    return jsonify({key: job[key] for key in ('total', 'sent', 'failed', 'done', 'errors')})
 
 
 # ── CONFIGURATION MODULE ──────────────────────────────────────────────────────
@@ -3117,23 +3489,40 @@ def broadcast_status(job_id):
 def config_page():
     cfg = get_config()
     if request.method == 'POST':
+        if not current_user.has_access('config', 'full'):
+            abort(403)
         section = request.form.get('section', 'general')
+        allowed_sections = {'general', 'theme', 'operational', 'schedule_windows',
+                            'language', 'email', 'sms'}
+        if section not in allowed_sections:
+            abort(400)
         if section == 'general':
             cfg.app_name     = request.form.get('app_name', cfg.app_name).strip()
             cfg.app_subtitle = request.form.get('app_subtitle', cfg.app_subtitle).strip()
             cfg.time_format  = request.form.get('time_format', '12h')
         elif section == 'theme':
-            cfg.theme_mode     = request.form.get('theme_mode', 'light')
-            cfg.color_bg       = request.form.get('color_bg', cfg.color_bg)
-            cfg.color_nav      = request.form.get('color_nav', cfg.color_nav)
-            cfg.color_card     = request.form.get('color_card', cfg.color_card)
-            cfg.color_text     = request.form.get('color_text', cfg.color_text)
-            cfg.color_accent   = request.form.get('color_accent', cfg.color_accent)
-            cfg.color_nav_text = request.form.get('color_nav_text', cfg.color_nav_text)
+            mode = request.form.get('theme_mode', 'light')
+            if mode not in {'light', 'dark'}:
+                abort(400)
+            colors = {field: request.form.get(field, getattr(cfg, field)) for field in
+                      ('color_bg', 'color_nav', 'color_card', 'color_text',
+                       'color_accent', 'color_nav_text')}
+            if any(not re.fullmatch(r'#[0-9A-Fa-f]{6}', value or '') for value in colors.values()):
+                abort(400)
+            cfg.theme_mode = mode
+            for field, value in colors.items():
+                setattr(cfg, field, value)
         elif section == 'operational':
-            cfg.timezone       = request.form.get('timezone', cfg.timezone)
-            cfg.daily_reset_time = request.form.get('daily_reset_time', cfg.daily_reset_time)
-            cfg.commit_delay_min = request.form.get('commit_delay_min', cfg.commit_delay_min, type=int)
+            timezone = request.form.get('timezone', cfg.timezone)
+            reset_time = request.form.get('daily_reset_time', cfg.daily_reset_time)
+            delay = request.form.get('commit_delay_min', cfg.commit_delay_min, type=int)
+            if timezone not in pytz.all_timezones or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', reset_time or ''):
+                abort(400)
+            if delay is None or not 0 <= delay <= 1440:
+                abort(400)
+            cfg.timezone = timezone
+            cfg.daily_reset_time = reset_time
+            cfg.commit_delay_min = delay
             cfg.offline_message  = request.form.get('offline_message', cfg.offline_message)
             cfg.show_always      = 'show_always' in request.form
         elif section == 'schedule_windows':
@@ -3143,25 +3532,58 @@ def config_page():
                 p.window_start = w_start or None
                 p.window_end   = w_end   or None
         elif section == 'language':
-            cfg.lang_frontend = request.form.get('lang_frontend', 'en')
-            cfg.lang_backend  = request.form.get('lang_backend', 'en')
+            frontend = request.form.get('lang_frontend', 'en')
+            backend = request.form.get('lang_backend', 'en')
+            if frontend not in TRANSLATIONS or backend not in TRANSLATIONS:
+                abort(400)
+            cfg.lang_frontend = frontend
+            cfg.lang_backend = backend
         elif section == 'email':
-            cfg.mail_provider   = request.form.get('mail_provider', 'custom')
-            cfg.mail_server     = request.form.get('mail_server', '').strip()
-            cfg.mail_port       = request.form.get('mail_port', 587, type=int)
-            cfg.mail_use_tls    = 'mail_use_tls' in request.form
-            cfg.mail_use_ssl    = 'mail_use_ssl' in request.form
-            cfg.mail_username   = request.form.get('mail_username', '').strip()
+            provider = request.form.get('mail_provider', 'custom')
+            server = request.form.get('mail_server', '').strip()
+            try:
+                port = _validated_smtp_port(request.form.get('mail_port', 587))
+                validated_server = _validated_smtp_host(provider, server)
+            except ValueError as exc:
+                flash(str(exc), 'error')
+                return redirect(url_for('config_page', tab='email'))
+            tls = 'mail_use_tls' in request.form
+            ssl = 'mail_use_ssl' in request.form
+            username = request.form.get('mail_username', '').strip()
+            if tls and ssl:
+                abort(400)
             new_pwd = request.form.get('mail_password', '').strip()
+            old_server = (SMTP_PRESET_SERVERS.get(cfg.mail_provider) or cfg.mail_server or '').lower().rstrip('.')
+            old_identity = (cfg.mail_provider, old_server,
+                            cfg.mail_port, bool(cfg.mail_use_tls),
+                            bool(cfg.mail_use_ssl), cfg.mail_username or '')
+            new_identity = (provider, validated_server, port, tls, ssl, username)
+            if old_identity != new_identity and cfg.mail_password and not new_pwd:
+                flash('Re-enter the SMTP password when changing connection settings.', 'error')
+                return redirect(url_for('config_page', tab='email'))
+            cfg.mail_provider = provider
+            cfg.mail_server = validated_server
+            cfg.mail_port = port
+            cfg.mail_use_tls = tls
+            cfg.mail_use_ssl = ssl
+            cfg.mail_username = username
             if new_pwd:
                 cfg.mail_password = new_pwd
             cfg.mail_from_email = request.form.get('mail_from_email', '').strip()
             cfg.mail_from_name  = request.form.get('mail_from_name', '').strip()
         elif section == 'sms':
-            cfg.twilio_enabled      = 'twilio_enabled' in request.form
-            cfg.twilio_account_sid  = request.form.get('twilio_account_sid', '').strip()
-            cfg.twilio_from_number  = request.form.get('twilio_from_number', '').strip()
+            enabled = 'twilio_enabled' in request.form
+            account_sid = request.form.get('twilio_account_sid', '').strip()
+            from_number = request.form.get('twilio_from_number', '').strip()
             new_tok = request.form.get('twilio_auth_token', '').strip()
+            if ((account_sid != (cfg.twilio_account_sid or '') or
+                 from_number != (cfg.twilio_from_number or '')) and
+                    cfg.twilio_auth_token and not new_tok):
+                flash('Re-enter the Twilio Auth Token when changing account settings.', 'error')
+                return redirect(url_for('config_page', tab='sms'))
+            cfg.twilio_enabled = enabled
+            cfg.twilio_account_sid = account_sid
+            cfg.twilio_from_number = from_number
             if new_tok:
                 cfg.twilio_auth_token = new_tok
             try:
@@ -3192,13 +3614,41 @@ def upload_logo():
     cfg  = get_config()
     field = request.form.get('field', 'logo')
     f = request.files.get('file')
+    if field not in {'logo', 'icon'}:
+        abort(400)
     if f and allowed_file(f.filename):
-        fn = secure_filename(f'app_{field}_{f.filename}')
-        f.save(os.path.join(app.config['UPLOAD_FOLDER'], fn))
-        if field == 'logo': cfg.logo_path = f'/static/uploads/{fn}'
-        else:               cfg.icon_path = f'/static/uploads/{fn}'
+        import warnings
+        from PIL import Image, UnidentifiedImageError
+        expected_formats = {
+            'png': {'PNG'}, 'jpg': {'JPEG'}, 'jpeg': {'JPEG'},
+            'gif': {'GIF'}, 'ico': {'ICO'},
+        }
+        extension = f.filename.rsplit('.', 1)[1].lower()
+        payload = f.read()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('error', Image.DecompressionBombWarning)
+                image = Image.open(io.BytesIO(payload))
+                image.verify()
+            if image.format not in expected_formats[extension]:
+                raise ValueError('Image format does not match its extension.')
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning,
+                UnidentifiedImageError, OSError, ValueError):
+            flash('Upload rejected: the file is not a valid approved image.', 'error')
+            return redirect(url_for('config_page', tab='general'))
+        fn = f'app_{field}_{secrets.token_hex(12)}.{extension}'
+        destination = os.path.join(app.config['UPLOAD_FOLDER'], fn)
+        with open(destination, 'xb') as output:
+            output.write(payload)
+        os.chmod(destination, 0o600)
+        if field == 'logo':
+            cfg.logo_path = f'/static/uploads/{fn}'
+        else:
+            cfg.icon_path = f'/static/uploads/{fn}'
         db.session.commit()
         flash('File uploaded.', 'success')
+    else:
+        flash('Upload rejected: select a PNG, JPEG, GIF, or ICO image.', 'error')
     return redirect(url_for('config_page', tab='general'))
 
 @app.route('/admin/config/test-email', methods=['POST'])
@@ -3206,16 +3656,17 @@ def upload_logo():
 @require_module('config', 'full')
 def test_email():
     cfg = get_config()
-    configure_mail(cfg)
     to = request.form.get('test_email', current_user.email or '')
     try:
+        configure_mail(cfg)
         msg = Message(subject=f'Test Email — {cfg.app_name}',
                       recipients=[to],
                       body=f'This is a test email from {cfg.app_name}.')
         mail.send(msg)
         flash(f'Test email sent to {to}.', 'success')
-    except Exception as e:
-        flash(f'Email failed: {e}', 'error')
+    except Exception:
+        _audit('smtp_test_failed', 'config', 'saved configuration')
+        flash('Email test failed. Review the approved SMTP settings and server log.', 'error')
     return redirect(url_for('config_page', tab='email'))
 
 
@@ -3236,10 +3687,13 @@ def test_email_live():
         'use_tls':    data.get('use_tls', True),
         'use_ssl':    data.get('use_ssl', False),
         'username':   data.get('username', ''),
-        'password':   data.get('password', '') or cfg.mail_password,
+        'password':   data.get('password', ''),
         'from_email': data.get('from_email', ''),
         'from_name':  data.get('from_name', ''),
     }
+    if override['username'] and not override['password']:
+        return jsonify({'ok': False, 'message':
+                        'Enter the SMTP password to run a live test.'}), 400
     try:
         configure_mail(cfg, override=override)
         msg = Message(
@@ -3252,8 +3706,12 @@ def test_email_live():
         )
         mail.send(msg)
         return jsonify({'ok': True, 'message': f'Test email sent successfully to {test_to}.'})
-    except Exception as e:
-        return jsonify({'ok': False, 'message': str(e)})
+    except ValueError as exc:
+        return jsonify({'ok': False, 'message': str(exc)}), 400
+    except Exception:
+        _audit('smtp_live_test_failed', 'config', 'approved destination')
+        return jsonify({'ok': False, 'message':
+                        'SMTP test failed. Verify credentials and the approved destination.'}), 400
 
 @app.route('/admin/config/check-smtp', methods=['POST'])
 @login_required
@@ -3264,14 +3722,17 @@ def check_smtp():
     data = request.get_json(silent=True) or {}
     cfg  = get_config()
 
-    PRESET_SERVERS = {'google': 'smtp.gmail.com', 'office365': 'smtp.office365.com'}
     provider = data.get('provider', 'custom')
-    server   = PRESET_SERVERS.get(provider) or data.get('server', cfg.mail_server) or ''
-    port     = int(data.get('port', None) or cfg.mail_port or 587)
+    try:
+        server = _validated_smtp_host(provider, data.get('server', ''))
+        port = _validated_smtp_port(data.get('port', None) or cfg.mail_port or 587)
+    except ValueError as exc:
+        return jsonify({'ok': False, 'steps': [
+            {'ok': False, 'label': 'SMTP configuration rejected', 'detail': str(exc)}]}), 400
     use_tls  = bool(data.get('use_tls', cfg.mail_use_tls))
     use_ssl  = bool(data.get('use_ssl', getattr(cfg, 'mail_use_ssl', False)))
-    username = data.get('username', cfg.mail_username) or ''
-    password = data.get('password', '') or cfg.mail_password or ''
+    username = data.get('username', '') or ''
+    password = data.get('password', '') or ''
 
     steps = []
 
@@ -3293,8 +3754,9 @@ def check_smtp():
         steps.append({'ok': False, 'label': f'TCP connect to {server}:{port}',
                       'detail': 'Connection refused — wrong server/port, or a local firewall is blocking Python.'})
         return jsonify({'ok': False, 'steps': steps})
-    except Exception as e:
-        steps.append({'ok': False, 'label': f'TCP connect to {server}:{port}', 'detail': str(e)})
+    except Exception:
+        steps.append({'ok': False, 'label': f'TCP connect to {server}:{port}',
+                      'detail': 'Connection failed.'})
         return jsonify({'ok': False, 'steps': steps})
 
     # Step 2 — SMTP handshake
@@ -3306,8 +3768,8 @@ def check_smtp():
             smtp = smtplib.SMTP(server, port, timeout=15)
         smtp.ehlo()
         steps.append({'ok': True, 'label': f'SMTP handshake (EHLO) — {"SSL" if use_ssl else "plain"}'})
-    except Exception as e:
-        steps.append({'ok': False, 'label': 'SMTP handshake', 'detail': str(e)})
+    except Exception:
+        steps.append({'ok': False, 'label': 'SMTP handshake', 'detail': 'SMTP handshake failed.'})
         return jsonify({'ok': False, 'steps': steps})
 
     # Step 3 — STARTTLS
@@ -3316,26 +3778,29 @@ def check_smtp():
             smtp.starttls()
             smtp.ehlo()
             steps.append({'ok': True, 'label': 'STARTTLS upgrade'})
-        except Exception as e:
-            steps.append({'ok': False, 'label': 'STARTTLS upgrade', 'detail': str(e)})
+        except Exception:
+            steps.append({'ok': False, 'label': 'STARTTLS upgrade', 'detail': 'TLS negotiation failed.'})
             smtp.quit()
             return jsonify({'ok': False, 'steps': steps})
 
     # Step 4 — Authentication
+    if username and not password:
+        steps.append({'ok': False, 'label': 'Authentication',
+                      'detail': 'Enter the SMTP password to run diagnostics.'})
+        smtp.quit()
+        return jsonify({'ok': False, 'steps': steps}), 400
     if username and password:
         try:
             smtp.login(username, password)
             steps.append({'ok': True, 'label': f'Authentication ({username})'})
-        except smtplib.SMTPAuthenticationError as e:
-            detail = str(e)
-            if '535' in detail or '5.7.8' in detail:
-                detail += (' — For Gmail: use an App Password, not your regular password. '
-                           'Go to Google Account → Security → App Passwords.')
-            steps.append({'ok': False, 'label': f'Authentication ({username})', 'detail': detail})
+        except smtplib.SMTPAuthenticationError:
+            steps.append({'ok': False, 'label': f'Authentication ({username})',
+                          'detail': 'Authentication was rejected by the SMTP server.'})
             smtp.quit()
             return jsonify({'ok': False, 'steps': steps})
-        except Exception as e:
-            steps.append({'ok': False, 'label': f'Authentication ({username})', 'detail': str(e)})
+        except Exception:
+            steps.append({'ok': False, 'label': f'Authentication ({username})',
+                          'detail': 'Authentication failed.'})
             smtp.quit()
             return jsonify({'ok': False, 'steps': steps})
     else:
@@ -3354,8 +3819,8 @@ def check_twilio():
         return jsonify({'ok': False, 'message': 'Twilio library not installed. Run: pip install twilio'})
     data = request.get_json(silent=True) or {}
     cfg  = get_config()
-    sid  = data.get('account_sid', '') or getattr(cfg, 'twilio_account_sid', '') or ''
-    tok  = data.get('auth_token',  '') or getattr(cfg, 'twilio_auth_token',  '') or ''
+    sid  = data.get('account_sid', '') or ''
+    tok  = data.get('auth_token',  '') or ''
     if not sid or not tok:
         return jsonify({'ok': False, 'message': 'Account SID and Auth Token are required.'})
     try:
@@ -3370,8 +3835,8 @@ def check_twilio():
         if e.code == 20003:
             return jsonify({'ok': False, 'message': 'Authentication failed — check your Account SID and Auth Token.'})
         return jsonify({'ok': False, 'message': f'Twilio error {e.code}: {e.msg}'})
-    except Exception as e:
-        return jsonify({'ok': False, 'message': str(e)})
+    except Exception:
+        return jsonify({'ok': False, 'message': 'Twilio diagnostic failed.'}), 400
 
 
 @app.route('/admin/config/test-sms', methods=['POST'])
@@ -3383,9 +3848,9 @@ def test_sms():
         return jsonify({'ok': False, 'message': 'Twilio library not installed. Run: pip install twilio'})
     data = request.get_json(silent=True) or {}
     cfg  = get_config()
-    sid      = data.get('account_sid', '')  or getattr(cfg, 'twilio_account_sid', '') or ''
-    tok      = data.get('auth_token',  '')  or getattr(cfg, 'twilio_auth_token',  '') or ''
-    from_num = data.get('from_number', '')  or getattr(cfg, 'twilio_from_number', '') or ''
+    sid      = data.get('account_sid', '') or ''
+    tok      = data.get('auth_token',  '') or ''
+    from_num = data.get('from_number', '') or ''
     to_num   = data.get('to_number',   '').strip()
     if not sid or not tok:
         return jsonify({'ok': False, 'message': 'Account SID and Auth Token are required.'})
@@ -3402,8 +3867,8 @@ def test_sms():
         return jsonify({'ok': True, 'message': f'SMS sent! SID: {msg.sid} — Status: {msg.status}'})
     except TwilioRestException as e:
         return jsonify({'ok': False, 'message': f'Twilio error {e.code}: {e.msg}'})
-    except Exception as e:
-        return jsonify({'ok': False, 'message': str(e)})
+    except Exception:
+        return jsonify({'ok': False, 'message': 'Twilio test failed.'}), 400
 
 
 @app.route('/admin/config/schedules/add', methods=['POST'])
@@ -3481,11 +3946,19 @@ def delete_holiday(hid):
 @app.route('/admin/config/export-db')
 @login_required
 @require_module('config', 'full')
+@require_admin
 def export_db():
-    db_path = os.path.join(BASE_DIR, 'bustrack.db')
-    if os.path.exists(db_path):
-        return send_file(db_path, as_attachment=True,
-                         download_name=f'bustrack_backup_{date.today()}.db')
+    db_path = db.engine.url.database if db.engine.url.get_backend_name() == 'sqlite' else None
+    if db_path and os.path.exists(db_path):
+        try:
+            with open(db_path, 'rb') as stream:
+                response = _encrypted_download(stream.read(),
+                                               f'bustrack_sqlite_{date.today()}.bustrack-db')
+            _audit('export_full_backup', 'config', 'encrypted SQLite database')
+            return response
+        except RuntimeError as exc:
+            flash(str(exc), 'error')
+            return redirect(url_for('config_page', tab='data'))
     flash('Database file not found.', 'error')
     return redirect(url_for('config_page', tab='data'))
 
@@ -3643,206 +4116,344 @@ def check_deps():
     return jsonify(results)
 
 
-@app.route('/admin/config/export-json')
-@login_required
-@require_module('config', 'full')
-def export_json():
-    from sqlalchemy import inspect as sa_inspect, text as sa_text
-    inspector = sa_inspect(db.engine)
-    tables = inspector.get_table_names()
-    dump = {}
-    for t in tables:
-        try:
-            rows = db.session.execute(sa_text(f'SELECT * FROM "{t}"')).mappings().all()
-            dump[t] = [dict(r) for r in rows]
-        except Exception as e:
-            dump[t] = {'error': str(e)}
-
-    def _default(o):
-        if isinstance(o, (datetime, date)): return o.isoformat()
-        return str(o)
-
-    payload = json.dumps(dump, default=_default, indent=2, ensure_ascii=False)
-    resp = make_response(payload)
-    resp.headers['Content-Type'] = 'application/json'
-    resp.headers['Content-Disposition'] = f'attachment; filename=bustrack_backup_{date.today()}.json'
-    return resp
-
-
-@app.route('/admin/config/export-sql')
-@login_required
-@require_module('config', 'full')
-def export_sql():
-    from sqlalchemy import inspect as sa_inspect, text as sa_text
-    inspector = sa_inspect(db.engine)
-    tables = inspector.get_table_names()
-    lines = [f'-- BusTrack SQL Dump — {datetime.utcnow().isoformat()}Z\n']
-    for t in tables:
-        try:
-            rows = db.session.execute(sa_text(f'SELECT * FROM "{t}"')).mappings().all()
-            for row in rows:
-                d = dict(row)
-                cols = ', '.join(f'"{k}"' for k in d)
-                vals_list = []
-                for v in d.values():
-                    if v is None:
-                        vals_list.append('NULL')
-                    elif isinstance(v, bool):
-                        vals_list.append('TRUE' if v else 'FALSE')
-                    elif isinstance(v, (int, float)):
-                        vals_list.append(str(v))
-                    else:
-                        escaped = str(v).replace("'", "''")
-                        vals_list.append(f"'{escaped}'")
-                vals = ', '.join(vals_list)
-                lines.append(f'INSERT INTO "{t}" ({cols}) VALUES ({vals});')
-        except Exception as e:
-            lines.append(f'-- Error dumping {t}: {e}')
-    payload = '\n'.join(lines)
-    resp = make_response(payload)
-    resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
-    resp.headers['Content-Disposition'] = f'attachment; filename=bustrack_backup_{date.today()}.sql'
-    return resp
-
-
 _IMPORT_TABLE_ORDER = [
     'user_group', 'group_permission', 'user', 'configuration',
     'operational_schedule', 'bus_schedule_type', 'incident_type',
     'delay_reason', 'bus', 'bus_schedule_assignment',
     'bus_incident_record', 'subscriber_group', 'group_bus_assignment',
     'notification_subscriber', 'subscriber_contact',
-    'notification_bus_assignment', 'holiday', 'audit_log',
+    'notification_bus_assignment', 'holiday', 'audit_log', 'login_throttle',
 ]
 
 
+_OPERATIONAL_EXPORT_TABLES = [
+    'operational_schedule', 'bus_schedule_type', 'holiday',
+]
+_SAFE_CONFIGURATION_COLUMNS = [
+    'app_name', 'app_subtitle', 'logo_path', 'icon_path', 'theme_mode',
+    'color_bg', 'color_nav', 'color_card', 'color_text', 'color_accent',
+    'color_nav_text', 'timezone', 'daily_reset_time', 'commit_delay_min',
+    'offline_message', 'show_always', 'lang_frontend', 'lang_backend',
+    'time_format', 'mail_provider', 'mail_server', 'mail_port', 'mail_use_tls',
+    'mail_use_ssl', 'mail_from_email', 'mail_from_name', 'twilio_enabled',
+    'twilio_from_number', 'twilio_sms_cost_per_seg',
+]
+_BACKUP_FORMAT = 'bustrack-full-backup'
+_BACKUP_VERSION = 1
+
+
+def _json_default(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    raise TypeError(f'Unsupported backup value type: {type(value).__name__}')
+
+
+def _backup_fernet():
+    from cryptography.fernet import Fernet
+    key = os.environ.get('BACKUP_ENCRYPTION_KEY', '').strip().encode('ascii', 'strict')
+    if not key:
+        raise RuntimeError('BACKUP_ENCRYPTION_KEY is not configured.')
+    try:
+        return Fernet(key)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError('BACKUP_ENCRYPTION_KEY is invalid.') from exc
+
+
+def _database_dump(table_names=None):
+    from sqlalchemy import inspect as sa_inspect, text as sa_text
+    inspector = sa_inspect(db.engine)
+    existing = set(inspector.get_table_names())
+    tables = sorted(existing) if table_names is None else [t for t in table_names if t in existing]
+    dump = {}
+    for table in tables:
+        rows = db.session.execute(sa_text(f'SELECT * FROM "{table}"')).mappings().all()
+        dump[table] = [dict(row) for row in rows]
+    return dump
+
+
+def _full_backup_document():
+    return {
+        'format': _BACKUP_FORMAT,
+        'version': _BACKUP_VERSION,
+        'created_at': _utcnow().isoformat() + 'Z',
+        'database': 'postgresql' if str(db.engine.url).startswith('postgresql') else 'sqlite',
+        'tables': _database_dump(_IMPORT_TABLE_ORDER),
+    }
+
+
+def _encrypted_download(payload, filename):
+    token = _backup_fernet().encrypt(payload)
+    response = make_response(token)
+    response.headers['Content-Type'] = 'application/octet-stream'
+    response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.route('/admin/config/export-operational-json')
+@login_required
+@require_module('config', 'full')
+def export_operational_json():
+    tables = list(_OPERATIONAL_EXPORT_TABLES)
+    if current_user.has_access('buses'):
+        tables.extend(['bus', 'bus_schedule_assignment'])
+    if current_user.has_access('incidents'):
+        tables.extend(['incident_type', 'delay_reason'])
+    data = _database_dump(tables)
+    cfg = get_config()
+    data['configuration'] = [{column: getattr(cfg, column) for column in
+                              _SAFE_CONFIGURATION_COLUMNS}]
+    payload = json.dumps({
+        'format': 'bustrack-operational-export',
+        'version': 1,
+        'created_at': _utcnow().isoformat() + 'Z',
+        'tables': data,
+    }, default=_json_default, indent=2, ensure_ascii=False)
+    response = make_response(payload)
+    response.headers['Content-Type'] = 'application/json; charset=utf-8'
+    response.headers['Content-Disposition'] = (
+        f'attachment; filename="bustrack_operational_{date.today()}.json"')
+    response.headers['Cache-Control'] = 'no-store'
+    _audit('export_operational', 'config', 'redacted operational data')
+    return response
+
+
+@app.route('/admin/config/export-json')
+@login_required
+@require_module('config', 'full')
+@require_admin
+def export_json():
+    try:
+        payload = json.dumps(_full_backup_document(), default=_json_default,
+                             separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+        response = _encrypted_download(payload, f'bustrack_full_{date.today()}.bustrack')
+        _audit('export_full_backup', 'config', 'encrypted JSON backup')
+        return response
+    except RuntimeError as exc:
+        flash(str(exc), 'error')
+        return redirect(url_for('config_page', tab='data'))
+
+
+@app.route('/admin/config/export-sql')
+@login_required
+@require_module('config', 'full')
+@require_admin
+def export_sql():
+    from sqlalchemy import inspect as sa_inspect, text as sa_text
+    lines = [f'-- BusTrack encrypted SQL export source — {_utcnow().isoformat()}Z']
+    for table in sorted(sa_inspect(db.engine).get_table_names()):
+        rows = db.session.execute(sa_text(f'SELECT * FROM "{table}"')).mappings().all()
+        for row in rows:
+            data = dict(row)
+            columns = ', '.join(f'"{key}"' for key in data)
+            values = []
+            for value in data.values():
+                if value is None:
+                    values.append('NULL')
+                elif isinstance(value, bool):
+                    values.append('TRUE' if value else 'FALSE')
+                elif isinstance(value, (int, float)):
+                    values.append(str(value))
+                else:
+                    values.append("'" + str(value).replace("'", "''") + "'")
+            lines.append(f'INSERT INTO "{table}" ({columns}) VALUES ({", ".join(values)});')
+    try:
+        response = _encrypted_download('\n'.join(lines).encode('utf-8'),
+                                       f'bustrack_sql_{date.today()}.bustrack-sql')
+        _audit('export_full_backup', 'config', 'encrypted SQL backup')
+        return response
+    except RuntimeError as exc:
+        flash(str(exc), 'error')
+        return redirect(url_for('config_page', tab='data'))
+
+
+RESTORE_JOB_DIR = os.path.join(INSTANCE_DIR, 'restore_jobs')
+RESTORE_SNAPSHOT_DIR = os.path.join(INSTANCE_DIR, 'restore_snapshots')
+
+
 def _job_path(job_id: str) -> str:
-    return os.path.join(tempfile.gettempdir(), f'bustrack_import_{job_id}.json')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{20,100}', job_id):
+        abort(404)
+    return os.path.join(RESTORE_JOB_DIR, f'{job_id}.json')
+
+
+def _write_private_file(path, payload, binary=False):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    mode = 'wb' if binary else 'w'
+    kwargs = {} if binary else {'encoding': 'utf-8'}
+    with os.fdopen(fd, mode, **kwargs) as stream:
+        stream.write(payload)
+
+
+def _cleanup_restore_jobs():
+    if os.path.isdir(RESTORE_JOB_DIR):
+        cutoff = time.time() - app.config['RESTORE_JOB_TTL_SECONDS']
+        for name in os.listdir(RESTORE_JOB_DIR):
+            path = os.path.join(RESTORE_JOB_DIR, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                continue
+    if os.path.isdir(RESTORE_SNAPSHOT_DIR):
+        snapshot_cutoff = time.time() - (
+            app.config['RESTORE_SNAPSHOT_RETENTION_DAYS'] * 86400)
+        for name in os.listdir(RESTORE_SNAPSHOT_DIR):
+            path = os.path.join(RESTORE_SNAPSHOT_DIR, name)
+            try:
+                if (name.endswith('.bustrack') and os.path.isfile(path) and
+                        os.path.getmtime(path) < snapshot_cutoff):
+                    os.remove(path)
+            except OSError:
+                continue
+
+
+def _validate_backup_document(document):
+    from sqlalchemy import inspect as sa_inspect
+    if not isinstance(document, dict) or document.get('format') != _BACKUP_FORMAT:
+        raise ValueError('Unsupported backup format.')
+    if document.get('version') != _BACKUP_VERSION:
+        raise ValueError('Unsupported backup version.')
+    tables = document.get('tables')
+    if not isinstance(tables, dict) or not tables:
+        raise ValueError('Backup does not contain tables.')
+    inspector = sa_inspect(db.engine)
+    existing = set(inspector.get_table_names())
+    allowed = set(_IMPORT_TABLE_ORDER) & existing
+    unknown = set(tables) - allowed
+    if unknown:
+        raise ValueError('Backup contains tables that are not approved for restore.')
+    missing = allowed - set(tables)
+    if missing:
+        raise ValueError('Full backup is incomplete and cannot be restored safely.')
+    ordered = []
+    for table in _IMPORT_TABLE_ORDER:
+        if table not in tables:
+            continue
+        rows = tables[table]
+        if not isinstance(rows, list):
+            raise ValueError(f'Backup table {table} is not a row list.')
+        allowed_columns = {column['name'] for column in inspector.get_columns(table)}
+        for row in rows:
+            if not isinstance(row, dict) or not row or not set(row).issubset(allowed_columns):
+                raise ValueError(f'Backup table {table} contains an invalid row schema.')
+        ordered.append((table, rows))
+
+    groups = tables.get('user_group', [])
+    users = tables.get('user', [])
+    truthy = {True, 1, '1', 'true', 'True'}
+    admin_group_ids = {row.get('id') for row in groups if row.get('is_admin') in truthy}
+    has_active_admin = any(
+        row.get('active') in truthy and row.get('group_id') in admin_group_ids and
+        bool(row.get('password_hash')) for row in users)
+    if not has_active_admin:
+        raise ValueError('Full backup does not contain an active administrator.')
+    if len(tables.get('configuration', [])) != 1:
+        raise ValueError('Full backup must contain exactly one configuration row.')
+    return ordered
 
 
 @app.route('/admin/config/import-db', methods=['POST'])
 @login_required
 @require_module('config', 'full')
+@require_admin
 def import_db():
-    """Phase 1: parse the uploaded JSON and store job; return job_id via JSON."""
+    """Validate an encrypted, versioned backup and stage an owner-bound restore job."""
+    _cleanup_restore_jobs()
     f = request.files.get('backup_file')
-    if not f or not f.filename.endswith('.json'):
-        return jsonify({'ok': False, 'error': 'Please upload a valid .json backup file.'})
+    if not f or not f.filename.lower().endswith('.bustrack'):
+        return jsonify({'ok': False, 'error': 'Upload an encrypted .bustrack backup.'}), 400
     try:
-        dump = json.loads(f.read().decode('utf-8'))
-    except Exception as e:
-        return jsonify({'ok': False, 'error': f'Could not parse file: {e}'})
+        decrypted = _backup_fernet().decrypt(f.read())
+        document = json.loads(decrypted.decode('utf-8'))
+        ordered = _validate_backup_document(document)
+    except RuntimeError as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    except Exception:
+        return jsonify({'ok': False, 'error':
+                        'Backup could not be authenticated or validated.'}), 400
 
-    from sqlalchemy import inspect as sa_inspect
-    inspector = sa_inspect(db.engine)
-    existing_tables = set(inspector.get_table_names())
-    is_pg = app.config.get('SQLALCHEMY_DATABASE_URI', '').startswith('postgresql')
-    SKIP = {'alembic_version'}
-
-    # Sort tables by known FK-safe order; unknown tables appended at end
-    known = [t for t in _IMPORT_TABLE_ORDER if t in dump and t not in SKIP and t in existing_tables]
-    rest  = [t for t in dump if t not in known and t not in SKIP and t in existing_tables and isinstance(dump[t], list)]
-    ordered = [(t, dump[t]) for t in known + rest if isinstance(dump.get(t), list)]
-
-    job_id = secrets.token_urlsafe(16)
-    with open(_job_path(job_id), 'w', encoding='utf-8') as fp:
-        json.dump({'tables': ordered, 'is_pg': is_pg}, fp)
+    job_id = secrets.token_urlsafe(32)
+    job = {
+        'owner_id': current_user.id,
+        'created_at': _utcnow().isoformat() + 'Z',
+        'tables': ordered,
+        'is_pg': str(db.engine.url).startswith('postgresql'),
+    }
+    _write_private_file(_job_path(job_id), json.dumps(job, default=_json_default))
     _audit('import_db_start', 'config', f'{len(ordered)} tables', f'File: {f.filename}')
     return jsonify({'ok': True, 'job_id': job_id, 'total': len(ordered)})
 
 
-@app.route('/admin/config/import-run/<job_id>')
+@app.route('/admin/config/import-run/<job_id>', methods=['POST'])
 @login_required
 @require_module('config', 'full')
+@require_admin
 def import_run(job_id):
-    """Phase 2: SSE stream that executes the restore and reports per-table progress."""
+    """Apply the validated restore atomically after creating an encrypted snapshot."""
+    _cleanup_restore_jobs()
     jpath = _job_path(job_id)
     if not os.path.exists(jpath):
-        def _err():
-            yield 'data: {"error":"Job not found or expired"}\n\n'
-        return app.response_class(_err(), mimetype='text/event-stream')
+        return jsonify({'ok': False, 'error': 'Restore job not found or expired.'}), 404
     with open(jpath, 'r', encoding='utf-8') as fp:
         job = json.load(fp)
+    if job.get('owner_id') != current_user.id:
+        abort(403)
+    try:
+        created = datetime.fromisoformat(job['created_at'].rstrip('Z'))
+    except (KeyError, TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'Restore job metadata is invalid.'}), 400
+    if _utcnow() - created > timedelta(seconds=app.config['RESTORE_JOB_TTL_SECONDS']):
+        os.remove(jpath)
+        return jsonify({'ok': False, 'error': 'Restore job has expired.'}), 410
 
-    tables  = job['tables']
-    is_pg   = job['is_pg']
-    total   = len(tables)
+    try:
+        tables = _validate_backup_document({
+            'format': _BACKUP_FORMAT, 'version': _BACKUP_VERSION,
+            'tables': dict(job['tables']),
+        })
+        snapshot = json.dumps(_full_backup_document(), default=_json_default,
+                              separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+        encrypted_snapshot = _backup_fernet().encrypt(snapshot)
+        snapshot_name = f'pre_restore_{_utcnow().strftime("%Y%m%dT%H%M%SZ")}_{job_id}.bustrack'
+        _write_private_file(os.path.join(RESTORE_SNAPSHOT_DIR, snapshot_name),
+                            encrypted_snapshot, binary=True)
 
-    def _generate():
         from sqlalchemy import text as sa_text
-        with app.app_context():
-            errors   = []
-            restored = 0
-
-            yield f'data: {json.dumps({"status":"truncating","total":total})}\n\n'
-
-            try:
-                with db.engine.begin() as conn:
-                    # ── TRUNCATE all tables first ─────────────────────────────
-                    if is_pg:
-                        for t, _ in tables:
-                            try:
-                                conn.execute(sa_text(f'TRUNCATE TABLE "{t}" CASCADE'))
-                            except Exception as e:
-                                errors.append(f'TRUNCATE {t}: {e}')
-                    else:
-                        conn.execute(sa_text('PRAGMA foreign_keys = OFF'))
-                        for t, _ in tables:
-                            try:
-                                conn.execute(sa_text(f'DELETE FROM "{t}"'))
-                            except Exception as e:
-                                errors.append(f'DELETE {t}: {e}')
-
-                    # ── INSERT each table ─────────────────────────────────────
-                    for step, (t, rows) in enumerate(tables, 1):
-                        inserted = 0
-                        try:
-                            for row in rows:
-                                if not isinstance(row, dict) or not row:
-                                    continue
-                                col_names    = ', '.join(f'"{k}"' for k in row)
-                                placeholders = ', '.join(f':{k}' for k in row)
-                                conn.execute(
-                                    sa_text(f'INSERT INTO "{t}" ({col_names}) VALUES ({placeholders})'),
-                                    row
-                                )
-                                inserted += 1
-                            # Reset PG sequences
-                            if is_pg and rows and 'id' in rows[0]:
-                                try:
-                                    conn.execute(sa_text(
-                                        f"SELECT setval(pg_get_serial_sequence('\"{t}\"','id'),"
-                                        f"COALESCE(MAX(id),1),true) FROM \"{t}\""
-                                    ))
-                                except Exception:
-                                    pass
-                            restored += 1
-                            ok = True
-                            err_msg = ''
-                        except Exception as e:
-                            ok = False
-                            err_msg = str(e)
-                            errors.append(f'{t}: {err_msg}')
-
-                        yield f'data: {json.dumps({"step":step,"total":total,"table":t,"rows":inserted,"ok":ok,"error":err_msg})}\n\n'
-
-                    if not is_pg:
-                        conn.execute(sa_text('PRAGMA foreign_keys = ON'))
-
-            except Exception as e:
-                errors.append(f'Transaction error: {e}')
-
-            try:
-                os.remove(jpath)
-            except Exception:
-                pass
-            _audit('import_db_done', 'config', f'{restored}/{total} tables restored',
-                   '; '.join(errors) if errors else 'no errors')
-            yield f'data: {json.dumps({"done":True,"restored":restored,"total":total,"errors":errors})}\n\n'
-
-    resp = app.response_class(_generate(), mimetype='text/event-stream')
-    resp.headers['Cache-Control'] = 'no-cache'
-    resp.headers['X-Accel-Buffering'] = 'no'
-    return resp
+        with db.engine.begin() as conn:
+            table_names = [table for table, _ in tables]
+            if job.get('is_pg'):
+                quoted = ', '.join(f'"{table}"' for table in table_names)
+                if quoted:
+                    conn.execute(sa_text(f'TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE'))
+            else:
+                for table in reversed(table_names):
+                    conn.execute(sa_text(f'DELETE FROM "{table}"'))
+            for table, rows in tables:
+                for row in rows:
+                    columns = ', '.join(f'"{key}"' for key in row)
+                    placeholders = ', '.join(f':{key}' for key in row)
+                    conn.execute(sa_text(
+                        f'INSERT INTO "{table}" ({columns}) VALUES ({placeholders})'), row)
+                if job.get('is_pg') and rows and 'id' in rows[0]:
+                    conn.execute(sa_text(
+                        f"SELECT setval(pg_get_serial_sequence('\"{table}\"','id'), "
+                        f"COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM \"{table}\""))
+        db.session.expire_all()
+        os.remove(jpath)
+        _audit('import_db_done', 'config', f'{len(tables)} tables restored',
+               f'Pre-restore snapshot: {snapshot_name}')
+        return jsonify({'ok': True, 'restored': len(tables), 'total': len(tables),
+                        'snapshot': snapshot_name})
+    except RuntimeError as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 503
+    except Exception:
+        db.session.rollback()
+        _audit('import_db_failed', 'config', 'atomic restore rolled back')
+        return jsonify({'ok': False, 'error':
+                        'Restore failed and the database transaction was rolled back.'}), 400
 
 @app.route('/admin/config/manual-commit', methods=['POST'])
 @login_required
@@ -3918,11 +4529,11 @@ def export_logs_csv():
     writer = csv.writer(buf)
     writer.writerow(['Timestamp', 'Username', 'Action', 'Module', 'Target', 'Details', 'IP'])
     for log in q.all():
-        writer.writerow([
+        writer.writerow(_csv_safe_row([
             log.created_at.strftime('%Y-%m-%d %H:%M:%S') if log.created_at else '',
             log.username or '', log.action or '', log.module or '',
             log.target or '', log.details or '', log.ip_address or '',
-        ])
+        ]))
     resp = make_response(buf.getvalue())
     resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
     resp.headers['Content-Disposition'] = f'attachment; filename=audit_log_{date.today()}.csv'
@@ -3945,10 +4556,15 @@ def profile():
         current_user.receive_notifications = 'receive_notifications' in request.form
         pwd = request.form.get('new_password','').strip()
         if pwd:
+            if len(pwd) < 12:
+                flash('New password must be at least 12 characters.', 'error')
+                return redirect(url_for('profile'))
             if not current_user.check_password(request.form.get('current_password','')):
                 flash('Current password is incorrect.', 'error')
                 return redirect(url_for('profile'))
             current_user.set_password(pwd)
+            current_user.session_version = int(current_user.session_version or 1) + 1
+            session['session_version'] = current_user.session_version
         db.session.commit()
         flash('Profile updated.', 'success')
         return redirect(url_for('profile'))

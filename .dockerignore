@@ -14,10 +14,15 @@ venv/
 env/
 .venv/
 .env/
+.env
+*.env
+!.env.example
 
 # Instance data (written at runtime, use volumes)
 instance/
 *.db
+static/uploads/
+static/exports/
 
 # Development / editor
 .idea/

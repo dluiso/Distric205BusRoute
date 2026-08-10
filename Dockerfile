@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 FROM base
 
 WORKDIR /app
-COPY . .
+COPY --chown=1000:1000 app.py ./app.py
+COPY --chown=1000:1000 templates ./templates
 
 # Persistent directories (override with Docker volumes)
 RUN mkdir -p instance static/uploads static/exports

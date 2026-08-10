@@ -48,13 +48,14 @@
     </div>
     {% if can_write %}
     <div class="px-4 py-3 bg-slate-50 border-t border-slate-100 flex items-center justify-end space-x-2">
-      <button onclick="openEdit({{ it.id }}, '{{ it.name|e }}', '{{ it.color }}', '{{ it.icon }}', '{{ it.description or '' }}')"
+      <button data-incident='{{ {"id": it.id, "name": it.name, "color": it.color, "icon": it.icon, "description": it.description or ""} | tojson }}'
+              onclick="openEditFromButton(this)"
               class="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:border-blue-400 hover:text-blue-600 transition-colors">
         <i class="fas fa-edit mr-1"></i>Edit
       </button>
       {% if not it.is_system %}
       <form method="POST" action="{{ url_for('delete_incident_type', type_id=it.id) }}"
-            onsubmit="return confirm('Delete \'{{ it.name }}\' ?')">
+            onsubmit="return confirm('Delete this status type?')">
         <button type="submit" class="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-red-500 hover:border-red-300 hover:bg-red-50 transition-colors">
           <i class="fas fa-trash mr-1"></i>Delete
         </button>
@@ -218,9 +219,16 @@ function openEdit(id, name, color, icon, desc) {
   document.getElementById('modal-edit').classList.remove('hidden');
 }
 
+function openEditFromButton(button) {
+  const item = JSON.parse(button.dataset.incident);
+  openEdit(item.id, item.name, item.color, item.icon, item.description);
+}
+
 function updateIconPreview(previewId, iconClass) {
   const el = document.getElementById(previewId);
-  el.innerHTML = `<i class="fas ${iconClass}"></i>`;
+  const icon = document.createElement('i');
+  icon.className = 'fas ' + (/^fa-[a-z0-9-]+$/.test(iconClass) ? iconClass : 'fa-circle');
+  el.replaceChildren(icon);
 }
 
 function syncColor(prefix) {
