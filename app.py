@@ -1045,9 +1045,73 @@ def _seed_phase2_security_and_imports():
             except (TypeError, ValueError):
                 existing_mapping = {}
             # Upgrade only the Phase 2 placeholder.  A complete operator-defined
-            # profile is never overwritten during startup.
+            # profile is never overwritten during startup. Managed aliases are
+            # merged additively so existing profiles can read newer saved exports
+            # without discarding operator-defined aliases.
             if not isinstance(existing_mapping.get('files'), dict):
                 row.mapping_json = json.dumps(mapping, sort_keys=True)
+            else:
+                original_mapping_json = json.dumps(existing_mapping, sort_keys=True)
+                changed = False
+                for file_key, managed_file in DEFAULT_MAPPING_V1['files'].items():
+                    existing_file = existing_mapping['files'].get(file_key)
+                    if existing_file is None:
+                        existing_file = {}
+                        existing_mapping['files'][file_key] = existing_file
+                        changed = True
+                    if not isinstance(existing_file, dict):
+                        continue
+                    existing_columns = existing_file.get('columns')
+                    if existing_columns is None:
+                        existing_columns = {}
+                        existing_file['columns'] = existing_columns
+                        changed = True
+                    if not isinstance(existing_columns, dict):
+                        continue
+                    for canonical, managed_aliases in managed_file['columns'].items():
+                        existing_aliases = existing_columns.get(canonical)
+                        if existing_aliases is None:
+                            existing_aliases = []
+                            existing_columns[canonical] = existing_aliases
+                            changed = True
+                        if not isinstance(existing_aliases, list):
+                            continue
+                        for alias in managed_aliases:
+                            if alias not in existing_aliases:
+                                existing_aliases.append(alias)
+                                changed = True
+                    existing_required = existing_file.get('required')
+                    if existing_required is None:
+                        existing_required = []
+                        existing_file['required'] = existing_required
+                        changed = True
+                    if isinstance(existing_required, list):
+                        for canonical in managed_file.get('required', []):
+                            if canonical not in existing_required:
+                                existing_required.append(canonical)
+                                changed = True
+                existing_periods = existing_mapping.get('period_aliases')
+                if existing_periods is None:
+                    existing_periods = {}
+                    existing_mapping['period_aliases'] = existing_periods
+                    changed = True
+                if isinstance(existing_periods, dict):
+                    for canonical, managed_aliases in (
+                            DEFAULT_MAPPING_V1['period_aliases'].items()):
+                        existing_aliases = existing_periods.get(canonical)
+                        if existing_aliases is None:
+                            existing_aliases = []
+                            existing_periods[canonical] = existing_aliases
+                            changed = True
+                        if not isinstance(existing_aliases, list):
+                            continue
+                        for alias in managed_aliases:
+                            if alias not in existing_aliases:
+                                existing_aliases.append(alias)
+                                changed = True
+                if changed or json.dumps(
+                        existing_mapping, sort_keys=True) != original_mapping_json:
+                    row.mapping_json = json.dumps(existing_mapping, sort_keys=True)
 
     now = _utcnow()
     BroadcastJob.query.filter(
@@ -3956,6 +4020,16 @@ def _powerschool_enabled():
         abort(404)
 
 
+@app.route('/admin/notifications/powerschool-guide')
+@login_required
+@require_module('notifications')
+def powerschool_import_guide():
+    return render_template(
+        'admin/powerschool_guide.html',
+        powerschool_enabled=app.config['POWERSCHOOL_IMPORT_ENABLED'],
+        can_powerschool_import=current_user.has_capability('import.powerschool'))
+
+
 def _import_metadata(batch):
     try:
         value = json.loads(batch.metadata_json or '{}')
@@ -4309,9 +4383,29 @@ def powerschool_import_preview():
     _cleanup_import_stages()
     transportation = request.files.get('transportation_file')
     contacts = request.files.get('contacts_file')
-    if not _valid_csv_upload(transportation) or not _valid_csv_upload(contacts):
+    student_contacts = request.files.get('student_contacts_file')
+    guardian_contacts = request.files.get('guardian_contacts_file')
+    has_combined_contacts = bool(contacts and contacts.filename)
+    has_student_contacts = bool(student_contacts and student_contacts.filename)
+    has_guardian_contacts = bool(guardian_contacts and guardian_contacts.filename)
+    has_any_split_contacts = has_student_contacts or has_guardian_contacts
+    if not _valid_csv_upload(transportation):
         return jsonify({'ok': False, 'message':
-                        'Select both approved UTF-8 CSV exports.'}), 400
+                        'Select the approved UTF-8 Transportation CSV export.'}), 400
+    if has_combined_contacts and has_any_split_contacts:
+        return jsonify({'ok': False, 'message':
+                        'Choose either the combined Contacts CSV or both PowerSchool contact exports, not both.'}), 400
+    if has_combined_contacts:
+        if not _valid_csv_upload(contacts):
+            return jsonify({'ok': False, 'message':
+                            'Select a valid UTF-8 combined Contacts CSV.'}), 400
+    elif not (has_student_contacts and has_guardian_contacts):
+        return jsonify({'ok': False, 'message':
+                        'Select both the Student Contacts and Guardian Contacts UTF-8 CSV exports.'}), 400
+    elif (not _valid_csv_upload(student_contacts)
+          or not _valid_csv_upload(guardian_contacts)):
+        return jsonify({'ok': False, 'message':
+                        'Both PowerSchool contact exports must be valid UTF-8 CSV files.'}), 400
     school_year = _normalize_text(request.form.get('school_year'), 20)
     if not re.fullmatch(r'20\d{2}-\d{2}', school_year):
         return jsonify({'ok': False, 'message':
@@ -4330,10 +4424,35 @@ def powerschool_import_preview():
     try:
         mapping = json.loads(profile.mapping_json)
         transport_payload = transportation.read()
-        contacts_payload = contacts.read()
+        contact_uploads = {}
+        if has_combined_contacts:
+            contacts_payload = contacts.read()
+            contact_sources = None
+            contact_uploads['contacts'] = (contacts, contacts_payload)
+        else:
+            contacts_payload = None
+            student_contacts_payload = student_contacts.read()
+            guardian_contacts_payload = guardian_contacts.read()
+            contact_sources = [
+                {
+                    'key': 'student_contacts',
+                    'payload': student_contacts_payload,
+                    'force_relationship': 'student',
+                },
+                {
+                    'key': 'guardian_contacts',
+                    'payload': guardian_contacts_payload,
+                    'default_relationship': 'guardian',
+                },
+            ]
+            contact_uploads.update({
+                'student_contacts': (student_contacts, student_contacts_payload),
+                'guardian_contacts': (guardian_contacts, guardian_contacts_payload),
+            })
         parsed = build_normalized_plan(
             transport_payload, contacts_payload, mapping,
-            app.config['IMPORT_MAX_ROWS'], app.config['IMPORT_MAX_COLUMNS'])
+            app.config['IMPORT_MAX_ROWS'], app.config['IMPORT_MAX_COLUMNS'],
+            contact_sources=contact_sources)
     except (ImportValidationError, json.JSONDecodeError) as exc:
         return jsonify({'ok': False, 'message': str(exc)}), 400
 
@@ -4366,9 +4485,10 @@ def powerschool_import_preview():
         paths.append(_store_powerschool_file(
             batch, 'transportation', transportation, transport_payload,
             parsed['files']['transportation']['headers']))
-        paths.append(_store_powerschool_file(
-            batch, 'contacts', contacts, contacts_payload,
-            parsed['files']['contacts']['headers']))
+        for file_type, (uploaded, payload) in contact_uploads.items():
+            paths.append(_store_powerschool_file(
+                batch, file_type, uploaded, payload,
+                parsed['files'][file_type]['headers']))
         row_number = 1
         uploaded_students = set()
         counts = {name: 0 for name in (

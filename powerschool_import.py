@@ -37,40 +37,44 @@ DEFAULT_MAPPING_V1 = {
                 ],
                 "student_id": [
                     "student_id", "STUDENTS.ID", "STUDENTS.dcid",
-                    "TRANSPORTATION.StudentID", "TRANSPORTATION.student_dcid",
+                    "student_dcid", "TRANSPORTATION.StudentID",
+                    "TRANSPORTATION.student_dcid",
                 ],
                 "household_id": [
                     "household_id", "family_id", "source_identifier",
                     "STUDENTS.Family_Ident",
                 ],
                 "first_name": [
-                    "first_name", "STUDENTS.First_Name",
+                    "first_name", "studentfname", "STUDENTS.First_Name",
                     "BRIGHTARROW.006_studentfname",
                     "TRANSPORTATION.studentfname",
                 ],
                 "last_name": [
-                    "last_name", "STUDENTS.Last_Name",
+                    "last_name", "studentlname", "STUDENTS.Last_Name",
                     "BRIGHTARROW.007_studentlname",
                     "TRANSPORTATION.studentlname",
                 ],
                 "school": [
-                    "school", "school_id", "STUDENTS.SchoolID",
+                    "school", "school_id", "schoolid", "STUDENTS.SchoolID",
                     "BRIGHTARROW.200_schoolid", "TRANSPORTATION.SchoolID",
                     "TRANSPORTATION.schoolid",
                 ],
-                "grade": ["grade", "grade_level", "STUDENTS.Grade_Level"],
+                "grade": [
+                    "grade", "grade_level", "STUDENTS.Grade_Level",
+                    "TRANSPORTATION.grade_level",
+                ],
                 "route": [
-                    "route", "bus_route", "STUDENTS.Bus_Route",
+                    "route", "bus_route", "busnumber", "STUDENTS.Bus_Route",
                     "BRIGHTARROW.013_bus_route", "TRANSPORTATION.BusNumber",
                     "TRANSPORTATION.busnumber",
                 ],
                 "stop": [
-                    "stop", "bus_stop", "STUDENTS.Bus_Stop",
+                    "stop", "bus_stop", "stopnumber", "STUDENTS.Bus_Stop",
                     "BRIGHTARROW.014_bus_stop", "TRANSPORTATION.StopNumber",
                     "TRANSPORTATION.stopnumber",
                 ],
                 "period": [
-                    "period", "direction", "TRANSPORTATION.FromTo",
+                    "period", "direction", "fromto", "TRANSPORTATION.FromTo",
                     "TRANSPORTATION.fromto", "TRANSPORTATION.Type",
                     "TRANSPORTATION.type",
                 ],
@@ -92,28 +96,33 @@ DEFAULT_MAPPING_V1 = {
                     "STUDENTS.Student_Number",
                 ],
                 "contact_id": [
-                    "contact_id", "contact_dcid",
+                    "contact_id", "contact_dcid", "600_00_contact_id",
+                    "600_04_contact_std_detailid",
                     "BRIGHTARROW.600_00_contact_id",
                     "BRIGHTARROW.600_04_contact_std_detailid",
                 ],
                 "first_name": [
-                    "first_name", "contact_first_name",
+                    "first_name", "contact_first_name", "600_01_contact_firstname",
                     "BRIGHTARROW.600_01_contact_firstname",
                 ],
                 "last_name": [
-                    "last_name", "contact_last_name",
+                    "last_name", "contact_last_name", "600_02_contact_lastname",
                     "BRIGHTARROW.600_02_contact_lastname",
                 ],
                 "relationship": [
-                    "relationship", "role",
+                    "relationship", "role", "600_03_contact_relationship",
                     "BRIGHTARROW.600_03_contact_relationship",
                 ],
                 "email": [
-                    "email", "BRIGHTARROW.801_email1",
+                    "email", "801_email1", "802_email2", "803_email3",
+                    "BRIGHTARROW.801_email1",
                     "BRIGHTARROW.802_email2", "BRIGHTARROW.803_email3",
                 ],
                 "phone": [
-                    "phone", "home_phone", "BRIGHTARROW.601_01_home_phone",
+                    "phone", "home_phone", "601_01_home_phone", "602_01_phone2",
+                    "603_01_phone3", "604_01_phone4", "605_01_phone5",
+                    "606_01_phone6", "607_01_phone7", "608_01_phone8",
+                    "609_01_phone9", "BRIGHTARROW.601_01_home_phone",
                     "BRIGHTARROW.602_01_phone2", "BRIGHTARROW.603_01_phone3",
                     "BRIGHTARROW.604_01_phone4", "BRIGHTARROW.605_01_phone5",
                     "BRIGHTARROW.606_01_phone6", "BRIGHTARROW.607_01_phone7",
@@ -276,17 +285,57 @@ def _normalize_period(value, aliases):
     return aliases.get(raw)
 
 
-def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows, max_columns):
+def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows,
+                          max_columns, contact_sources=None):
     files = mapping.get("files") or {}
     if "transportation" not in files or "contacts" not in files:
         raise ImportValidationError("The selected mapping profile is incomplete.")
 
     transport_headers, transport_rows = read_csv_payload(
         transport_payload, max_rows, max_columns)
-    contact_headers, contact_rows = read_csv_payload(
-        contacts_payload, max_rows, max_columns)
     transport_map = resolve_mapping(transport_headers, files["transportation"])
-    contact_map = resolve_mapping(contact_headers, files["contacts"])
+    if contact_sources is None:
+        if contacts_payload is None:
+            raise ImportValidationError("A contacts export is required.")
+        contact_sources = [{
+            "key": "contacts", "payload": contacts_payload,
+            "force_relationship": None, "default_relationship": None,
+        }]
+        split_contacts = False
+    else:
+        if contacts_payload is not None:
+            raise ImportValidationError(
+                "Use either one combined contacts export or the two PowerSchool contact exports.")
+        split_contacts = True
+        if not isinstance(contact_sources, (list, tuple)) or not contact_sources:
+            raise ImportValidationError("Both PowerSchool contact exports are required.")
+
+    parsed_contact_sources = []
+    total_contact_rows = 0
+    used_source_keys = set()
+    for source in contact_sources:
+        source_key = normalize_text(source.get("key"), 40)
+        payload = source.get("payload")
+        if not source_key or source_key in used_source_keys or not isinstance(payload, bytes):
+            raise ImportValidationError("The contacts export configuration is invalid.")
+        used_source_keys.add(source_key)
+        contact_headers, contact_rows = read_csv_payload(
+            payload, max_rows, max_columns)
+        total_contact_rows += len(contact_rows)
+        if total_contact_rows > max_rows:
+            raise ImportValidationError(
+                f"The contact exports contain more than {max_rows} total data rows.")
+        parsed_contact_sources.append({
+            "key": source_key,
+            "payload": payload,
+            "headers": contact_headers,
+            "rows": contact_rows,
+            "mapping": resolve_mapping(contact_headers, files["contacts"]),
+            "force_relationship": normalize_text(
+                source.get("force_relationship"), 40).lower(),
+            "default_relationship": normalize_text(
+                source.get("default_relationship"), 40).lower(),
+        })
     aliases = _period_alias_map(mapping)
 
     students = {}
@@ -353,58 +402,72 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
                 proposal[field] = incoming
 
     seen_contacts = {}
-    for row_number, row in contact_rows:
-        student_number = normalize_identifier(_first(row, contact_map, "student_number"))
-        contact_id = normalize_identifier(_first(row, contact_map, "contact_id"))
-        email, invalid_emails = normalize_email_values(_values(row, contact_map, "email"))
-        contact = {
-            "contact_id": contact_id,
-            "first_name": normalize_text(_first(row, contact_map, "first_name"), 80),
-            "last_name": normalize_text(_first(row, contact_map, "last_name"), 80),
-            "relationship": normalize_text(
-                _first(row, contact_map, "relationship"), 40).lower(),
-            "email": email,
-            "phone": normalize_phone_values(_values(row, contact_map, "phone")),
-            "notification_preference": normalize_text(
-                _first(row, contact_map, "notification_preference"), 40).lower(),
-            "priority": normalize_text(_first(row, contact_map, "priority"), 20),
-        }
-        errors = []
-        if not student_number:
-            errors.append("student_number is required")
-        elif student_number not in students:
-            errors.append("student_number has no valid transportation row")
-        if not contact_id:
-            errors.append("contact_id is required; PII cannot be used as identity")
-        elif not IDENTIFIER_RE.fullmatch(contact_id):
-            errors.append("contact_id contains unsupported characters")
-        if invalid_emails:
-            errors.append("one or more email addresses are invalid")
-        if len(email) > 500:
-            errors.append("normalized email addresses exceed the 500-character limit")
-        if not contact["first_name"] and not contact["email"] and not contact["phone"]:
-            errors.append("contact has no usable name, email, or phone")
-        if errors:
-            row_issues.append({
-                "file": "contacts", "row_number": row_number,
-                "classification": "rejected", "errors": errors,
-            })
-            continue
-        key = (student_number, contact_id)
-        canonical = json.dumps(contact, sort_keys=True, separators=(",", ":"))
-        if key in seen_contacts:
-            classification = "duplicate" if seen_contacts[key] == canonical else "conflict"
-            row_issues.append({
-                "file": "contacts", "row_number": row_number,
-                "classification": classification,
-                "errors": [f"contact_id is repeated with {classification} values"],
-            })
-            if classification == "conflict":
-                students[student_number].setdefault("conflicts", []).append(
-                    "contacts contain conflicting values for one contact_id")
-            continue
-        seen_contacts[key] = canonical
-        students[student_number]["contacts"].append(contact)
+    for source in parsed_contact_sources:
+        contact_map = source["mapping"]
+        for row_number, row in source["rows"]:
+            student_number = normalize_identifier(
+                _first(row, contact_map, "student_number"))
+            contact_id = normalize_identifier(_first(row, contact_map, "contact_id"))
+            email, invalid_emails = normalize_email_values(
+                _values(row, contact_map, "email"))
+            relationship = normalize_text(
+                _first(row, contact_map, "relationship"), 40).lower()
+            if source["force_relationship"]:
+                relationship = source["force_relationship"]
+            elif not relationship:
+                relationship = source["default_relationship"]
+            contact = {
+                "contact_id": contact_id,
+                "first_name": normalize_text(
+                    _first(row, contact_map, "first_name"), 80),
+                "last_name": normalize_text(
+                    _first(row, contact_map, "last_name"), 80),
+                "relationship": relationship,
+                "email": email,
+                "phone": normalize_phone_values(
+                    _values(row, contact_map, "phone")),
+                "notification_preference": normalize_text(
+                    _first(row, contact_map, "notification_preference"), 40).lower(),
+                "priority": normalize_text(
+                    _first(row, contact_map, "priority"), 20),
+            }
+            errors = []
+            if not student_number:
+                errors.append("student_number is required")
+            elif student_number not in students:
+                errors.append("student_number has no valid transportation row")
+            if not contact_id:
+                errors.append("contact_id is required; PII cannot be used as identity")
+            elif not IDENTIFIER_RE.fullmatch(contact_id):
+                errors.append("contact_id contains unsupported characters")
+            if invalid_emails:
+                errors.append("one or more email addresses are invalid")
+            if len(email) > 500:
+                errors.append("normalized email addresses exceed the 500-character limit")
+            if not contact["first_name"] and not contact["email"] and not contact["phone"]:
+                errors.append("contact has no usable name, email, or phone")
+            if errors:
+                row_issues.append({
+                    "file": source["key"], "row_number": row_number,
+                    "classification": "rejected", "errors": errors,
+                })
+                continue
+            key = (student_number, contact_id)
+            canonical = json.dumps(contact, sort_keys=True, separators=(",", ":"))
+            if key in seen_contacts:
+                classification = (
+                    "duplicate" if seen_contacts[key] == canonical else "conflict")
+                row_issues.append({
+                    "file": source["key"], "row_number": row_number,
+                    "classification": classification,
+                    "errors": [f"contact_id is repeated with {classification} values"],
+                })
+                if classification == "conflict":
+                    students[student_number].setdefault("conflicts", []).append(
+                        "contacts contain conflicting values for one contact_id")
+                continue
+            seen_contacts[key] = canonical
+            students[student_number]["contacts"].append(contact)
 
     normalized = []
     for student_number in sorted(students):
@@ -424,17 +487,30 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             proposal["contacts"], key=lambda item: item["contact_id"])
         normalized.append(proposal)
 
-    combined_sha = hashlib.sha256(
-        hashlib.sha256(transport_payload).digest()
-        + hashlib.sha256(contacts_payload).digest()
-    ).hexdigest()
+    if split_contacts:
+        digest_input = bytearray(b"powerschool-split-contacts-v1\0")
+        digest_input.extend(hashlib.sha256(transport_payload).digest())
+        for source in parsed_contact_sources:
+            digest_input.extend(source["key"].encode("utf-8"))
+            digest_input.extend(b"\0")
+            digest_input.extend(hashlib.sha256(source["payload"]).digest())
+        combined_sha = hashlib.sha256(bytes(digest_input)).hexdigest()
+    else:
+        combined_sha = hashlib.sha256(
+            hashlib.sha256(transport_payload).digest()
+            + hashlib.sha256(contacts_payload).digest()
+        ).hexdigest()
+    file_metadata = {
+        "transportation": {"headers": transport_headers, "rows": len(transport_rows)},
+    }
+    for source in parsed_contact_sources:
+        file_metadata[source["key"]] = {
+            "headers": source["headers"], "rows": len(source["rows"]),
+        }
     return {
         "students": normalized,
         "issues": row_issues,
-        "files": {
-            "transportation": {"headers": transport_headers, "rows": len(transport_rows)},
-            "contacts": {"headers": contact_headers, "rows": len(contact_rows)},
-        },
+        "files": file_metadata,
         "combined_sha256": combined_sha,
     }
 

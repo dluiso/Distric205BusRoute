@@ -100,6 +100,10 @@
          class="inline-flex items-center gap-1.5 px-3 py-2 border border-slate-200 hover:border-emerald-400 text-slate-600 hover:text-emerald-700 rounded-xl text-sm font-medium transition-colors">
         <i class="fas fa-file-csv text-xs"></i>Export CSV
       </a>{% endif %}
+      <a href="{{ url_for('powerschool_import_guide') }}"
+         class="inline-flex items-center gap-1.5 px-3 py-2 border border-indigo-200 hover:border-indigo-400 text-indigo-700 rounded-xl text-sm font-medium transition-colors">
+        <i class="fas fa-book-open text-xs"></i>PowerSchool Guide
+      </a>
       {% if can_write %}
       {% if powerschool_enabled and can_powerschool_import %}
       <a href="{{ url_for('powerschool_import_page') }}"

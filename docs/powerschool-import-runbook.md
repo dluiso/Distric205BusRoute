@@ -21,9 +21,23 @@ deactivate a subscriber.
 
 ## Saved PowerSchool exports
 
-Create and retain two Data Export Manager templates. Export CSV as UTF-8 and preserve
-all identifiers as text, including leading zeroes. Column order does not matter: the
-selected versioned mapping profile resolves column names and aliases.
+The district PowerSchool account contains three reusable Data Export Manager templates.
+Open them through **District Office → Special Functions → Importing & Exporting → Data
+Export Manager → My Templates**. Export all three for the same scope and school year.
+Use comma delimiter, CR/LF line endings, UTF-8, column headers and quoted values. Do not
+open and resave the files in Excel: stable identifiers and leading zeroes must remain
+unchanged. Column order does not matter because the versioned mapping profile resolves
+column names and aliases.
+
+| Saved template | PowerSchool source | Expected filename |
+|---|---|---|
+| `D205 BusRoute - Transportation v1` | `BrightArrow Transportation Current Day Bussing` | `D205_BusRoute_Transportation_v1.csv` |
+| `D205 BusRoute - Student Contacts v1` | `BrightArrow - Basic - Students Combined` | `D205_BusRoute_Student_Contacts_v1.csv` |
+| `D205 BusRoute - Guardian Contacts v1` | `BrightArrow - Basic - Parents Combined` | `D205_BusRoute_Guardian_Contacts_v1.csv` |
+
+Run Transportation before 6:00 PM because its PowerSchool source changes to the next
+service day after 6:00 PM. Never schedule these exports to email or an unsecured/shared
+folder. They contain protected student and guardian information.
 
 ### Transportation
 
@@ -48,7 +62,7 @@ The supplied v1 profile also recognizes the district's verified `STUDENTS.*`,
 `TRANSPORTATION.*` and `BRIGHTARROW.*` header aliases. A student may have multiple
 rows for multiple periods, but conflicting bus routes are classified as `conflict`.
 
-### Contacts
+### Student and guardian contacts
 
 Use `powerschool-contacts-v1.csv`:
 
@@ -62,18 +76,30 @@ Use `powerschool-contacts-v1.csv`:
 | `notification_preference` | no | Retained in normalized review data |
 | `priority` | no | Retained in normalized review data |
 
+PowerSchool separates student contact information from parent/guardian contacts. Upload
+both saved contact exports; the application combines them during normalization. Rows
+from `Students Combined` are assigned the student role. `Parents Combined` preserves its
+relationship and defaults a blank relationship to guardian. No manual CSV merge is
+required.
+
 The v1 mapping accepts the verified `BRIGHTARROW.600_*`, `601_*`–`609_*` and
-`801_*`–`803_*` aliases. Repeated stable IDs with different values are conflicts.
+`801_*`–`803_* aliases. Repeated stable IDs with different values are conflicts. The
+downloadable `powerschool-contacts-v1.csv` remains available only as a backward-compatible
+combined-file contract.
 
 ## Annual workflow
 
 1. Confirm the active bus catalog and its AM/MD/PM schedule assignments.
-2. Export Transportation and Contacts for the same school year and scope.
-3. Open **Notifications → PowerSchool** and choose the mapping version.
+2. Run the three saved templates for the same school year and scope; do not edit or
+   manually combine their CSV output.
+3. Open **Notifications → PowerSchool Guide** for the operational checklist, then open
+   the importer and choose the mapping version.
 4. Select `Delta` for normal incremental work. Select `Complete district snapshot`
    only when the files are known to contain the entire district population.
-5. Analyze. The server validates UTF-8, MIME/type, headers, column and row limits,
-   stable identifiers, duplicate files, duplicate rows, routes, periods and contacts.
+5. Keep `PowerSchool saved templates` selected and upload Transportation, Student
+   Contacts and Guardian Contacts. Analyze. The server validates UTF-8, MIME/type,
+   headers, cumulative column/row limits, stable identifiers, duplicate files, duplicate
+   rows, routes, periods and contacts.
 6. Review `new`, `update`, `unchanged`, `duplicate`, `conflict`, `rejected` and any
    `deactivate_candidate` rows. Filter by classification, school, grade, group/route,
    or change/error type.
@@ -86,7 +112,7 @@ The v1 mapping accepts the verified `BRIGHTARROW.600_*`, `601_*`–`609_*` and
 10. Download the final CSV report and reconcile:
     `selected + excluded + rejected = total`.
 11. Reopening or resubmitting the same applied batch creates no duplicates. Exact file
-    pairs already staged or applied are detected by SHA-256.
+   sets already staged or applied are detected by SHA-256.
 12. Monitor audit logs and notifications before expanding a pilot to more schools.
 
 ## Classification and preservation rules

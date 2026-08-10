@@ -6,7 +6,11 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import app as application
-from powerschool_import import build_normalized_plan
+from powerschool_import import (
+    DEFAULT_MAPPING_V1,
+    ImportValidationError,
+    build_normalized_plan,
+)
 from conftest import _database_url_for_tests, csrf_token, login
 from test_phase1_security import add_group, add_user
 
@@ -19,6 +23,19 @@ CONTACT_HEADER = (
     'student_number,contact_id,first_name,last_name,relationship,email,phone,'
     'notification_preference,priority\n'
 )
+POWERSCHOOL_TRANSPORT_HEADER = ','.join([
+    'TRANSPORTATION.student_number', 'student_dcid', 'studentfname',
+    'studentlname', 'schoolid', 'grade_level', 'busnumber', 'stopnumber',
+    'fromto', 'ride_on_enabledToday',
+]) + '\n'
+POWERSCHOOL_CONTACT_HEADER = ','.join([
+    'BRIGHTARROW.003_student_number', '600_00_contact_id',
+    '600_04_contact_std_detailid', '600_01_contact_firstname',
+    '600_02_contact_lastname', '600_03_contact_relationship',
+    '601_01_home_phone', '602_01_phone2', '603_01_phone3', '604_01_phone4',
+    '605_01_phone5', '606_01_phone6', '607_01_phone7', '608_01_phone8',
+    '609_01_phone9', '801_email1', '802_email2', '803_email3',
+]) + '\n'
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +91,116 @@ def preview(client, transportation, contacts, snapshot='delta'):
             io.BytesIO((CONTACT_HEADER + contacts).encode()),
             'contacts.csv', 'text/csv'),
     }, content_type='multipart/form-data')
+
+
+def preview_split(client, transportation, student_contacts, guardian_contacts,
+                  snapshot='delta'):
+    return client.post('/admin/notifications/powerschool/preview', data={
+        '_csrf': csrf_token(client), 'school_year': '2026-27',
+        'snapshot_type': snapshot, 'mapping_profile_id': str(profile_id()),
+        'transportation_file': (
+            io.BytesIO((TRANSPORT_HEADER + transportation).encode()),
+            'transportation.csv', 'text/csv'),
+        'student_contacts_file': (
+            io.BytesIO((CONTACT_HEADER + student_contacts).encode()),
+            'student-contacts.csv', 'text/csv'),
+        'guardian_contacts_file': (
+            io.BytesIO((CONTACT_HEADER + guardian_contacts).encode()),
+            'guardian-contacts.csv', 'text/csv'),
+    }, content_type='multipart/form-data')
+
+
+def test_split_powerschool_contacts_are_combined_with_safe_roles():
+    parsed = build_normalized_plan(
+        (TRANSPORT_HEADER + transport_row()).encode(), None,
+        DEFAULT_MAPPING_V1, 10, 50,
+        contact_sources=[
+            {
+                'key': 'student_contacts',
+                'payload': (CONTACT_HEADER + contact_row(
+                    contact='STUDENT-1', relationship='guardian',
+                    email='student@example.test')).encode(),
+                'force_relationship': 'student',
+            },
+            {
+                'key': 'guardian_contacts',
+                'payload': (CONTACT_HEADER + contact_row(
+                    contact='GUARDIAN-1', relationship='',
+                    email='guardian@example.test')).encode(),
+                'default_relationship': 'guardian',
+            },
+        ])
+    contacts = {item['contact_id']: item for item in parsed['students'][0]['contacts']}
+    assert contacts['STUDENT-1']['relationship'] == 'student'
+    assert contacts['GUARDIAN-1']['relationship'] == 'guardian'
+    assert set(parsed['files']) == {
+        'transportation', 'student_contacts', 'guardian_contacts'}
+
+
+def test_exact_saved_template_headers_resolve_without_manual_changes():
+    transport = POWERSCHOOL_TRANSPORT_HEADER + ','.join([
+        '0001', 'SID-0001', 'Ada', 'Lovelace', '205', '5', 'TEST1', '10',
+        'AM', 'true',
+    ]) + '\n'
+    student = POWERSCHOOL_CONTACT_HEADER + ','.join([
+        '0001', 'STUDENT-1', '', 'Ada', 'Lovelace', '', '708-555-0101',
+        '', '', '', '', '', '', '', '', 'student@example.test', '', '',
+    ]) + '\n'
+    guardian = POWERSCHOOL_CONTACT_HEADER + ','.join([
+        '0001', 'GUARDIAN-1', '', 'Grace', 'Hopper', 'Mother', '708-555-0102',
+        '', '', '', '', '', '', '', '', 'guardian@example.test', '', '',
+    ]) + '\n'
+    parsed = build_normalized_plan(
+        transport.encode(), None, DEFAULT_MAPPING_V1, 10, 50,
+        contact_sources=[
+            {'key': 'student_contacts', 'payload': student.encode(),
+             'force_relationship': 'student'},
+            {'key': 'guardian_contacts', 'payload': guardian.encode(),
+             'default_relationship': 'guardian'},
+        ])
+    proposal = parsed['students'][0]
+    assert proposal['student_number'] == '0001'
+    assert proposal['student_id'] == 'SID-0001'
+    assert proposal['school'] == '205'
+    assert proposal['grade'] == '5'
+    assert proposal['assignments'][0] == {
+        'route_prefix': 'TEST', 'route_number': '1', 'period': 'AM'}
+    assert {item['email'] for item in proposal['contacts']} == {
+        'student@example.test', 'guardian@example.test'}
+
+
+def test_managed_header_aliases_merge_without_overwriting_custom_profile():
+    with application.app.app_context():
+        profile = application.ImportMappingProfile.query.filter_by(
+            source_type='powerschool', schema_version='1').one()
+        mapping = json.loads(profile.mapping_json)
+        mapping['files']['transportation']['columns']['route'] = ['custom_route']
+        profile.mapping_json = json.dumps(mapping)
+        application.db.session.commit()
+        application._seed_phase2_security_and_imports()
+        merged = json.loads(application.ImportMappingProfile.query.filter_by(
+            source_type='powerschool', schema_version='1').one().mapping_json)
+        route_aliases = merged['files']['transportation']['columns']['route']
+        assert 'custom_route' in route_aliases
+        assert 'busnumber' in route_aliases
+        assert 'TRANSPORTATION.busnumber' in route_aliases
+
+
+def test_split_contact_sources_share_one_cumulative_row_limit():
+    with pytest.raises(ImportValidationError, match='more than 1 total data rows'):
+        build_normalized_plan(
+            (TRANSPORT_HEADER + transport_row()).encode(), None,
+            DEFAULT_MAPPING_V1, 1, 50,
+            contact_sources=[
+                {'key': 'student_contacts',
+                 'payload': (CONTACT_HEADER + contact_row(
+                     contact='STUDENT-1')).encode(),
+                 'force_relationship': 'student'},
+                {'key': 'guardian_contacts',
+                 'payload': (CONTACT_HEADER + contact_row(
+                     contact='GUARDIAN-1')).encode(),
+                 'default_relationship': 'guardian'},
+            ])
 
 
 def apply_batch(client, report):
@@ -135,6 +262,30 @@ def test_powerschool_new_apply_is_idempotent_reported_and_rollbackable(logged_in
         assert application.SubscriberGroup.query.count() == 0
         assert application.ImportBatch.query.filter_by(
             public_id=report['batch_id']).one().status == 'rolled_back'
+
+
+def test_split_exports_apply_student_and_guardian_contacts(logged_in_client):
+    setup_route()
+    response = preview_split(
+        logged_in_client, transport_row(),
+        contact_row(contact='STUDENT-1', relationship='',
+                    email='student@example.test'),
+        contact_row(contact='GUARDIAN-1', relationship='',
+                    email='guardian@example.test'))
+    assert response.status_code == 200, response.get_data(as_text=True)
+    report = response.get_json()
+    assert report['counts']['new'] == 1
+    assert apply_batch(logged_in_client, report).status_code == 200
+    with application.app.app_context():
+        contacts = application.SubscriberContact.query.order_by(
+            application.SubscriberContact.role).all()
+        assert {(item.role, item.email) for item in contacts} == {
+            ('student', 'student@example.test'),
+            ('parent', 'guardian@example.test'),
+        }
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        assert application.ImportFile.query.filter_by(batch_id=batch.id).count() == 0
 
 
 def test_powerschool_update_rollback_restores_previous_values(logged_in_client):
@@ -317,6 +468,55 @@ def test_powerschool_capability_is_explicit_and_feature_flag_fail_closed(client)
     assert client.get('/admin/notifications/powerschool').status_code == 404
 
 
+def test_annual_guide_remains_available_when_importer_is_disabled(logged_in_client):
+    application.app.config['POWERSCHOOL_IMPORT_ENABLED'] = False
+    response = logged_in_client.get('/admin/notifications/powerschool-guide')
+    assert response.status_code == 200
+    page = response.get_data(as_text=True)
+    assert 'D205 BusRoute - Transportation v1' in page
+    assert 'D205 BusRoute - Student Contacts v1' in page
+    assert 'D205 BusRoute - Guardian Contacts v1' in page
+    assert 'Importer disabled or not assigned to this account' in page
+
+
+def test_preview_rejects_partial_or_mixed_contact_file_sets(logged_in_client):
+    base = {
+        '_csrf': csrf_token(logged_in_client), 'school_year': '2026-27',
+        'snapshot_type': 'delta', 'mapping_profile_id': str(profile_id()),
+        'transportation_file': (
+            io.BytesIO((TRANSPORT_HEADER + transport_row()).encode()),
+            'transportation.csv', 'text/csv'),
+        'student_contacts_file': (
+            io.BytesIO((CONTACT_HEADER + contact_row()).encode()),
+            'student-contacts.csv', 'text/csv'),
+    }
+    partial = logged_in_client.post(
+        '/admin/notifications/powerschool/preview', data=base,
+        content_type='multipart/form-data')
+    assert partial.status_code == 400
+    assert 'both the Student Contacts and Guardian Contacts' in (
+        partial.get_json()['message'])
+
+    mixed = {
+        '_csrf': csrf_token(logged_in_client), 'school_year': '2026-27',
+        'snapshot_type': 'delta', 'mapping_profile_id': str(profile_id()),
+        'transportation_file': (
+            io.BytesIO((TRANSPORT_HEADER + transport_row()).encode()),
+            'transportation.csv', 'text/csv'),
+        'contacts_file': (
+            io.BytesIO((CONTACT_HEADER + contact_row()).encode()),
+            'contacts.csv', 'text/csv'),
+        'student_contacts_file': (
+            io.BytesIO((CONTACT_HEADER + contact_row()).encode()),
+            'student-contacts.csv', 'text/csv'),
+    }
+    mixed_response = logged_in_client.post(
+        '/admin/notifications/powerschool/preview', data=mixed,
+        content_type='multipart/form-data')
+    assert mixed_response.status_code == 400
+    assert 'not both' in mixed_response.get_json()['message']
+
+
 def test_invalid_stable_identity_is_rejected_and_report_formula_safe(logged_in_client):
     setup_route()
     response = preview(
@@ -481,6 +681,7 @@ def test_retention_retries_raw_file_cleanup_before_closing(logged_in_client, mon
 def test_templates_compile_and_do_not_use_dynamic_inner_html():
     with application.app.app_context():
         application.app.jinja_env.get_template('admin/powerschool_import.html')
+        application.app.jinja_env.get_template('admin/powerschool_guide.html')
     source = open('templates/admin/powerschool_import.html', encoding='utf-8').read()
     assert 'innerHTML' not in source
     assert 'eval(' not in source
