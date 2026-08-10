@@ -17,6 +17,7 @@ FROM base
 WORKDIR /app
 COPY --chown=1000:1000 app.py ./app.py
 COPY --chown=1000:1000 templates ./templates
+COPY --chown=1000:1000 static/js ./static/js
 
 # Persistent directories (override with Docker volumes)
 RUN mkdir -p instance static/uploads static/exports

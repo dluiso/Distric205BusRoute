@@ -41,6 +41,7 @@ def clean_database():
         application.db.drop_all()
         application.db.create_all()
         application._seed_defaults()
+        application._seed_phase2_security_and_imports()
         admin_group = application.UserGroup.query.filter_by(is_admin=True).one()
         admin = application.User(
             username='admin', email='admin@example.test', first_name='Admin',

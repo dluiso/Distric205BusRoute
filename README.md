@@ -27,9 +27,12 @@ A web application for publishing and managing school bus incident status in real
 
 ### Security
 - CSRF protection on all POST endpoints
-- Rate-limited login (5 attempts / 5 min per IP)
+- Database-backed rate-limited login shared across workers
 - Session hardening (HttpOnly, SameSite, Secure in production)
-- Security headers (X-Frame-Options, X-Content-Type-Options, etc.)
+- Explicit privileged capabilities layered over module permissions
+- Enforced Content Security Policy, no-store controls for admin pages, and secure headers
+- PII masking for notification readers without the dedicated PII capability
+- Formula-safe CSV exports and immutable, hash-bound Legacy CSV staging
 - Open-redirect prevention
 - Installation wizard lock — wizard is permanently disabled after first install
 
@@ -253,6 +256,12 @@ Full backups and restores are administrator-only and require `BACKUP_ENCRYPTION_
 Operational exports are redacted and never include passwords, hashes, notification
 contacts, users, or audit data. Store the encryption key outside the repository and
 back it up independently; losing it makes encrypted backups unrecoverable.
+
+Legacy subscriber CSV imports are now analyzed into a private immutable stage under
+the instance directory. Confirmation is bound to the staged rows and SHA-256-derived
+plan hash, so the browser cannot substitute a different file after preview. A batch
+can be applied only once. The additive PowerSchool staging schema is installed but
+remains unavailable while `POWERSCHOOL_IMPORT_ENABLED=0`; Phase 3 owns activation.
 
 ---
 

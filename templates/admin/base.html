@@ -8,6 +8,7 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+  <script src="{{ url_for('static', filename='js/safe-output.js') }}"></script>
   {% block head %}{% endblock %}
   <style>
     [x-cloak]{display:none!important}
@@ -94,9 +95,12 @@
     <a href="{{ url_for('index') }}" target="_blank" class="sidebar-link">
       <i class="fas fa-external-link-alt icon"></i><span>Public View</span>
     </a>
-    <a href="{{ url_for('logout') }}" class="sidebar-link text-red-400 hover:bg-red-900/30 hover:text-red-300">
-      <i class="fas fa-sign-out-alt icon"></i><span>Sign Out</span>
-    </a>
+    <form method="POST" action="{{ url_for('logout') }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+      <button type="submit" class="sidebar-link text-red-400 hover:bg-red-900/30 hover:text-red-300 w-full">
+        <i class="fas fa-sign-out-alt icon"></i><span>Sign Out</span>
+      </button>
+    </form>
   </nav>
 
   <!-- User -->

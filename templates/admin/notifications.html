@@ -96,10 +96,10 @@
     </select>
     <!-- Actions -->
     <div class="flex items-center gap-2 ml-auto">
-      <a href="{{ url_for('export_subscribers_csv') }}"
+      {% if can_export_pii %}<a href="{{ url_for('export_subscribers_csv') }}"
          class="inline-flex items-center gap-1.5 px-3 py-2 border border-slate-200 hover:border-emerald-400 text-slate-600 hover:text-emerald-700 rounded-xl text-sm font-medium transition-colors">
         <i class="fas fa-file-csv text-xs"></i>Export CSV
-      </a>
+      </a>{% endif %}
       {% if can_write %}
       <button onclick="document.getElementById('modal-import').classList.remove('hidden')"
               class="inline-flex items-center gap-1.5 px-3 py-2 border border-slate-200 hover:border-blue-400 text-slate-600 hover:text-blue-700 rounded-xl text-sm font-medium transition-colors">
@@ -817,10 +817,10 @@
             <p class="text-sm font-medium text-slate-700">Download template / current data</p>
             <p class="text-xs text-slate-400">Export current subscribers as a starting point</p>
           </div>
-          <a href="{{ url_for('export_subscribers_csv') }}"
+          {% if can_export_pii %}<a href="{{ url_for('export_subscribers_csv') }}"
              class="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-200 hover:border-emerald-400 text-slate-600 hover:text-emerald-700 rounded-xl text-sm font-medium transition-colors">
             <i class="fas fa-download text-xs"></i>Export CSV
-          </a>
+          </a>{% endif %}
         </div>
         <!-- File picker -->
         <div>
@@ -894,6 +894,9 @@
         <button type="button" onclick="csvImportClose()"
                 class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-white">Cancel</button>
         <form id="csv-confirm-form" method="POST" action="{{ url_for('import_subscribers_csv') }}" enctype="multipart/form-data">
+          <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+          <input type="hidden" name="batch_id" id="csv-batch-id">
+          <input type="hidden" name="plan_hash" id="csv-plan-hash">
           <button id="csv-btn-confirm" type="submit"
                   class="hidden px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
             <i class="fas fa-file-import mr-1"></i>Confirm Import
@@ -1427,9 +1430,7 @@ async function pollBroadcast(jobId, total) {
 }
 
 // ─── Utility ────────────────────────────────────────────────────────────────
-function escHtml(str) {
-  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
+const escHtml = window.SafeOutput.escapeHtml;
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 filterAndPage();
@@ -1453,6 +1454,8 @@ function csvResetToUpload() {
   document.getElementById('csv-btn-back').classList.add('hidden');
   document.getElementById('csv-btn-confirm').classList.add('hidden');
   document.getElementById('csv-file-input').value = '';
+  document.getElementById('csv-batch-id').value = '';
+  document.getElementById('csv-plan-hash').value = '';
 }
 
 async function csvAnalyze() {
@@ -1569,17 +1572,9 @@ async function csvAnalyze() {
   document.getElementById('csv-btn-back').classList.remove('hidden');
 
   if (data.can_import) {
-    // Wire the actual file into the confirm form
-    const confirmForm = document.getElementById('csv-confirm-form');
-    const newInput = document.createElement('input');
-    newInput.type = 'file';
-    newInput.name = 'csv_file';
-    newInput.style.display = 'none';
-    const dt = new DataTransfer();
-    dt.items.add(input.files[0]);
-    newInput.files = dt.files;
-    confirmForm.querySelectorAll('input[name="csv_file"]').forEach(el => el.remove());
-    confirmForm.appendChild(newInput);
+    // Commit is bound to the immutable normalized stage and exact plan hash.
+    document.getElementById('csv-batch-id').value = data.batch_id;
+    document.getElementById('csv-plan-hash').value = data.plan_hash;
     document.getElementById('csv-btn-confirm').classList.remove('hidden');
   }
 }

@@ -611,10 +611,7 @@ const auditBusOrder = {{ audit_bus_order_json|tojson }};
 const DEFAULT_TYPE  = {{ default_type_name|tojson }};
 const AUDIT_DAYS    = {{ total_days_in_range }};
 
-function escHtml(value) {
-  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
+const escHtml = window.SafeOutput.escapeHtml;
 
 let mainChart = null;
 

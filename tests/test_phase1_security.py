@@ -288,7 +288,7 @@ def test_full_backup_is_encrypted_and_versioned(logged_in_client):
     plaintext = Fernet(os.environ['BACKUP_ENCRYPTION_KEY'].encode()).decrypt(response.data)
     document = json.loads(plaintext)
     assert document['format'] == 'bustrack-full-backup'
-    assert document['version'] == 1
+    assert document['version'] == application._BACKUP_VERSION
     assert 'user' in document['tables']
 
 

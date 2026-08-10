@@ -13,10 +13,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime, date, timedelta, timezone
 from contextlib import contextmanager
 from functools import wraps
+from types import SimpleNamespace
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from urllib.parse import urlsplit
-import hashlib, hmac, os, json, csv, io, pytz, re, threading, time, secrets, html, math, tempfile
+import hashlib, hmac, os, json, csv, io, pytz, re, threading, time, secrets, html, math, tempfile, unicodedata
 
 
 def _utcnow():
@@ -109,16 +110,29 @@ app.config['LOGIN_RATE_LIMIT_LOCK_SECONDS'] = _env_int('LOGIN_RATE_LIMIT_LOCK_SE
 app.config['RESTORE_JOB_TTL_SECONDS'] = _env_int('RESTORE_JOB_TTL_SECONDS', 1800, 60, 86400)
 app.config['RESTORE_SNAPSHOT_RETENTION_DAYS'] = _env_int(
     'RESTORE_SNAPSHOT_RETENTION_DAYS', 30, 1, 3650)
+app.config['BROADCAST_JOB_TTL_SECONDS'] = _env_int(
+    'BROADCAST_JOB_TTL_SECONDS', 86400, 300, 604800)
+app.config['IMPORT_MAX_ROWS'] = _env_int('IMPORT_MAX_ROWS', 25000, 1, 250000)
+app.config['IMPORT_MAX_COLUMNS'] = _env_int('IMPORT_MAX_COLUMNS', 64, 1, 512)
+app.config['IMPORT_STAGE_TTL_HOURS'] = _env_int('IMPORT_STAGE_TTL_HOURS', 24, 1, 720)
+app.config['POWERSCHOOL_IMPORT_ENABLED'] = (
+    os.environ.get('POWERSCHOOL_IMPORT_ENABLED', '0').strip().lower() in {'1', 'true', 'yes'})
+app.config['CSP_ENFORCE'] = (
+    os.environ.get('CSP_ENFORCE', '1').strip().lower() in {'1', 'true', 'yes'})
+app.config['CSP_REPORT_ONLY'] = (
+    os.environ.get('CSP_REPORT_ONLY', '0').strip().lower() in {'1', 'true', 'yes'})
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, 'static', 'exports'), exist_ok=True)
 os.makedirs(INSTANCE_DIR, exist_ok=True)
+IMPORT_STAGE_DIR = os.path.join(INSTANCE_DIR, 'imports')
+os.makedirs(IMPORT_STAGE_DIR, mode=0o700, exist_ok=True)
+os.chmod(IMPORT_STAGE_DIR, 0o700)
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 mail = Mail(app)
-broadcast_jobs  = {}   # job_id -> {total, sent, failed, done, errors}
 
 # ── INSTALLATION LOCK ─────────────────────────────────────────────────────────
 INSTALLED_FILE = os.path.join(INSTANCE_DIR, '.installed')
@@ -154,6 +168,47 @@ def _csv_safe_cell(value):
 
 def _csv_safe_row(values):
     return [_csv_safe_cell(value) for value in values]
+
+
+def _password_error(value):
+    """One password policy shared by installation, user admin, and profile."""
+    if not isinstance(value, str) or len(value) < 12:
+        return 'Password must be at least 12 characters.'
+    if len(value) > 1024:
+        return 'Password must not exceed 1024 characters.'
+    return None
+
+
+def _normalize_text(value, maximum=None):
+    normalized = unicodedata.normalize('NFKC', str(value or '')).strip()
+    return normalized[:maximum] if maximum else normalized
+
+
+def _normalize_email(value):
+    values = []
+    for item in _normalize_text(value, 500).split(','):
+        email = item.strip().lower()
+        if email:
+            values.append(email)
+    return ','.join(values)
+
+
+def _normalize_phone(value):
+    phone = _normalize_text(value, 40)
+    if phone.endswith('.0') and phone[:-2].lstrip('+-').isdigit():
+        phone = phone[:-2]
+    compact = re.sub(r'[\s().-]', '', phone)
+    if compact and not compact.startswith('+') and compact.isdigit():
+        compact = '+' + compact
+    return compact[:30]
+
+
+def _valid_csv_upload(file):
+    if not file or not file.filename or not file.filename.lower().endswith('.csv'):
+        return False
+    mime = (file.mimetype or '').lower().split(';', 1)[0]
+    return mime in {'text/csv', 'text/plain', 'application/csv',
+                    'application/vnd.ms-excel', 'application/octet-stream'}
 
 
 # ── MODELS ───────────────────────────────────────────────────────────────────
@@ -240,6 +295,16 @@ class GroupPermission(db.Model):
     __table_args__ = (db.UniqueConstraint('group_id', 'module_key'),)
 
 
+class GroupCapability(db.Model):
+    """Explicit privileged capability grants, separate from visual modules."""
+    id             = db.Column(db.Integer, primary_key=True)
+    group_id       = db.Column(db.Integer, db.ForeignKey('user_group.id'), nullable=False)
+    capability_key = db.Column(db.String(80), nullable=False)
+    granted        = db.Column(db.Boolean, nullable=False, default=True)
+    created_at     = db.Column(db.DateTime, default=_utcnow)
+    __table_args__ = (db.UniqueConstraint('group_id', 'capability_key'),)
+
+
 MODULES = [
     {'key': 'buses',         'label': 'Buses',          'icon': 'fa-bus'},
     {'key': 'incidents',     'label': 'Status Types',    'icon': 'fa-exclamation-circle'},
@@ -249,6 +314,59 @@ MODULES = [
     {'key': 'config',        'label': 'Configuration',   'icon': 'fa-cog'},
     {'key': 'logs',          'label': 'System Logs',     'icon': 'fa-scroll'},
 ]
+
+# One registry defines every authorization decision. Ordinary read/write
+# capabilities retain compatibility with the existing module matrix; sensitive
+# capabilities require an explicit GroupCapability grant or Administrator.
+CAPABILITIES = {
+    'buses.read':                  {'module': 'buses', 'level': 'limited'},
+    'buses.write':                 {'module': 'buses', 'level': 'full'},
+    'incidents.read':              {'module': 'incidents', 'level': 'limited'},
+    'incidents.write':             {'module': 'incidents', 'level': 'full'},
+    'statistics.read':             {'module': 'statistics', 'level': 'limited'},
+    'statistics.write':            {'module': 'statistics', 'level': 'full'},
+    'users.read':                  {'module': 'users', 'level': 'limited'},
+    'user.manage':                 {'module': 'users', 'level': 'full'},
+    'notifications.read':          {'module': 'notifications', 'level': 'limited'},
+    'notifications.write':         {'module': 'notifications', 'level': 'full'},
+    'config.read':                 {'module': 'config', 'level': 'limited'},
+    'config.write':                {'module': 'config', 'level': 'full'},
+    'audit.read':                  {'module': 'logs', 'level': 'limited'},
+    'backup.export_operational':   {'module': 'config', 'level': 'full'},
+    # Explicit-only capabilities below are never inferred from module access.
+    'user.assign_admin':           {},
+    'backup.export_sensitive':     {},
+    'restore.operational':         {},
+    'restore.identity':            {},
+    'smtp.diagnose':               {},
+    'audit.export':                {},
+    'notifications.pii':           {},
+    'notifications.export_pii':    {},
+    'notifications.broadcast':     {},
+    'import.legacy':               {},
+    'import.powerschool':          {},
+    'import.rollback':             {},
+}
+
+MODULE_CAPABILITIES = {
+    ('buses', 'limited'): 'buses.read', ('buses', 'full'): 'buses.write',
+    ('incidents', 'limited'): 'incidents.read', ('incidents', 'full'): 'incidents.write',
+    ('statistics', 'limited'): 'statistics.read', ('statistics', 'full'): 'statistics.write',
+    ('users', 'limited'): 'users.read', ('users', 'full'): 'user.manage',
+    ('notifications', 'limited'): 'notifications.read',
+    ('notifications', 'full'): 'notifications.write',
+    ('config', 'limited'): 'config.read', ('config', 'full'): 'config.write',
+    ('logs', 'limited'): 'audit.read', ('logs', 'full'): 'audit.read',
+}
+
+EXPLICIT_CAPABILITIES_BY_MODULE = {
+    ('config', 'full'): {'backup.export_operational', 'smtp.diagnose'},
+    ('logs', 'full'): {'audit.export'},
+    ('notifications', 'full'): {
+        'notifications.pii', 'notifications.export_pii',
+        'notifications.broadcast', 'import.legacy',
+    },
+}
 
 
 class AuditLog(db.Model):
@@ -315,6 +433,22 @@ class User(UserMixin, db.Model):
         if level == 'limited': return perm.access_level in ('limited', 'full')
         if level == 'full': return perm.access_level == 'full'
         return False
+
+    def has_capability(self, capability_key):
+        policy = CAPABILITIES.get(capability_key)
+        if policy is None:
+            return False
+        if self.is_admin:
+            return True
+        if not self.group_id:
+            return False
+        explicit = GroupCapability.query.filter_by(
+            group_id=self.group_id, capability_key=capability_key).first()
+        if explicit is not None:
+            return bool(explicit.granted)
+        module_key = policy.get('module')
+        return bool(module_key and self.has_access(
+            module_key, policy.get('level', 'limited')))
 
     def accessible_modules(self):
         if self.is_admin: return MODULES
@@ -488,6 +622,120 @@ class NotificationLog(db.Model):
     sms_sid            = db.Column(db.String(50))
     sms_segments       = db.Column(db.Integer)
     sms_cost_usd       = db.Column(db.Float)
+
+
+class BroadcastJob(db.Model):
+    __tablename__ = 'broadcast_job'
+    public_id     = db.Column(db.String(64), primary_key=True)
+    owner_id      = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    status        = db.Column(db.String(20), nullable=False, default='queued', index=True)
+    total         = db.Column(db.Integer, nullable=False, default=0)
+    sent          = db.Column(db.Integer, nullable=False, default=0)
+    failed        = db.Column(db.Integer, nullable=False, default=0)
+    errors_json   = db.Column(db.Text, nullable=False, default='[]')
+    created_at    = db.Column(db.DateTime, nullable=False, default=_utcnow, index=True)
+    updated_at    = db.Column(db.DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+    expires_at    = db.Column(db.DateTime, nullable=False, index=True)
+
+    @property
+    def done(self):
+        return self.status in {'completed', 'failed', 'expired'}
+
+    @property
+    def errors(self):
+        try:
+            value = json.loads(self.errors_json or '[]')
+            return value if isinstance(value, list) else []
+        except (TypeError, ValueError):
+            return []
+
+
+class ImportMappingProfile(db.Model):
+    __tablename__ = 'import_mapping_profile'
+    id             = db.Column(db.Integer, primary_key=True)
+    name           = db.Column(db.String(100), nullable=False)
+    source_type    = db.Column(db.String(40), nullable=False)
+    schema_version = db.Column(db.String(30), nullable=False)
+    mapping_json   = db.Column(db.Text, nullable=False, default='{}')
+    active         = db.Column(db.Boolean, nullable=False, default=True)
+    created_at     = db.Column(db.DateTime, nullable=False, default=_utcnow)
+    __table_args__ = (db.UniqueConstraint('source_type', 'schema_version'),)
+
+
+class ImportBatch(db.Model):
+    __tablename__ = 'import_batch'
+    id             = db.Column(db.Integer, primary_key=True)
+    public_id      = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    source_type    = db.Column(db.String(40), nullable=False, index=True)
+    schema_version = db.Column(db.String(30), nullable=False)
+    status         = db.Column(db.String(24), nullable=False, default='staged', index=True)
+    snapshot_type  = db.Column(db.String(20), nullable=False, default='delta')
+    school_year    = db.Column(db.String(20))
+    uploaded_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    file_sha256    = db.Column(db.String(64), nullable=False, index=True)
+    plan_hash      = db.Column(db.String(64), nullable=False)
+    total_rows     = db.Column(db.Integer, nullable=False, default=0)
+    selected_rows  = db.Column(db.Integer, nullable=False, default=0)
+    rejected_rows  = db.Column(db.Integer, nullable=False, default=0)
+    excluded_rows  = db.Column(db.Integer, nullable=False, default=0)
+    metadata_json  = db.Column(db.Text, nullable=False, default='{}')
+    created_at     = db.Column(db.DateTime, nullable=False, default=_utcnow, index=True)
+    expires_at     = db.Column(db.DateTime, nullable=False, index=True)
+    applied_at     = db.Column(db.DateTime)
+
+
+class ImportFile(db.Model):
+    __tablename__ = 'import_file'
+    id             = db.Column(db.Integer, primary_key=True)
+    batch_id       = db.Column(db.Integer, db.ForeignKey('import_batch.id', ondelete='CASCADE'), nullable=False, index=True)
+    file_type      = db.Column(db.String(30), nullable=False)
+    original_name  = db.Column(db.String(255), nullable=False)
+    sha256         = db.Column(db.String(64), nullable=False)
+    byte_size      = db.Column(db.Integer, nullable=False)
+    storage_path   = db.Column(db.String(500), nullable=False)
+    headers_json   = db.Column(db.Text, nullable=False, default='[]')
+    created_at     = db.Column(db.DateTime, nullable=False, default=_utcnow)
+    __table_args__ = (db.UniqueConstraint('batch_id', 'file_type'),)
+
+
+class ImportRow(db.Model):
+    __tablename__ = 'import_row'
+    id              = db.Column(db.Integer, primary_key=True)
+    batch_id        = db.Column(db.Integer, db.ForeignKey('import_batch.id', ondelete='CASCADE'), nullable=False, index=True)
+    row_number      = db.Column(db.Integer, nullable=False)
+    external_key    = db.Column(db.String(160), index=True)
+    classification  = db.Column(db.String(30), nullable=False, index=True)
+    selected        = db.Column(db.Boolean, nullable=False, default=True)
+    normalized_json = db.Column(db.Text, nullable=False)
+    errors_json     = db.Column(db.Text, nullable=False, default='[]')
+    row_hash        = db.Column(db.String(64), nullable=False)
+    __table_args__  = (db.UniqueConstraint('batch_id', 'row_number'),)
+
+
+class ExternalIdentity(db.Model):
+    __tablename__ = 'external_identity'
+    id              = db.Column(db.Integer, primary_key=True)
+    source_type     = db.Column(db.String(40), nullable=False)
+    entity_type     = db.Column(db.String(40), nullable=False)
+    external_key    = db.Column(db.String(160), nullable=False)
+    local_table     = db.Column(db.String(80), nullable=False)
+    local_id        = db.Column(db.Integer, nullable=False)
+    created_at      = db.Column(db.DateTime, nullable=False, default=_utcnow)
+    updated_at      = db.Column(db.DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+    __table_args__  = (db.UniqueConstraint('source_type', 'entity_type', 'external_key'),)
+
+
+class ImportChange(db.Model):
+    __tablename__ = 'import_change'
+    id           = db.Column(db.Integer, primary_key=True)
+    batch_id     = db.Column(db.Integer, db.ForeignKey('import_batch.id', ondelete='CASCADE'), nullable=False, index=True)
+    row_id       = db.Column(db.Integer, db.ForeignKey('import_row.id', ondelete='SET NULL'), index=True)
+    operation    = db.Column(db.String(30), nullable=False)
+    target_table = db.Column(db.String(80), nullable=False)
+    target_id    = db.Column(db.Integer)
+    before_json  = db.Column(db.Text)
+    after_json   = db.Column(db.Text)
+    created_at   = db.Column(db.DateTime, nullable=False, default=_utcnow)
 
 
 @login_manager.user_loader
@@ -763,6 +1011,42 @@ def _migrate_subscriber_contacts():
         db.session.rollback()
 
 
+def _seed_phase2_security_and_imports():
+    for group in UserGroup.query.filter_by(is_admin=False).all():
+        _sync_group_capabilities(group.id)
+    profiles = [
+        ('Legacy CSV v1', 'legacy_csv', '1', {
+            'identity': 'additive-household',
+            'columns': ['schema_version', 'subscriber_id', 'household_label',
+                        'group', 'active', 'role', 'first_name', 'last_name',
+                        'email', 'phone'],
+        }),
+        ('PowerSchool Import v1', 'powerschool', '1', {
+            'identity': 'student_number',
+            'files': ['transportation', 'contacts'],
+            'enabled': False,
+        }),
+    ]
+    for name, source_type, version, mapping in profiles:
+        row = ImportMappingProfile.query.filter_by(
+            source_type=source_type, schema_version=version).first()
+        if not row:
+            db.session.add(ImportMappingProfile(
+                name=name, source_type=source_type, schema_version=version,
+                mapping_json=json.dumps(mapping, sort_keys=True)))
+
+    now = _utcnow()
+    BroadcastJob.query.filter(
+        BroadcastJob.status.in_(['queued', 'running']),
+        BroadcastJob.updated_at < now - timedelta(minutes=15),
+    ).update({'status': 'failed', 'updated_at': now}, synchronize_session=False)
+    BroadcastJob.query.filter(
+        BroadcastJob.expires_at <= now,
+        ~BroadcastJob.status.in_(['completed', 'failed', 'expired']),
+    ).update({'status': 'expired', 'updated_at': now}, synchronize_session=False)
+    db.session.commit()
+
+
 @contextmanager
 def _database_init_lock():
     """Serialize schema initialization across Gunicorn workers and processes."""
@@ -812,16 +1096,24 @@ def _initialize_database_unlocked():
     _migrate_group_bus_period()
     _seed_defaults()
     _migrate_subscriber_contacts()
+    _seed_phase2_security_and_imports()
 
     from sqlalchemy import inspect as sa_inspect
     inspector = sa_inspect(db.engine)
     user_columns = {column['name'] for column in inspector.get_columns('user')}
     throttle_columns = ({column['name'] for column in inspector.get_columns('login_throttle')}
                         if 'login_throttle' in inspector.get_table_names() else set())
+    required_phase2_tables = {
+        'group_capability', 'broadcast_job', 'import_mapping_profile',
+        'import_batch', 'import_file', 'import_row', 'external_identity',
+        'import_change',
+    }
     if 'session_version' not in user_columns or not {
             'throttle_key', 'failed_count', 'window_started_at', 'locked_until'
     }.issubset(throttle_columns):
         raise RuntimeError('Security schema migration did not complete; refusing to start.')
+    if not required_phase2_tables.issubset(set(inspector.get_table_names())):
+        raise RuntimeError('Phase 2 additive schema migration did not complete; refusing to start.')
 
     # Auto-detect existing installations: if users exist but no lock file, create it.
     if not os.path.exists(INSTALLED_FILE) and User.query.count() > 0:
@@ -1025,13 +1317,50 @@ def configure_mail(cfg, override=None):
 
 # ── PERMISSION DECORATOR ─────────────────────────────────────────────────────
 
-def require_module(module_key, level='limited'):
+def _sync_group_capabilities(group_id, overwrite_existing=False):
+    """Backfill legacy grants without overwriting an explicit policy decision."""
+    desired = set()
+    for permission in GroupPermission.query.filter_by(group_id=group_id).all():
+        if permission.access_level == 'full':
+            desired.update(EXPLICIT_CAPABILITIES_BY_MODULE.get(
+                (permission.module_key, 'full'), set()))
+    managed = set().union(*EXPLICIT_CAPABILITIES_BY_MODULE.values())
+    existing = {row.capability_key: row for row in GroupCapability.query.filter_by(
+        group_id=group_id).filter(GroupCapability.capability_key.in_(managed)).all()}
+    for capability in managed:
+        row = existing.get(capability)
+        should_grant = capability in desired
+        if row and overwrite_existing:
+            row.granted = should_grant
+        elif not row:
+            db.session.add(GroupCapability(
+                group_id=group_id, capability_key=capability, granted=should_grant))
+
+
+def require_capability(capability_key):
+    if capability_key not in CAPABILITIES:
+        raise RuntimeError(f'Unknown capability: {capability_key}')
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
             if not current_user.is_authenticated:
                 return redirect(url_for('login', next=request.url))
-            if not current_user.has_access(module_key, level):
+            if not current_user.has_capability(capability_key):
+                abort(403)
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
+
+def require_module(module_key, level='limited'):
+    capability = MODULE_CAPABILITIES.get((module_key, level))
+    if not capability:
+        raise RuntimeError(f'No capability mapping for {module_key}:{level}')
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if not current_user.is_authenticated:
+                return redirect(url_for('login', next=request.url))
+            if not current_user.has_capability(capability):
                 flash('You do not have permission to access this section.', 'error')
                 return redirect(url_for('dashboard'))
             return f(*args, **kwargs)
@@ -1282,6 +1611,26 @@ def security_headers(resp):
     resp.headers['X-XSS-Protection']        = '1; mode=block'
     resp.headers['Referrer-Policy']         = 'strict-origin-when-cross-origin'
     resp.headers['Permissions-Policy']      = 'geolocation=(), microphone=(), camera=()'
+    resp.headers['Cross-Origin-Opener-Policy'] = 'same-origin'
+    resp.headers['Cross-Origin-Resource-Policy'] = 'same-origin'
+    csp = (
+        "default-src 'self'; "
+        "base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com "
+        "https://unpkg.com https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+        "font-src 'self' data: https://cdnjs.cloudflare.com; "
+        "img-src 'self' data:; connect-src 'self'"
+    )
+    if app.config['CSP_REPORT_ONLY']:
+        resp.headers['Content-Security-Policy-Report-Only'] = csp
+    if app.config['CSP_ENFORCE']:
+        resp.headers['Content-Security-Policy'] = csp
+    if request.path.startswith('/admin/'):
+        resp.headers['Cache-Control'] = 'no-store, private, max-age=0'
+        resp.headers['Pragma'] = 'no-cache'
+    if os.environ.get('FLASK_ENV') == 'production' and request.is_secure:
+        resp.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     if request.path.startswith('/static/uploads/') and request.path.lower().endswith('.svg'):
         resp.headers['Content-Disposition'] = 'attachment'
         resp.headers['Content-Security-Policy'] = "sandbox; default-src 'none'"
@@ -1378,8 +1727,9 @@ def install_run():
     if not 3 <= len(username) <= 80 or not re.fullmatch(r'[A-Za-z0-9_.-]+', username):
         return jsonify({'ok': False, 'message':
                         'Username must be 3–80 characters using letters, numbers, dots, hyphens or underscores.'}), 400
-    if not 12 <= len(password) <= 1024:
-        return jsonify({'ok': False, 'message': 'Password must be 12–1024 characters.'}), 400
+    password_error = _password_error(password)
+    if password_error:
+        return jsonify({'ok': False, 'message': password_error}), 400
     if email and (len(email) > 120 or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email)):
         return jsonify({'ok': False, 'message': 'Enter a valid email address.'}), 400
 
@@ -1704,10 +2054,12 @@ def login():
         flash('Invalid credentials. Please try again.', 'error')
     return render_template('admin/login.html')
 
-@app.route('/admin/logout')
+@app.route('/admin/logout', methods=['POST'])
 @login_required
 def logout():
+    _audit('logout', 'auth', current_user.username)
     logout_user()
+    session.clear()
     return redirect(url_for('index'))
 
 
@@ -2142,8 +2494,8 @@ def statistics():
 
     # Notification delivery data contains parent/contact PII and belongs to the
     # notifications capability even when displayed alongside statistics.
-    can_view_notifications = current_user.has_access('notifications', 'limited')
-    can_delete_notifications = current_user.has_access('notifications', 'full')
+    can_view_notifications = current_user.has_capability('notifications.pii')
+    can_delete_notifications = current_user.has_capability('notifications.write')
     notif_logs = []
     if can_view_notifications:
         notif_q = NotificationLog.query.filter(
@@ -2271,7 +2623,7 @@ def export_statistics(fmt):
 
     # ── Notification log for general export ──────────────────────────────────
     notif_exp = []
-    if current_user.has_access('notifications', 'limited'):
+    if current_user.has_capability('notifications.pii'):
         notif_exp_q = NotificationLog.query.filter(
             NotificationLog.sent_at >= datetime.combine(d_from, datetime.min.time()),
             NotificationLog.sent_at <= datetime.combine(d_to,   datetime.max.time()),
@@ -2546,7 +2898,7 @@ def reset_statistics():
         return redirect(url_for('statistics'))
 
     include_notifs = request.form.get('include_notifications') == '1'
-    if include_notifs and not current_user.has_access('notifications', 'full'):
+    if include_notifs and not current_user.has_capability('notifications.write'):
         abort(403)
 
     # Collect the incident IDs that will be deleted
@@ -2594,6 +2946,7 @@ def reset_statistics():
 @login_required
 @require_module('statistics', 'limited')
 @require_module('notifications', 'limited')
+@require_capability('notifications.export_pii')
 def export_notification_stats():
     today    = date.today()
     period   = request.args.get('period', 'today')
@@ -2647,7 +3000,7 @@ def _group_access_level(group, module_key):
 def _can_assign_group(actor, group):
     if not group:
         return True
-    if actor.is_admin:
+    if actor.has_capability('user.assign_admin'):
         return True
     if group.is_admin:
         return False
@@ -2708,8 +3061,9 @@ def add_user():
     if email and User.query.filter_by(email=email).first():
         flash('Email already in use.', 'error')
         return redirect(url_for('users'))
-    if len(password) < 12:
-        flash('Password must be at least 12 characters.', 'error')
+    password_error = _password_error(password)
+    if password_error:
+        flash(password_error, 'error')
         return redirect(url_for('users'))
     group = _requested_group(request.form.get('group_id', type=int))
     u = User(username=username, email=email,
@@ -2758,8 +3112,9 @@ def edit_user(uid):
         u.active = new_active
     pwd = request.form.get('new_password', '').strip()
     if pwd:
-        if len(pwd) < 12:
-            flash('Password must be at least 12 characters.', 'error')
+        password_error = _password_error(pwd)
+        if password_error:
+            flash(password_error, 'error')
             return redirect(url_for('users'))
         u.set_password(pwd)
         security_changed = True
@@ -2811,8 +3166,10 @@ def add_group():
     for mod in MODULES:
         level = _requested_permission_level(mod['key'])
         db.session.add(GroupPermission(group_id=g.id, module_key=mod['key'], access_level=level))
+    db.session.flush()
+    _sync_group_capabilities(g.id, overwrite_existing=True)
     db.session.commit()
-    _audit('add_group', 'users', name)
+    _audit('permission_group_created', 'users', name)
     flash(f'Group "{name}" created.', 'success')
     return redirect(url_for('users'))
 
@@ -2825,14 +3182,25 @@ def edit_group(gid):
         abort(403)
     g.name        = request.form.get('name', g.name).strip()
     g.description = request.form.get('description', '').strip() or None
+    changed_permissions = False
     if not g.is_admin:
         for mod in MODULES:
             level = _requested_permission_level(mod['key'])
             perm  = GroupPermission.query.filter_by(group_id=gid, module_key=mod['key']).first()
-            if perm: perm.access_level = level
-            else: db.session.add(GroupPermission(group_id=gid, module_key=mod['key'], access_level=level))
+            if perm:
+                changed_permissions = changed_permissions or perm.access_level != level
+                perm.access_level = level
+            else:
+                changed_permissions = changed_permissions or level != 'none'
+                db.session.add(GroupPermission(group_id=gid, module_key=mod['key'], access_level=level))
+        db.session.flush()
+        _sync_group_capabilities(gid, overwrite_existing=True)
+    if changed_permissions:
+        for member in g.users:
+            member.session_version = int(member.session_version or 1) + 1
     db.session.commit()
-    _audit('edit_group', 'users', g.name)
+    _audit('permissions_changed', 'users', g.name,
+           'Existing sessions revoked.' if changed_permissions else 'Metadata only.')
     flash(f'Group "{g.name}" updated.', 'success')
     return redirect(url_for('users'))
 
@@ -2860,6 +3228,52 @@ def delete_group(gid):
 
 # ── NOTIFICATIONS MODULE ──────────────────────────────────────────────────────
 
+def _mask_name(value):
+    value = (value or '').strip()
+    return (value[:1] + '***') if value else ''
+
+
+def _mask_email(value):
+    value = (value or '').strip()
+    if '@' not in value:
+        return '***' if value else ''
+    local, domain = value.rsplit('@', 1)
+    return f'{local[:1]}***@{domain}'
+
+
+def _mask_phone(value):
+    value = (value or '').strip()
+    digits = re.sub(r'\D', '', value)
+    return f'***-***-{digits[-4:]}' if len(digits) >= 4 else ('***' if value else '')
+
+
+def _masked_subscriber(subscriber):
+    contacts = [SimpleNamespace(
+        first_name=_mask_name(contact.first_name),
+        last_name=_mask_name(contact.last_name),
+        email=', '.join(_mask_email(item) for item in (contact.email or '').split(',') if item.strip()),
+        phone=_mask_phone(contact.phone),
+        role=contact.role,
+        full_name=' '.join(filter(None, (
+            _mask_name(contact.first_name), _mask_name(contact.last_name)))),
+    ) for contact in subscriber.contacts]
+    return SimpleNamespace(
+        id=subscriber.id, notes=_mask_name(subscriber.notes), active=subscriber.active,
+        group_id=subscriber.group_id, group=subscriber.group,
+        contacts=contacts, first_name=_mask_name(subscriber.first_name),
+        last_name=_mask_name(subscriber.last_name), email=_mask_email(subscriber.email),
+        phone=_mask_phone(subscriber.phone), full_name=(
+            contacts[0].full_name if contacts else _mask_name(subscriber.full_name)),
+    )
+
+
+def _masked_user(user):
+    return SimpleNamespace(
+        username=user.username, first_name=_mask_name(user.first_name),
+        last_name=_mask_name(user.last_name), email=_mask_email(user.email),
+        receive_notifications=user.receive_notifications, group=user.group,
+    )
+
 @app.route('/admin/notifications')
 @login_required
 @require_module('notifications')
@@ -2869,12 +3283,18 @@ def notifications():
     all_buses      = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
     admin_users    = User.query.filter_by(active=True).order_by(User.username).all()
     schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
-    can_write      = current_user.has_access('notifications', 'full')
+    can_write      = current_user.has_capability('notifications.write')
+    can_view_pii   = current_user.has_capability('notifications.pii')
+    if not can_view_pii:
+        subs = [_masked_subscriber(subscriber) for subscriber in subs]
+        admin_users = [_masked_user(user) for user in admin_users]
     return render_template('admin/notifications.html',
                            subscribers=subs, groups=groups,
                            all_buses=all_buses, admin_users=admin_users,
                            schedule_types=schedule_types,
-                           can_write=can_write)
+                           can_write=can_write, can_view_pii=can_view_pii,
+                           can_export_pii=current_user.has_capability(
+                               'notifications.export_pii'))
 
 def _save_contacts(subscriber_id, form):
     """Read contact_{i}_* fields from form and create SubscriberContact records."""
@@ -2960,14 +3380,14 @@ def bulk_delete_subscribers():
 
 @app.route('/admin/notifications/export-csv')
 @login_required
-@require_module('notifications')
+@require_capability('notifications.export_pii')
 def export_subscribers_csv():
     import csv, io
     subs = (NotificationSubscriber.query
             .order_by(NotificationSubscriber.id).all())
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['subscriber_id', 'household_label', 'group', 'active',
+    writer.writerow(['schema_version', 'subscriber_id', 'household_label', 'group', 'active',
                      'role', 'first_name', 'last_name', 'email', 'phone'])
     for sub in subs:
         group_name = sub.group.name if sub.group else ''
@@ -2975,13 +3395,13 @@ def export_subscribers_csv():
         if sub.contacts:
             for c in sub.contacts:
                 writer.writerow(_csv_safe_row([
-                    sub.id, sub.notes or '', group_name, active_str,
+                    'Legacy CSV v1', sub.id, sub.notes or '', group_name, active_str,
                     c.role or 'parent', c.first_name or '', c.last_name or '',
                     c.email or '', c.phone or '',
                 ]))
         else:
             writer.writerow(_csv_safe_row([
-                sub.id, sub.notes or '', group_name, active_str,
+                'Legacy CSV v1', sub.id, sub.notes or '', group_name, active_str,
                 'parent', sub.first_name or '', sub.last_name or '',
                 sub.email or '', sub.phone or '',
             ]))
@@ -3077,19 +3497,112 @@ def _auto_create_group_from_name(group_name):
     return grp
 
 
+def _store_import_stage(file_name, payload, content, headers, normalized_rows, report):
+    public_id = secrets.token_urlsafe(32)
+    file_sha = hashlib.sha256(payload).hexdigest()
+    canonical_rows = json.dumps(normalized_rows, ensure_ascii=False,
+                                sort_keys=True, separators=(',', ':'))
+    plan_hash = hashlib.sha256(
+        f'legacy_csv:1:{file_sha}:{canonical_rows}'.encode('utf-8')).hexdigest()
+    now = _utcnow()
+    batch = ImportBatch(
+        public_id=public_id, source_type='legacy_csv', schema_version='1',
+        status='staged' if not report['critical'] else 'blocked',
+        snapshot_type='delta', uploaded_by_id=current_user.id,
+        file_sha256=file_sha, plan_hash=plan_hash,
+        total_rows=report['total_rows'],
+        selected_rows=sum(1 for row in normalized_rows if row['classification'] == 'new'),
+        rejected_rows=sum(1 for row in normalized_rows if row['classification'] == 'rejected'),
+        excluded_rows=0, metadata_json=json.dumps(report, sort_keys=True),
+        created_at=now,
+        expires_at=now + timedelta(hours=app.config['IMPORT_STAGE_TTL_HOURS']))
+    db.session.add(batch)
+    db.session.flush()
+    storage_path = os.path.join(IMPORT_STAGE_DIR, f'{public_id}.csv')
+    _write_private_file(storage_path, payload, binary=True)
+    db.session.add(ImportFile(
+        batch_id=batch.id, file_type='legacy_csv',
+        original_name=re.sub(r'[^A-Za-z0-9._ -]', '_', os.path.basename(file_name))[:255],
+        sha256=file_sha, byte_size=len(payload), storage_path=storage_path,
+        headers_json=json.dumps(headers)))
+    for row in normalized_rows:
+        normalized = row['normalized']
+        normalized_json = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+        db.session.add(ImportRow(
+            batch_id=batch.id, row_number=row['row_number'],
+            external_key=None, classification=row['classification'],
+            selected=row['classification'] == 'new', normalized_json=normalized_json,
+            errors_json=json.dumps(row.get('errors', [])),
+            row_hash=hashlib.sha256(normalized_json.encode('utf-8')).hexdigest()))
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        if os.path.isfile(storage_path):
+            os.remove(storage_path)
+        raise
+    _audit('import_staged', 'notifications', public_id,
+           f'Legacy CSV v1; {batch.total_rows} rows; sha256={file_sha[:12]}')
+    return batch
+
+
+def _purge_import_raw_files(batch):
+    """Remove raw staged bytes while preserving normalized audit/change evidence."""
+    stage_root = os.path.realpath(IMPORT_STAGE_DIR) + os.sep
+    failures = []
+    for staged_file in ImportFile.query.filter_by(batch_id=batch.id).all():
+        path = os.path.realpath(staged_file.storage_path)
+        try:
+            if not path.startswith(stage_root):
+                failures.append(staged_file.original_name)
+                continue
+            if os.path.isfile(path):
+                os.remove(path)
+            db.session.delete(staged_file)
+        except OSError:
+            failures.append(staged_file.original_name)
+    return failures
+
+
+def _cleanup_import_stages():
+    now = _utcnow()
+    expired = ImportBatch.query.filter(
+        ImportBatch.expires_at <= now,
+        ImportBatch.status.in_([
+            'staged', 'blocked', 'applying', 'applied', 'failed', 'expired',
+        ]),
+    ).all()
+    for batch in expired:
+        failures = _purge_import_raw_files(batch)
+        if batch.status != 'applied':
+            ImportRow.query.filter_by(batch_id=batch.id).delete(synchronize_session=False)
+            batch.status = 'expired'
+        if failures:
+            db.session.add(AuditLog(
+                username='system', action='import_stage_cleanup_failed',
+                module='notifications', target=batch.public_id,
+                details=f'{len(failures)} raw file(s) could not be removed.',
+                ip_address='background'))
+    if expired:
+        db.session.commit()
+
+
 @app.route('/admin/notifications/import-csv/preview', methods=['POST'])
 @login_required
-@require_module('notifications', 'full')
+@require_capability('import.legacy')
 def preview_import_csv():
-    """Dry-run CSV parse — returns JSON report without writing to the database."""
+    """Normalize once into immutable staging and return a review report."""
     import csv, io
     from collections import OrderedDict
 
+    _cleanup_import_stages()
     file = request.files.get('csv_file')
-    if not file or not file.filename:
-        return jsonify({'ok': False, 'message': 'No file selected.'})
+    if not _valid_csv_upload(file):
+        return jsonify({'ok': False, 'message':
+                        'Select a CSV file with an approved content type.'}), 400
     try:
-        content = file.read().decode('utf-8-sig')
+        payload = file.read()
+        content = payload.decode('utf-8-sig')
     except UnicodeDecodeError:
         return jsonify({'ok': False, 'message': 'File must be UTF-8 encoded.'})
 
@@ -3139,23 +3652,39 @@ def preview_import_csv():
     warn_no_email = 0
     warn_no_phone = 0
     skipped_bus   = 0
+    normalized_rows = []
 
     reader = csv.DictReader(io.StringIO(content))
+    headers = reader.fieldnames or []
+    if (not headers or len(headers) > app.config['IMPORT_MAX_COLUMNS'] or
+            len(headers) != len(set(headers)) or 'group' not in headers or
+            not ({'first_name', 'email'} & set(headers))):
+        return jsonify({'ok': False, 'message':
+                        'CSV headers are missing, duplicated, or do not match Legacy CSV v1.'}), 400
     for i, row in enumerate(reader, 2):
+        if total_rows >= app.config['IMPORT_MAX_ROWS']:
+            return jsonify({'ok': False, 'message':
+                            f'CSV exceeds the {app.config["IMPORT_MAX_ROWS"]} row limit.'}), 400
         total_rows += 1
         group_name = (row.get('group') or '').strip()
         household  = (row.get('household_label') or '').strip()
         first_name = (row.get('first_name') or '').strip()
         last_name  = (row.get('last_name') or '').strip()
-        email      = (row.get('email') or '').strip()
-        phone      = (row.get('phone') or '').strip()
-        if phone.endswith('.0') and phone[:-2].lstrip('+-').isdigit():
-            phone = phone[:-2]
-        if phone and not phone.startswith('+'):
-            phone = '+' + phone
+        email      = _normalize_email(row.get('email'))
+        phone      = _normalize_phone(row.get('phone'))
+        role_raw   = (row.get('role') or 'parent').strip().lower()
+        role       = role_raw if role_raw in ('parent', 'student') else 'parent'
+        normalized = {
+            'group': group_name, 'household_label': household,
+            'first_name': first_name, 'last_name': last_name,
+            'email': email, 'phone': phone, 'role': role,
+        }
 
         if not first_name and not email:
             skipped_blank += 1
+            normalized_rows.append({'row_number': i, 'classification': 'rejected',
+                                    'normalized': normalized,
+                                    'errors': ['A name or email is required.']})
             continue
 
         gkey = group_name.lower() if group_name else ''
@@ -3188,6 +3717,9 @@ def preview_import_csv():
         if group_name and groups_info.get(gkey, {}).get('status') == 'error':
             skipped_bus += 1
             groups_info[gkey]['rows'] += 1
+            normalized_rows.append({'row_number': i, 'classification': 'rejected',
+                                    'normalized': normalized,
+                                    'errors': ['Group bus could not be resolved.']})
             continue
 
         if group_name and gkey in groups_info:
@@ -3202,13 +3734,15 @@ def preview_import_csv():
         if hh_key not in households:
             households[hh_key] = 0
         households[hh_key] += 1
+        normalized_rows.append({'row_number': i, 'classification': 'new',
+                                'normalized': normalized, 'errors': []})
 
     critical = [
         f'Group "{v["name"]}": bus not found — {v["rows"]} row(s) will be skipped'
         for v in groups_info.values() if v['status'] == 'error'
     ]
 
-    return jsonify({
+    report = {
         'ok':            True,
         'total_rows':    total_rows,
         'skipped_blank': skipped_blank,
@@ -3221,103 +3755,132 @@ def preview_import_csv():
         'warn_no_email': warn_no_email,
         'warn_no_phone': warn_no_phone,
         'can_import':    len(critical) == 0,
-    })
+    }
+    batch = _store_import_stage(
+        file.filename, payload, content, headers, normalized_rows, report)
+    report.update({'batch_id': batch.public_id, 'plan_hash': batch.plan_hash,
+                   'schema_version': 'Legacy CSV v1'})
+    return jsonify(report)
 
 
 @app.route('/admin/notifications/import-csv', methods=['POST'])
 @login_required
-@require_module('notifications', 'full')
+@require_capability('import.legacy')
 def import_subscribers_csv():
-    import csv, io
-    from collections import OrderedDict
-    file = request.files.get('csv_file')
-    if not file or not file.filename:
-        flash('No file selected.', 'error')
-        return redirect(url_for('notifications'))
-    try:
-        content = file.read().decode('utf-8-sig')
-    except UnicodeDecodeError:
-        flash('File must be UTF-8 encoded.', 'error')
+    batch_id = (request.form.get('batch_id') or '').strip()
+    plan_hash = (request.form.get('plan_hash') or '').strip()
+    if not batch_id or not plan_hash:
+        flash('Analyze the CSV before confirming the import.', 'error')
         return redirect(url_for('notifications'))
 
-    reader = csv.DictReader(io.StringIO(content))
-    groups_cache = {g.name.strip().lower(): g for g in SubscriberGroup.query.all()}
+    batch = ImportBatch.query.filter_by(public_id=batch_id).first()
+    if not batch or batch.source_type != 'legacy_csv':
+        abort(404)
+    if batch.uploaded_by_id != current_user.id and not current_user.is_admin:
+        abort(403)
+    if batch.expires_at <= _utcnow():
+        batch.status = 'expired'
+        db.session.commit()
+        flash('The analyzed import expired. Analyze the file again.', 'error')
+        return redirect(url_for('notifications'))
+    if not secrets.compare_digest(batch.plan_hash, plan_hash):
+        abort(409)
+    if batch.status == 'applied':
+        flash('This analyzed batch was already imported; no records were duplicated.', 'warning')
+        return redirect(url_for('notifications'))
+    if batch.status != 'staged':
+        flash('This import batch is not eligible to be applied.', 'error')
+        return redirect(url_for('notifications'))
 
-    # Group rows by (group_id, household_label) so multiple contacts share one subscriber
-    households = OrderedDict()
-    row_errors = []
-    skipped = 0
-    auto_created_groups = []
-
-    for i, row in enumerate(reader, 2):   # row 1 = header
-        group_name = (row.get('group') or '').strip()
-        household  = (row.get('household_label') or '').strip()
-        first_name = (row.get('first_name') or '').strip()
-        last_name  = (row.get('last_name') or '').strip()
-        email      = (row.get('email') or '').strip()
-        phone      = (row.get('phone') or '').strip()
-        # CSV exported from spreadsheets may store phone as float (e.g. "17082504810.0")
-        if phone.endswith('.0') and phone[:-2].lstrip('+-').isdigit():
-            phone = phone[:-2]
-        # Ensure phone has leading + for SMS delivery (e.g. "13312308587" → "+13312308587")
-        if phone and not phone.startswith('+'):
-            phone = '+' + phone
-        role_raw   = (row.get('role') or 'parent').strip().lower()
-        role       = role_raw if role_raw in ('parent', 'student') else 'parent'
-
-        if not first_name and not email:
-            skipped += 1
-            continue
-
-        group_obj = groups_cache.get(group_name.lower()) if group_name else None
-        if group_name and not group_obj:
-            group_obj = _auto_create_group_from_name(group_name)
-            if group_obj:
-                groups_cache[group_name.lower()] = group_obj
-                if group_name not in auto_created_groups:
-                    auto_created_groups.append(group_name)
-            else:
-                row_errors.append(f'Row {i}: group "{group_name}" not found and could not be auto-created (bus not found) — skipped')
-                skipped += 1
-                continue
-
-        group_id = group_obj.id if group_obj else None
-        key = (group_id, household if household else f'__row_{i}__')
-        if key not in households:
-            households[key] = {'group_id': group_id, 'notes': household or None, 'contacts': []}
-        households[key]['contacts'].append({
-            'first_name': first_name or None,
-            'last_name':  last_name  or None,
-            'email':      email      or None,
-            'phone':      phone      or None,
-            'role':       role,
-        })
-
-    imported = 0
-    for key, hh in households.items():
-        sub = NotificationSubscriber(
-            notes=hh['notes'],
-            group_id=hh['group_id'],
-            active=True,
-        )
-        db.session.add(sub)
-        db.session.flush()
-        for idx, c in enumerate(hh['contacts']):
-            db.session.add(SubscriberContact(
-                subscriber_id=sub.id, sort_order=idx, **c))
-        imported += 1
-
+    # A conditional UPDATE is atomic on both SQLite and PostgreSQL. It closes
+    # the double-submit race that SELECT ... FOR UPDATE cannot close on SQLite.
+    claimed = ImportBatch.query.filter_by(
+        id=batch.id, status='staged').update(
+            {'status': 'applying'}, synchronize_session=False)
     db.session.commit()
-    parts = [f'{imported} subscriber(s) imported.']
-    if auto_created_groups:
-        parts.append(f'{len(auto_created_groups)} group(s) auto-created: {", ".join(auto_created_groups[:5])}.')
-    if skipped:
-        parts.append(f'{skipped} row(s) skipped.')
-    if row_errors:
-        parts.append(' | '.join(row_errors[:5]))
-    flash(' '.join(parts), 'success' if not row_errors else 'warning')
-    return redirect(url_for('notifications'))
+    if claimed != 1:
+        flash('This analyzed batch is already being applied.', 'warning')
+        return redirect(url_for('notifications'))
+    batch = db.session.get(ImportBatch, batch.id)
 
+    rows = ImportRow.query.filter_by(
+        batch_id=batch.id, selected=True, classification='new',
+    ).order_by(ImportRow.row_number).all()
+    households = {}
+    groups_cache = {group.name.strip().lower(): group
+                    for group in SubscriberGroup.query.all()}
+    created_groups = []
+    try:
+        for row in rows:
+            normalized = json.loads(row.normalized_json)
+            group_name = normalized.get('group', '').strip()
+            group_obj = groups_cache.get(group_name.lower()) if group_name else None
+            if group_name and not group_obj:
+                group_obj = _auto_create_group_from_name(group_name)
+                if not group_obj:
+                    raise ValueError(f'Group "{group_name}" can no longer be resolved.')
+                groups_cache[group_name.lower()] = group_obj
+                created_groups.append(group_name)
+            household = normalized.get('household_label', '').strip()
+            key = (group_obj.id if group_obj else None,
+                   household if household else f'__row_{row.row_number}__')
+            households.setdefault(key, {
+                'group_id': group_obj.id if group_obj else None,
+                'notes': household or None, 'contacts': [], 'rows': [],
+            })
+            households[key]['contacts'].append({
+                'first_name': normalized.get('first_name') or None,
+                'last_name': normalized.get('last_name') or None,
+                'email': normalized.get('email') or None,
+                'phone': normalized.get('phone') or None,
+                'role': normalized.get('role') or 'parent',
+            })
+            households[key]['rows'].append(row)
+
+        imported = 0
+        for household in households.values():
+            subscriber = NotificationSubscriber(
+                notes=household['notes'], group_id=household['group_id'], active=True)
+            db.session.add(subscriber)
+            db.session.flush()
+            for index, contact in enumerate(household['contacts']):
+                db.session.add(SubscriberContact(
+                    subscriber_id=subscriber.id, sort_order=index, **contact))
+            for row in household['rows']:
+                db.session.add(ImportChange(
+                    batch_id=batch.id, row_id=row.id, operation='create',
+                    target_table='notification_subscriber', target_id=subscriber.id,
+                    after_json=json.dumps({
+                        'subscriber_id': subscriber.id,
+                        'group_id': subscriber.group_id,
+                    }, sort_keys=True)))
+            imported += 1
+
+        batch.status = 'applied'
+        batch.applied_at = _utcnow()
+        batch.selected_rows = len(rows)
+        db.session.commit()
+        cleanup_failures = _purge_import_raw_files(batch)
+        db.session.commit()
+        _audit('import_applied', 'notifications', batch.public_id,
+               f'Legacy CSV v1; {imported} subscribers; {len(rows)} rows')
+        if cleanup_failures:
+            _audit('import_stage_cleanup_failed', 'notifications', batch.public_id,
+                   f'{len(cleanup_failures)} raw file(s) could not be removed.')
+        message = f'{imported} subscriber(s) imported from the analyzed batch.'
+        if created_groups:
+            message += f' {len(created_groups)} group(s) auto-created.'
+        flash(message, 'success')
+    except Exception:
+        db.session.rollback()
+        failed = ImportBatch.query.filter_by(public_id=batch_id).first()
+        if failed and failed.status != 'applied':
+            failed.status = 'failed'
+            db.session.commit()
+        _audit('import_failed', 'notifications', batch_id,
+               'Atomic transaction rolled back.')
+        flash('Import failed and no subscriber records were changed.', 'error')
+    return redirect(url_for('notifications'))
 
 # ── SUBSCRIBER GROUPS ──────────────────────────────────────────────────────────
 
@@ -3464,13 +4027,24 @@ def _build_recipient_list(target, group_ids, subscriber_id, user_id):
 
 
 def _broadcast_worker(job_id, recipients, subject, body, interval_sec):
-    """Background thread: send emails with optional interval between each."""
-    broadcast_jobs[job_id].update({'total': len(recipients), 'sent': 0, 'failed': 0,
-                                   'done': False, 'errors': []})
+    """Background worker with database-backed progress shared by all web workers."""
     with app.app_context():
+        job = db.session.get(BroadcastJob, job_id)
+        if not job or job.expires_at <= _utcnow():
+            return
+        job.status = 'running'
+        job.updated_at = _utcnow()
+        db.session.commit()
         cfg = Configuration.query.first()
-        if cfg:
-            configure_mail(cfg)
+        try:
+            if cfg:
+                configure_mail(cfg)
+        except Exception:
+            job.status = 'failed'
+            job.errors_json = json.dumps(['Approved SMTP configuration could not be initialized.'])
+            job.updated_at = _utcnow()
+            db.session.commit()
+            return
         for i, (name, email) in enumerate(recipients):
             if i > 0 and interval_sec > 0:
                 time.sleep(interval_sec)
@@ -3478,16 +4052,28 @@ def _broadcast_worker(job_id, recipients, subject, body, interval_sec):
                 msg = Message(subject=subject, recipients=[email],
                               body=f"Hi {name or 'there'},\n\n{body}")
                 mail.send(msg)
-                broadcast_jobs[job_id]['sent'] += 1
-            except Exception as e:
-                broadcast_jobs[job_id]['failed'] += 1
-                broadcast_jobs[job_id]['errors'].append(f'{email}: {str(e)[:120]}')
-        broadcast_jobs[job_id]['done'] = True
+                job.sent += 1
+            except Exception:
+                job.failed += 1
+                errors = job.errors
+                if len(errors) < 100:
+                    errors.append(f'{_mask_email(email)}: delivery failed')
+                job.errors_json = json.dumps(errors)
+            job.updated_at = _utcnow()
+            db.session.commit()
+        job.status = 'completed'
+        job.updated_at = _utcnow()
+        owner = db.session.get(User, job.owner_id)
+        db.session.add(AuditLog(
+            user_id=job.owner_id, username=owner.username if owner else 'system',
+            action='broadcast_completed', module='notifications', target=job.public_id,
+            details=f'{job.sent} sent; {job.failed} failed', ip_address='background'))
+        db.session.commit()
 
 
 @app.route('/admin/notifications/broadcast', methods=['POST'])
 @login_required
-@require_module('notifications', 'full')
+@require_capability('notifications.broadcast')
 def send_broadcast():
     data         = request.get_json(silent=True) or {}
     target       = data.get('target', 'all')
@@ -3505,9 +4091,16 @@ def send_broadcast():
     if not recipients:
         return jsonify({'ok': False, 'message': 'No valid recipients found.'})
 
-    job_id = secrets.token_urlsafe(24)
-    broadcast_jobs[job_id] = {'total': len(recipients), 'sent': 0, 'failed': 0,
-                               'done': False, 'errors': [], 'owner_id': current_user.id}
+    job_id = secrets.token_urlsafe(32)
+    now = _utcnow()
+    db.session.add(BroadcastJob(
+        public_id=job_id, owner_id=current_user.id, status='queued',
+        total=len(recipients), sent=0, failed=0, errors_json='[]',
+        created_at=now, updated_at=now,
+        expires_at=now + timedelta(seconds=app.config['BROADCAST_JOB_TTL_SECONDS'])))
+    db.session.commit()
+    _audit('broadcast_started', 'notifications', job_id,
+           f'{len(recipients)} recipients')
 
     t = threading.Thread(target=_broadcast_worker,
                          args=(job_id, recipients, subject, body, interval_sec),
@@ -3518,14 +4111,22 @@ def send_broadcast():
 
 @app.route('/admin/notifications/broadcast/<job_id>/status')
 @login_required
-@require_module('notifications', 'full')
+@require_capability('notifications.broadcast')
 def broadcast_status(job_id):
-    job = broadcast_jobs.get(job_id)
+    job = db.session.get(BroadcastJob, job_id)
     if not job:
         abort(404)
-    if job.get('owner_id') != current_user.id and not current_user.is_admin:
+    if job.expires_at <= _utcnow():
+        if job.status not in {'completed', 'failed', 'expired'}:
+            job.status = 'expired'
+            db.session.commit()
+        abort(404)
+    if job.owner_id != current_user.id and not current_user.is_admin:
         abort(403)
-    return jsonify({key: job[key] for key in ('total', 'sent', 'failed', 'done', 'errors')})
+    return jsonify({
+        'total': job.total, 'sent': job.sent, 'failed': job.failed,
+        'done': job.done, 'status': job.status, 'errors': job.errors,
+    })
 
 
 # ── CONFIGURATION MODULE ──────────────────────────────────────────────────────
@@ -3700,7 +4301,7 @@ def upload_logo():
 
 @app.route('/admin/config/test-email', methods=['POST'])
 @login_required
-@require_module('config', 'full')
+@require_capability('smtp.diagnose')
 def test_email():
     cfg = get_config()
     to = request.form.get('test_email', current_user.email or '')
@@ -3710,6 +4311,7 @@ def test_email():
                       recipients=[to],
                       body=f'This is a test email from {cfg.app_name}.')
         mail.send(msg)
+        _audit('smtp_test_succeeded', 'config', 'saved approved destination')
         flash(f'Test email sent to {to}.', 'success')
     except Exception:
         _audit('smtp_test_failed', 'config', 'saved configuration')
@@ -3719,7 +4321,7 @@ def test_email():
 
 @app.route('/admin/config/test-email-live', methods=['POST'])
 @login_required
-@require_module('config', 'full')
+@require_capability('smtp.diagnose')
 def test_email_live():
     """AJAX endpoint: test SMTP with current form values (does not save to DB)."""
     data = request.get_json(silent=True) or {}
@@ -3752,6 +4354,8 @@ def test_email_live():
                   f'From: {app.config.get("MAIL_DEFAULT_SENDER")}'),
         )
         mail.send(msg)
+        _audit('smtp_live_test_succeeded', 'config',
+               app.config.get('MAIL_SERVER', 'approved destination'))
         return jsonify({'ok': True, 'message': f'Test email sent successfully to {test_to}.'})
     except ValueError as exc:
         return jsonify({'ok': False, 'message': str(exc)}), 400
@@ -3762,7 +4366,7 @@ def test_email_live():
 
 @app.route('/admin/config/check-smtp', methods=['POST'])
 @login_required
-@require_module('config', 'full')
+@require_capability('smtp.diagnose')
 def check_smtp():
     """AJAX endpoint: step-by-step SMTP diagnostics using smtplib directly."""
     import smtplib, socket as _socket
@@ -3774,12 +4378,14 @@ def check_smtp():
         server = _validated_smtp_host(provider, data.get('server', ''))
         port = _validated_smtp_port(data.get('port', None) or cfg.mail_port or 587)
     except ValueError as exc:
+        _audit('smtp_diagnostic_rejected', 'config', 'unapproved destination')
         return jsonify({'ok': False, 'steps': [
             {'ok': False, 'label': 'SMTP configuration rejected', 'detail': str(exc)}]}), 400
     use_tls  = bool(data.get('use_tls', cfg.mail_use_tls))
     use_ssl  = bool(data.get('use_ssl', getattr(cfg, 'mail_use_ssl', False)))
     username = data.get('username', '') or ''
     password = data.get('password', '') or ''
+    _audit('smtp_diagnostic_started', 'config', f'{server}:{port}')
 
     steps = []
 
@@ -3854,6 +4460,7 @@ def check_smtp():
         steps.append({'ok': None, 'label': 'Authentication skipped — no credentials entered'})
 
     smtp.quit()
+    _audit('smtp_diagnostic_succeeded', 'config', f'{server}:{port}')
     return jsonify({'ok': True, 'steps': steps})
 
 
@@ -3992,8 +4599,7 @@ def delete_holiday(hid):
 
 @app.route('/admin/config/export-db')
 @login_required
-@require_module('config', 'full')
-@require_admin
+@require_capability('backup.export_sensitive')
 def export_db():
     db_path = db.engine.url.database if db.engine.url.get_backend_name() == 'sqlite' else None
     if db_path and os.path.exists(db_path):
@@ -4163,13 +4769,25 @@ def check_deps():
     return jsonify(results)
 
 
-_IMPORT_TABLE_ORDER = [
+_IMPORT_TABLE_ORDER_V1 = [
     'user_group', 'group_permission', 'user', 'configuration',
     'operational_schedule', 'bus_schedule_type', 'incident_type',
     'delay_reason', 'bus', 'bus_schedule_assignment',
     'bus_incident_record', 'subscriber_group', 'group_bus_assignment',
     'notification_subscriber', 'subscriber_contact',
     'notification_bus_assignment', 'holiday', 'audit_log', 'login_throttle',
+]
+
+_IMPORT_TABLE_ORDER = [
+    'user_group', 'group_permission', 'group_capability', 'user', 'configuration',
+    'operational_schedule', 'bus_schedule_type', 'incident_type',
+    'delay_reason', 'bus', 'bus_schedule_assignment',
+    'bus_incident_record', 'subscriber_group', 'group_bus_assignment',
+    'notification_subscriber', 'subscriber_contact',
+    'notification_bus_assignment', 'notification_log', 'holiday',
+    'audit_log', 'login_throttle', 'broadcast_job',
+    'import_mapping_profile', 'import_batch', 'import_file', 'import_row',
+    'external_identity', 'import_change',
 ]
 
 
@@ -4186,7 +4804,8 @@ _SAFE_CONFIGURATION_COLUMNS = [
     'twilio_from_number', 'twilio_sms_cost_per_seg',
 ]
 _BACKUP_FORMAT = 'bustrack-full-backup'
-_BACKUP_VERSION = 1
+_BACKUP_VERSION = 2
+_SUPPORTED_BACKUP_VERSIONS = {1, 2}
 
 
 def _json_default(value):
@@ -4239,7 +4858,7 @@ def _encrypted_download(payload, filename):
 
 @app.route('/admin/config/export-operational-json')
 @login_required
-@require_module('config', 'full')
+@require_capability('backup.export_operational')
 def export_operational_json():
     tables = list(_OPERATIONAL_EXPORT_TABLES)
     if current_user.has_access('buses'):
@@ -4267,8 +4886,7 @@ def export_operational_json():
 
 @app.route('/admin/config/export-json')
 @login_required
-@require_module('config', 'full')
-@require_admin
+@require_capability('backup.export_sensitive')
 def export_json():
     try:
         payload = json.dumps(_full_backup_document(), default=_json_default,
@@ -4283,8 +4901,7 @@ def export_json():
 
 @app.route('/admin/config/export-sql')
 @login_required
-@require_module('config', 'full')
-@require_admin
+@require_capability('backup.export_sensitive')
 def export_sql():
     from sqlalchemy import inspect as sa_inspect, text as sa_text
     lines = [f'-- BusTrack encrypted SQL export source — {_utcnow().isoformat()}Z']
@@ -4361,14 +4978,16 @@ def _validate_backup_document(document):
     from sqlalchemy import inspect as sa_inspect
     if not isinstance(document, dict) or document.get('format') != _BACKUP_FORMAT:
         raise ValueError('Unsupported backup format.')
-    if document.get('version') != _BACKUP_VERSION:
+    version = document.get('version')
+    if version not in _SUPPORTED_BACKUP_VERSIONS:
         raise ValueError('Unsupported backup version.')
     tables = document.get('tables')
     if not isinstance(tables, dict) or not tables:
         raise ValueError('Backup does not contain tables.')
     inspector = sa_inspect(db.engine)
     existing = set(inspector.get_table_names())
-    allowed = set(_IMPORT_TABLE_ORDER) & existing
+    import_order = _IMPORT_TABLE_ORDER if version == 2 else _IMPORT_TABLE_ORDER_V1
+    allowed = set(import_order) & existing
     unknown = set(tables) - allowed
     if unknown:
         raise ValueError('Backup contains tables that are not approved for restore.')
@@ -4376,7 +4995,7 @@ def _validate_backup_document(document):
     if missing:
         raise ValueError('Full backup is incomplete and cannot be restored safely.')
     ordered = []
-    for table in _IMPORT_TABLE_ORDER:
+    for table in import_order:
         if table not in tables:
             continue
         rows = tables[table]
@@ -4404,8 +5023,7 @@ def _validate_backup_document(document):
 
 @app.route('/admin/config/import-db', methods=['POST'])
 @login_required
-@require_module('config', 'full')
-@require_admin
+@require_capability('restore.identity')
 def import_db():
     """Validate an encrypted, versioned backup and stage an owner-bound restore job."""
     _cleanup_restore_jobs()
@@ -4426,6 +5044,7 @@ def import_db():
     job = {
         'owner_id': current_user.id,
         'created_at': _utcnow().isoformat() + 'Z',
+        'backup_version': document.get('version'),
         'tables': ordered,
         'is_pg': str(db.engine.url).startswith('postgresql'),
     }
@@ -4436,8 +5055,7 @@ def import_db():
 
 @app.route('/admin/config/import-run/<job_id>', methods=['POST'])
 @login_required
-@require_module('config', 'full')
-@require_admin
+@require_capability('restore.identity')
 def import_run(job_id):
     """Apply the validated restore atomically after creating an encrypted snapshot."""
     _cleanup_restore_jobs()
@@ -4458,7 +5076,8 @@ def import_run(job_id):
 
     try:
         tables = _validate_backup_document({
-            'format': _BACKUP_FORMAT, 'version': _BACKUP_VERSION,
+            'format': _BACKUP_FORMAT,
+            'version': job.get('backup_version', _BACKUP_VERSION),
             'tables': dict(job['tables']),
         })
         snapshot = json.dumps(_full_backup_document(), default=_json_default,
@@ -4471,11 +5090,19 @@ def import_run(job_id):
         from sqlalchemy import text as sa_text
         with db.engine.begin() as conn:
             table_names = [table for table, _ in tables]
+            legacy_phase2_tables = [
+                'import_change', 'import_file', 'import_row', 'import_batch',
+                'external_identity', 'broadcast_job', 'group_capability',
+                'import_mapping_profile',
+            ] if job.get('backup_version') == 1 else []
             if job.get('is_pg'):
-                quoted = ', '.join(f'"{table}"' for table in table_names)
+                clear_tables = table_names + legacy_phase2_tables
+                quoted = ', '.join(f'"{table}"' for table in clear_tables)
                 if quoted:
                     conn.execute(sa_text(f'TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE'))
             else:
+                for table in legacy_phase2_tables:
+                    conn.execute(sa_text(f'DELETE FROM "{table}"'))
                 for table in reversed(table_names):
                     conn.execute(sa_text(f'DELETE FROM "{table}"'))
             for table, rows in tables:
@@ -4489,6 +5116,7 @@ def import_run(job_id):
                         f"SELECT setval(pg_get_serial_sequence('\"{table}\"','id'), "
                         f"COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM \"{table}\""))
         db.session.expire_all()
+        _seed_phase2_security_and_imports()
         os.remove(jpath)
         _audit('import_db_done', 'config', f'{len(tables)} tables restored',
                f'Pre-restore snapshot: {snapshot_name}')
@@ -4551,7 +5179,7 @@ def system_logs():
 
 @app.route('/admin/logs/export-csv')
 @login_required
-@require_module('logs')
+@require_capability('audit.export')
 def export_logs_csv():
     module_f = request.args.get('module', '').strip()
     user_f   = request.args.get('user', '').strip()
@@ -4603,8 +5231,9 @@ def profile():
         current_user.receive_notifications = 'receive_notifications' in request.form
         pwd = request.form.get('new_password','').strip()
         if pwd:
-            if len(pwd) < 12:
-                flash('New password must be at least 12 characters.', 'error')
+            password_error = _password_error(pwd)
+            if password_error:
+                flash(password_error, 'error')
                 return redirect(url_for('profile'))
             if not current_user.check_password(request.form.get('current_password','')):
                 flash('Current password is incorrect.', 'error')
