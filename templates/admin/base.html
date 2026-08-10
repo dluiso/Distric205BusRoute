@@ -7,11 +7,9 @@
   <script>/* suppress Tailwind Play CDN production warning */const _cw=console.warn;console.warn=function(...a){if(a[0]&&String(a[0]).includes('cdn.tailwindcss.com'))return;_cw.apply(console,a)};</script>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
   <script src="{{ url_for('static', filename='js/safe-output.js') }}"></script>
   {% block head %}{% endblock %}
   <style>
-    [x-cloak]{display:none!important}
     .sidebar-link {
       display: flex;
       align-items: center;
@@ -40,16 +38,15 @@
     }
   </style>
 </head>
-<body class="bg-slate-100 h-full" x-data="{ sidebar: window.innerWidth >= 1024 }">
+<body class="bg-slate-100 h-full">
 
 <!-- Mobile overlay -->
-<div x-show="sidebar && window.innerWidth < 1024" x-cloak @click="sidebar=false"
-     class="fixed inset-0 bg-black/50 z-20 lg:hidden backdrop-blur-sm"></div>
+<div id="sidebar-overlay"
+     class="hidden fixed inset-0 bg-black/50 z-20 lg:hidden backdrop-blur-sm"></div>
 
 <!-- ── SIDEBAR ──────────────────────────────────────────────────── -->
-<aside x-cloak
-       :class="sidebar ? 'translate-x-0' : '-translate-x-full'"
-       class="fixed top-0 left-0 h-full w-64 bg-slate-900 flex flex-col z-30 transform transition-transform duration-200 ease-in-out lg:translate-x-0">
+<aside id="admin-sidebar"
+       class="fixed top-0 left-0 h-full w-64 bg-slate-900 flex flex-col z-30 transform -translate-x-full transition-transform duration-200 ease-in-out lg:translate-x-0">
 
   <!-- Brand -->
   <div class="flex items-center space-x-3 px-5 py-5 border-b border-slate-700/50">
@@ -124,7 +121,8 @@
   <header class="bg-white border-b border-slate-200 shadow-sm sticky top-0 z-10">
     <div class="flex items-center justify-between px-5 py-3.5">
       <div class="flex items-center space-x-3">
-        <button @click="sidebar=!sidebar" class="lg:hidden text-slate-500 hover:text-slate-700 p-1">
+        <button id="sidebar-toggle" type="button" aria-controls="admin-sidebar" aria-expanded="false"
+                class="lg:hidden text-slate-500 hover:text-slate-700 p-1">
           <i class="fas fa-bars text-lg"></i>
         </button>
         <div>
@@ -169,6 +167,29 @@
 
 <meta name="csrf-token" content="{{ csrf_token() }}">
 <script>
+  const sidebar = document.getElementById('admin-sidebar');
+  const sidebarOverlay = document.getElementById('sidebar-overlay');
+  const sidebarToggle = document.getElementById('sidebar-toggle');
+  const desktopSidebar = window.matchMedia('(min-width: 1024px)');
+
+  function setSidebarOpen(open) {
+    if (!sidebar || !sidebarOverlay || !sidebarToggle) return;
+    const mobileOpen = Boolean(open) && !desktopSidebar.matches;
+    sidebar.classList.toggle('-translate-x-full', !mobileOpen && !desktopSidebar.matches);
+    sidebar.classList.toggle('translate-x-0', mobileOpen);
+    sidebarOverlay.classList.toggle('hidden', !mobileOpen);
+    sidebarToggle.setAttribute('aria-expanded', String(mobileOpen));
+  }
+
+  if (sidebarToggle && sidebarOverlay) {
+    sidebarToggle.addEventListener('click', () => {
+      setSidebarOpen(sidebarToggle.getAttribute('aria-expanded') !== 'true');
+    });
+    sidebarOverlay.addEventListener('click', () => setSidebarOpen(false));
+    desktopSidebar.addEventListener('change', () => setSidebarOpen(false));
+    setSidebarOpen(false);
+  }
+
   document.getElementById('topbar-date').textContent =
     new Date().toLocaleDateString('en-US', {weekday:'short',year:'numeric',month:'short',day:'numeric'});
   setTimeout(() => {

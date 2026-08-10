@@ -629,6 +629,33 @@
   </div>
 </div>
 
+<template id="contact-row-template">
+  <div class="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+    <div class="flex items-center justify-between">
+      <select data-contact-field="role"
+              class="px-2 py-1.5 border border-slate-200 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <option value="parent">Parent / Guardian</option>
+        <option value="student">Student</option>
+      </select>
+      <button type="button" data-contact-remove
+              class="hidden px-2 py-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors text-xs">
+        <i class="fas fa-times"></i> Remove
+      </button>
+    </div>
+    <div class="grid grid-cols-2 gap-2">
+      <input data-contact-field="first_name" type="text" placeholder="First name"
+             class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      <input data-contact-field="last_name" type="text" placeholder="Last name"
+             class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+    </div>
+    <input data-contact-field="email" type="text" placeholder="email@example.com"
+           class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <p class="text-[10px] text-slate-400 -mt-1 pl-1"><i class="fas fa-info-circle mr-0.5"></i>Multiple emails: separate with commas</p>
+    <input data-contact-field="phone" type="tel" placeholder="Phone (optional)"
+           class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+  </div>
+</template>
+
 <!-- ── MODAL: Add Subscriber ── -->
 <div id="modal-add" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
   <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
@@ -638,7 +665,7 @@
         <i class="fas fa-times"></i>
       </button>
     </div>
-    <div id="add-sub-alpine" x-data="{ contacts: [{first_name:'',last_name:'',email:'',phone:'',role:'parent'}] }">
+    <div id="add-sub-editor">
       <form method="POST" action="{{ url_for('add_subscriber') }}" class="px-6 py-5 space-y-4">
         <div>
           <label class="block text-xs font-semibold text-slate-600 mb-1.5">
@@ -660,37 +687,9 @@
           <label class="block text-xs font-semibold text-slate-600 mb-2">
             Contacts <span class="text-slate-400 font-normal">(parents and/or students)</span>
           </label>
-          <div class="space-y-3">
-            <template x-for="(c, i) in contacts" :key="i">
-              <div class="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
-                <div class="flex items-center justify-between">
-                  <select :name="'contact_' + i + '_role'" x-model="c.role"
-                          class="px-2 py-1.5 border border-slate-200 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
-                    <option value="parent">Parent / Guardian</option>
-                    <option value="student">Student</option>
-                  </select>
-                  <button type="button" @click="contacts.splice(i, 1)" x-show="contacts.length > 1"
-                          class="px-2 py-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors text-xs">
-                    <i class="fas fa-times"></i> Remove
-                  </button>
-                </div>
-                <div class="grid grid-cols-2 gap-2">
-                  <input :name="'contact_' + i + '_first_name'" x-model="c.first_name" type="text" placeholder="First name"
-                         class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                  <input :name="'contact_' + i + '_last_name'" x-model="c.last_name" type="text" placeholder="Last name"
-                         class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                </div>
-                <input :name="'contact_' + i + '_email'" x-model="c.email" type="text" placeholder="email@example.com"
-                       class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <p class="text-[10px] text-slate-400 -mt-1 pl-1"><i class="fas fa-info-circle mr-0.5"></i>Multiple emails: separate with commas</p>
-                <input :name="'contact_' + i + '_phone'" x-model="c.phone" type="tel" placeholder="Phone (optional)"
-                       class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-              </div>
-            </template>
-          </div>
-          <input type="hidden" name="contact_count" :value="contacts.length">
-          <button type="button"
-                  @click="contacts.push({first_name:'',last_name:'',email:'',phone:'',role:'parent'})"
+          <div id="add-contacts-list" class="space-y-3"></div>
+          <input id="add-contact-count" type="hidden" name="contact_count" value="1">
+          <button id="add-contact-button" type="button"
                   class="mt-2 text-sm text-blue-600 hover:text-blue-800 font-medium">
             <i class="fas fa-plus mr-1"></i>Add Another Person
           </button>
@@ -714,16 +713,16 @@
         <i class="fas fa-times"></i>
       </button>
     </div>
-    <div id="edit-sub-alpine" x-data="{ contacts: [], notes: '', group_id: '', active: true }">
+    <div id="edit-sub-editor">
       <form method="POST" id="form-edit" class="px-6 py-5 space-y-4">
         <div>
           <label class="block text-xs font-semibold text-slate-600 mb-1.5">Household Label</label>
-          <input type="text" name="notes" x-model="notes" placeholder="Smith Family"
+          <input id="edit-subscriber-notes" type="text" name="notes" placeholder="Smith Family"
                  class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
         </div>
         <div>
           <label class="block text-xs font-semibold text-slate-600 mb-1.5">Group</label>
-          <select name="group_id" x-model="group_id"
+          <select id="edit-subscriber-group" name="group_id"
                   class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
             <option value="">— No Group —</option>
             {% for grp in groups %}
@@ -732,44 +731,16 @@
           </select>
         </div>
         <label class="flex items-center space-x-2 cursor-pointer">
-          <input type="checkbox" name="active" x-model="active" class="w-4 h-4 rounded border-slate-300 text-blue-600">
+          <input id="edit-subscriber-active" type="checkbox" name="active" class="w-4 h-4 rounded border-slate-300 text-blue-600">
           <span class="text-sm text-slate-600 font-medium">Active (receives notifications)</span>
         </label>
         <div>
           <label class="block text-xs font-semibold text-slate-600 mb-2">
             Contacts <span class="text-slate-400 font-normal">(parents and/or students)</span>
           </label>
-          <div class="space-y-3">
-            <template x-for="(c, i) in contacts" :key="i">
-              <div class="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
-                <div class="flex items-center justify-between">
-                  <select :name="'contact_' + i + '_role'" x-model="c.role"
-                          class="px-2 py-1.5 border border-slate-200 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
-                    <option value="parent">Parent / Guardian</option>
-                    <option value="student">Student</option>
-                  </select>
-                  <button type="button" @click="contacts.splice(i, 1)" x-show="contacts.length > 1"
-                          class="px-2 py-1 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors text-xs">
-                    <i class="fas fa-times"></i> Remove
-                  </button>
-                </div>
-                <div class="grid grid-cols-2 gap-2">
-                  <input :name="'contact_' + i + '_first_name'" x-model="c.first_name" type="text" placeholder="First name"
-                         class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                  <input :name="'contact_' + i + '_last_name'" x-model="c.last_name" type="text" placeholder="Last name"
-                         class="px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                </div>
-                <input :name="'contact_' + i + '_email'" x-model="c.email" type="text" placeholder="email@example.com"
-                       class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <p class="text-[10px] text-slate-400 -mt-1 pl-1"><i class="fas fa-info-circle mr-0.5"></i>Multiple emails: separate with commas</p>
-                <input :name="'contact_' + i + '_phone'" x-model="c.phone" type="tel" placeholder="Phone (optional)"
-                       class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-              </div>
-            </template>
-          </div>
-          <input type="hidden" name="contact_count" :value="contacts.length">
-          <button type="button"
-                  @click="contacts.push({first_name:'',last_name:'',email:'',phone:'',role:'parent'})"
+          <div id="edit-contacts-list" class="space-y-3"></div>
+          <input id="edit-contact-count" type="hidden" name="contact_count" value="1">
+          <button id="edit-contact-button" type="button"
                   class="mt-2 text-sm text-blue-600 hover:text-blue-800 font-medium">
             <i class="fas fa-plus mr-1"></i>Add Another Person
           </button>
@@ -1179,12 +1150,61 @@ function confirmBulkDelete() {
 }
 
 // ─── Modal helpers ──────────────────────────────────────────────────────────
+const contactEditorState = { add: [], edit: [] };
+
+function emptyContact() {
+  return {first_name: '', last_name: '', email: '', phone: '', role: 'parent'};
+}
+
+function normalizedContact(contact) {
+  const source = contact && typeof contact === 'object' ? contact : {};
+  return {
+    first_name: String(source.first_name || ''),
+    last_name: String(source.last_name || ''),
+    email: String(source.email || ''),
+    phone: String(source.phone || ''),
+    role: source.role === 'student' ? 'student' : 'parent',
+  };
+}
+
+function setContactEditorContacts(kind, contacts) {
+  const normalized = Array.isArray(contacts) ? contacts.map(normalizedContact) : [];
+  contactEditorState[kind] = normalized.length ? normalized : [emptyContact()];
+  renderContactEditor(kind);
+}
+
+function renderContactEditor(kind) {
+  const list = document.getElementById(`${kind}-contacts-list`);
+  const count = document.getElementById(`${kind}-contact-count`);
+  const template = document.getElementById('contact-row-template');
+  const contacts = contactEditorState[kind];
+  if (!list || !count || !template || !contacts) return;
+
+  list.replaceChildren();
+  contacts.forEach((contact, index) => {
+    const fragment = template.content.cloneNode(true);
+    const row = fragment.firstElementChild;
+    row.querySelectorAll('[data-contact-field]').forEach(field => {
+      const key = field.dataset.contactField;
+      field.name = `contact_${index}_${key}`;
+      field.value = contact[key];
+      const update = () => { contactEditorState[kind][index][key] = field.value; };
+      field.addEventListener('input', update);
+      field.addEventListener('change', update);
+    });
+    const remove = row.querySelector('[data-contact-remove]');
+    remove.classList.toggle('hidden', contacts.length <= 1);
+    remove.addEventListener('click', () => {
+      contactEditorState[kind].splice(index, 1);
+      renderContactEditor(kind);
+    });
+    list.appendChild(fragment);
+  });
+  count.value = String(contacts.length);
+}
+
 function openAddModal() {
-  const wrapper = document.getElementById('add-sub-alpine');
-  if (wrapper && window.Alpine) {
-    const data = Alpine.$data(wrapper);
-    data.contacts = [{first_name:'', last_name:'', email:'', phone:'', role:'parent'}];
-  }
+  setContactEditorContacts('add', [emptyContact()]);
   document.getElementById('modal-add').classList.remove('hidden');
 }
 
@@ -1195,24 +1215,23 @@ function openEdit(btn) {
 
 function openEditFromData(sub) {
   document.getElementById('form-edit').action = '/admin/notifications/' + sub.id + '/edit';
-  const wrapper = document.getElementById('edit-sub-alpine');
-  if (wrapper && window.Alpine) {
-    const data = Alpine.$data(wrapper);
-    data.notes    = sub.notes || '';
-    data.active   = sub.active;
-    data.group_id = String(sub.group_id || '');
-    data.contacts = sub.contacts && sub.contacts.length > 0
-      ? sub.contacts.map(c => ({
-          first_name: c.first_name || '',
-          last_name:  c.last_name  || '',
-          email:      c.email      || '',
-          phone:      c.phone      || '',
-          role:       c.role       || 'parent',
-        }))
-      : [{first_name:'', last_name:'', email:'', phone:'', role:'parent'}];
-  }
+  document.getElementById('edit-subscriber-notes').value = sub.notes || '';
+  document.getElementById('edit-subscriber-active').checked = Boolean(sub.active);
+  document.getElementById('edit-subscriber-group').value = String(sub.group_id || '');
+  setContactEditorContacts('edit', sub.contacts);
   document.getElementById('modal-edit').classList.remove('hidden');
 }
+
+document.getElementById('add-contact-button').addEventListener('click', () => {
+  contactEditorState.add.push(emptyContact());
+  renderContactEditor('add');
+});
+document.getElementById('edit-contact-button').addEventListener('click', () => {
+  contactEditorState.edit.push(emptyContact());
+  renderContactEditor('edit');
+});
+setContactEditorContacts('add', [emptyContact()]);
+setContactEditorContacts('edit', [emptyContact()]);
 
 function openEditGroup(btn) {
   const grp = JSON.parse(btn.dataset.group);

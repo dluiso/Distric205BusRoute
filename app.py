@@ -1617,7 +1617,7 @@ def security_headers(resp):
         "default-src 'self'; "
         "base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; "
         "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com "
-        "https://unpkg.com https://cdn.jsdelivr.net; "
+        "https://cdn.jsdelivr.net; "
         "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
         "font-src 'self' data: https://cdnjs.cloudflare.com; "
         "img-src 'self' data:; connect-src 'self'"

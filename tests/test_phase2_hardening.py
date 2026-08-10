@@ -73,6 +73,7 @@ def test_security_headers_and_post_only_logout(logged_in_client):
     response = logged_in_client.get('/admin/dashboard')
     assert response.headers['Cache-Control'].startswith('no-store')
     assert "default-src 'self'" in response.headers['Content-Security-Policy']
+    assert 'unpkg.com' not in response.headers['Content-Security-Policy']
     assert response.headers['Cross-Origin-Opener-Policy'] == 'same-origin'
     assert logged_in_client.get('/admin/logout').status_code == 405
     logged_out = logged_in_client.post('/admin/logout', data={
@@ -80,6 +81,19 @@ def test_security_headers_and_post_only_logout(logged_in_client):
     })
     assert logged_out.status_code == 302
     assert logged_in_client.get('/admin/dashboard').status_code == 302
+
+
+def test_admin_ui_has_no_eval_dependent_alpine_runtime():
+    root = Path(__file__).resolve().parents[1]
+    base = (root / 'templates/admin/base.html').read_text(encoding='utf-8')
+    notifications = (root / 'templates/admin/notifications.html').read_text(
+        encoding='utf-8')
+    combined = base + notifications
+    for marker in ('alpinejs', 'x-data=', 'x-for=', 'x-model=', '@click='):
+        assert marker not in combined
+    assert 'id="sidebar-toggle"' in base
+    assert 'id="contact-row-template"' in notifications
+    assert 'setContactEditorContacts' in notifications
 
 
 def test_broadcast_status_is_database_backed_owner_bound_and_expires(client):
