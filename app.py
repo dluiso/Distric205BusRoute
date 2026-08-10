@@ -11,6 +11,7 @@ from flask_mail import Mail, Message
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime, date, timedelta, timezone
+from contextlib import contextmanager
 from functools import wraps
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -762,7 +763,48 @@ def _migrate_subscriber_contacts():
         db.session.rollback()
 
 
-def init_db():
+@contextmanager
+def _database_init_lock():
+    """Serialize schema initialization across Gunicorn workers and processes."""
+    db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+    if db_url.startswith('postgresql'):
+        from sqlalchemy import text
+        database_name = db.engine.url.database or 'default'
+        lock_material = f'{database_name}:bustrack-schema-init:v1'.encode('utf-8')
+        lock_key = int.from_bytes(
+            hashlib.sha256(lock_material).digest()[:8], 'big', signed=True)
+        lock_connection = db.engine.connect()
+        try:
+            lock_connection.execute(
+                text('SELECT pg_advisory_lock(:lock_key)'), {'lock_key': lock_key})
+            yield
+        finally:
+            try:
+                lock_connection.execute(
+                    text('SELECT pg_advisory_unlock(:lock_key)'), {'lock_key': lock_key})
+            finally:
+                lock_connection.close()
+        return
+
+    lock_path = os.path.join(INSTANCE_DIR, '.database-init.lock')
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except ImportError:
+            pass  # Single-process development fallback on platforms without fcntl.
+        yield
+    finally:
+        try:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except ImportError:
+            pass
+        os.close(lock_fd)
+
+
+def _initialize_database_unlocked():
     _migrate_bus_table()
     db.create_all()
     _migrate_add_columns()
@@ -784,6 +826,11 @@ def init_db():
     # Auto-detect existing installations: if users exist but no lock file, create it.
     if not os.path.exists(INSTALLED_FILE) and User.query.count() > 0:
         _mark_installed()
+
+
+def init_db():
+    with _database_init_lock():
+        _initialize_database_unlocked()
 
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────

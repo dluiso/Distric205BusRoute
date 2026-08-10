@@ -2,6 +2,7 @@ import io
 import json
 import os
 import base64
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -107,6 +108,36 @@ def test_instance_secret_persistence_preserves_existing_configuration():
     assert content.count('SECRET_KEY=') == 1
     assert 'SECRET_KEY="new-session-secret"' in content
     assert env_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_database_initialization_lock_serializes_concurrent_workers():
+    first_acquired = threading.Event()
+    release_first = threading.Event()
+    second_acquired = threading.Event()
+
+    def hold_lock():
+        with application._database_init_lock():
+            first_acquired.set()
+            assert release_first.wait(2)
+
+    def wait_for_lock():
+        assert first_acquired.wait(2)
+        with application._database_init_lock():
+            second_acquired.set()
+
+    first = threading.Thread(target=hold_lock)
+    second = threading.Thread(target=wait_for_lock)
+    first.start()
+    assert first_acquired.wait(2)
+    second.start()
+    assert not second_acquired.wait(0.1)
+    release_first.set()
+    assert second_acquired.wait(2)
+    first.join(2)
+    second.join(2)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert (Path(INSTANCE_DIR) / '.database-init.lock').stat().st_mode & 0o777 == 0o600
 
 
 def test_config_limited_cannot_post_any_section(client):
