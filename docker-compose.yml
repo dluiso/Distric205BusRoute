@@ -35,10 +35,11 @@ services:
       IMPORT_MAX_COLUMNS: "${IMPORT_MAX_COLUMNS:-64}"
       IMPORT_STAGE_TTL_HOURS: "${IMPORT_STAGE_TTL_HOURS:-24}"
       POWERSCHOOL_IMPORT_ENABLED: "${POWERSCHOOL_IMPORT_ENABLED:-0}"
+      POWERSCHOOL_ROLLBACK_RETENTION_DAYS: "${POWERSCHOOL_ROLLBACK_RETENTION_DAYS:-30}"
       CSP_ENFORCE: "${CSP_ENFORCE:-1}"
       CSP_REPORT_ONLY: "${CSP_REPORT_ONLY:-0}"
     volumes:
-      - ./instance:/app/instance          # wizard lock file + instance .env
+      - ./instance:/app/instance          # wizard lock + private import staging
       - ./static/uploads:/app/static/uploads  # logos / icons
     depends_on:
       db:

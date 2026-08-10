@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 from cryptography.fernet import Fernet
+from sqlalchemy.engine import make_url
 
 
 TEST_ROOT = tempfile.mkdtemp(prefix='bustrack-tests-')
@@ -12,8 +13,37 @@ INSTANCE_DIR = os.path.join(TEST_ROOT, 'instance')
 UPLOAD_DIR = os.path.join(TEST_ROOT, 'uploads')
 DB_PATH = os.path.join(TEST_ROOT, 'test.db')
 
+
+def _database_url_for_tests():
+    override = os.environ.get('TEST_DATABASE_URL')
+    if not override:
+        return f'sqlite:///{DB_PATH}'
+    parsed = make_url(override)
+    backend = parsed.get_backend_name()
+    if parsed.query:
+        raise RuntimeError(
+            'TEST_DATABASE_URL query parameters are not allowed for destructive tests.')
+    if backend == 'sqlite':
+        selected = Path(parsed.database or '').resolve()
+        if Path(TEST_ROOT).resolve() not in selected.parents:
+            raise RuntimeError(
+                'TEST_DATABASE_URL SQLite files must be inside the generated TEST_ROOT.')
+        return override
+    if backend in {'postgresql', 'postgres'}:
+        database_name = (parsed.database or '').lower()
+        if parsed.host not in {'127.0.0.1', 'localhost', '::1'}:
+            raise RuntimeError('PostgreSQL tests require a loopback database host.')
+        if not database_name.startswith('d205_test_'):
+            raise RuntimeError(
+                'PostgreSQL test database names must start with d205_test_.')
+        if os.environ.get('D205_ALLOW_DESTRUCTIVE_TEST_DATABASE') != '1':
+            raise RuntimeError(
+                'Set D205_ALLOW_DESTRUCTIVE_TEST_DATABASE=1 for the disposable test database.')
+        return override
+    raise RuntimeError(f'Unsupported TEST_DATABASE_URL backend: {backend}')
+
 os.environ.update({
-    'DATABASE_URL': f'sqlite:///{DB_PATH}',
+    'DATABASE_URL': _database_url_for_tests(),
     'INSTANCE_DIR': INSTANCE_DIR,
     'UPLOAD_FOLDER': UPLOAD_DIR,
     'DISABLE_SCHEDULER': '1',

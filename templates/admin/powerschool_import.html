@@ -1,0 +1,318 @@
+{% extends 'admin/base.html' %}
+{% block title %}PowerSchool Import{% endblock %}
+
+{% block content %}
+<div class="max-w-[1500px] mx-auto space-y-5">
+  <div class="flex flex-wrap items-center justify-between gap-3">
+    <div>
+      <div class="flex items-center gap-2 text-sm text-slate-500 mb-1">
+        <a href="{{ url_for('notifications') }}" class="hover:text-blue-600">Notifications</a>
+        <i class="fas fa-chevron-right text-[9px]"></i><span>PowerSchool Import</span>
+      </div>
+      <h1 class="text-2xl font-bold text-slate-900">PowerSchool Import v1</h1>
+      <p class="text-sm text-slate-500 mt-1">Normalize, review, select, approve and roll back an annual roster batch.</p>
+    </div>
+    <a id="report-link" class="hidden items-center gap-2 px-3 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:border-emerald-400 hover:text-emerald-700">
+      <i class="fas fa-file-csv"></i>Download review report
+    </a>
+  </div>
+
+  <div id="notice" class="hidden rounded-xl border px-4 py-3 text-sm" role="status"></div>
+
+  <section class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
+    <div class="flex items-start justify-between gap-4 mb-5">
+      <div>
+        <h2 class="font-semibold text-slate-800">1. Upload the two saved exports</h2>
+        <p class="text-xs text-slate-500 mt-1">Files remain private, are normalized once, and are purged after apply or expiry.</p>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <a href="{{ url_for('static', filename='templates/powerschool-transportation-v1.csv') }}" download
+           class="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:text-blue-700">
+          <i class="fas fa-download mr-1"></i>Transportation template
+        </a>
+        <a href="{{ url_for('static', filename='templates/powerschool-contacts-v1.csv') }}" download
+           class="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:text-blue-700">
+          <i class="fas fa-download mr-1"></i>Contacts template
+        </a>
+      </div>
+    </div>
+    <form id="upload-form" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
+      <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+      <label class="block">
+        <span class="block text-xs font-semibold text-slate-600 mb-1.5">School year</span>
+        <input name="school_year" required pattern="20[0-9]{2}-[0-9]{2}" placeholder="2026-27"
+               class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none">
+      </label>
+      <label class="block">
+        <span class="block text-xs font-semibold text-slate-600 mb-1.5">Import policy</span>
+        <select name="snapshot_type" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white">
+          <option value="delta">Delta — never propose deactivation</option>
+          <option value="full_district">Complete district snapshot</option>
+        </select>
+      </label>
+      <label class="block">
+        <span class="block text-xs font-semibold text-slate-600 mb-1.5">Mapping profile</span>
+        <select name="mapping_profile_id" required class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white">
+          {% for profile in profiles %}<option value="{{ profile.id }}">{{ profile.name }} (v{{ profile.schema_version }})</option>{% endfor %}
+        </select>
+      </label>
+      <label class="block">
+        <span class="block text-xs font-semibold text-slate-600 mb-1.5">Transportation CSV</span>
+        <input name="transportation_file" type="file" accept=".csv,text/csv" required
+               class="w-full text-xs file:mr-2 file:px-3 file:py-2 file:border-0 file:rounded-lg file:bg-blue-50 file:text-blue-700">
+      </label>
+      <label class="block">
+        <span class="block text-xs font-semibold text-slate-600 mb-1.5">Contacts CSV</span>
+        <input name="contacts_file" type="file" accept=".csv,text/csv" required
+               class="w-full text-xs file:mr-2 file:px-3 file:py-2 file:border-0 file:rounded-lg file:bg-blue-50 file:text-blue-700">
+      </label>
+      <div class="md:col-span-2 xl:col-span-5 flex items-center justify-between gap-3 pt-1">
+        <p class="text-xs text-slate-400">Identity is based only on <code>student_number</code> and stable contact IDs.</p>
+        <button id="analyze-button" type="submit" class="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-sm font-semibold">
+          <i class="fas fa-magnifying-glass mr-1"></i>Analyze and normalize
+        </button>
+      </div>
+    </form>
+  </section>
+
+  <section id="review-section" class="hidden space-y-4">
+    <div id="summary-cards" class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3"></div>
+
+    <div class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+      <div class="p-4 border-b border-slate-100 space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 class="font-semibold text-slate-800">2. Review and select exact rows</h2>
+            <p class="text-xs text-slate-500 mt-1">Changing the selection creates a new plan hash before approval.</p>
+          </div>
+          <div class="flex gap-2">
+            <button id="save-selection" type="button" class="px-3 py-2 border border-blue-200 text-blue-700 rounded-xl text-sm font-medium hover:bg-blue-50">Save selection</button>
+            <button id="apply-plan" type="button" disabled class="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white rounded-xl text-sm font-semibold">Apply approved plan</button>
+            {% if can_rollback %}<button id="rollback-plan" type="button" class="hidden px-3 py-2 border border-amber-300 text-amber-700 rounded-xl text-sm font-medium hover:bg-amber-50">Rollback batch</button>{% endif %}
+          </div>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2">
+          <input id="filter-search" placeholder="Student number or group…" class="px-3 py-2 border border-slate-200 rounded-lg text-sm">
+          <select id="filter-status" class="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white"><option value="">All classifications</option></select>
+          <select id="filter-school" class="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white"><option value="">All schools</option></select>
+          <select id="filter-grade" class="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white"><option value="">All grades</option></select>
+          <select id="filter-group" class="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white"><option value="">All groups</option></select>
+          <select id="filter-problem" class="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white"><option value="">All change/error types</option></select>
+        </div>
+        <label id="deactivation-confirm-wrap" class="hidden items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800">
+          <input id="confirm-deactivations" type="checkbox" class="mt-0.5">
+          <span>I separately approve the selected deactivation candidates from this complete district snapshot. Absence alone never selects them.</span>
+        </label>
+      </div>
+      <div class="overflow-x-auto max-h-[620px]">
+        <table class="w-full text-sm">
+          <thead class="sticky top-0 bg-slate-50 border-b border-slate-200 text-xs uppercase text-slate-500">
+            <tr><th class="px-3 py-2 text-left">Use</th><th class="px-3 py-2 text-left">Class</th><th class="px-3 py-2 text-left">Student</th><th class="px-3 py-2 text-left">School / Grade</th><th class="px-3 py-2 text-left">Group</th><th class="px-3 py-2 text-left">Changes / Errors</th></tr>
+          </thead>
+          <tbody id="review-body" class="divide-y divide-slate-100"></tbody>
+        </table>
+      </div>
+      <div class="px-4 py-3 border-t border-slate-100 text-xs text-slate-500"><span id="visible-count">0</span> rows shown</div>
+    </div>
+  </section>
+
+  {% if recent_batches %}
+  <section class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
+    <h2 class="font-semibold text-slate-800 mb-3">Recent batches</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
+      {% for batch in recent_batches %}
+      <button type="button" class="recent-batch text-left border border-slate-200 hover:border-blue-300 rounded-xl p-3" data-batch-id="{{ batch.public_id }}">
+        <span class="block text-xs font-mono text-slate-500">{{ batch.public_id[:16] }}…</span>
+        <span class="block text-sm font-semibold text-slate-700 mt-1">{{ batch.school_year }} · {{ batch.status }}</span>
+        <span class="block text-xs text-slate-400 mt-1">{{ batch.total_rows }} review rows</span>
+      </button>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const csrf = {{ csrf_token() | tojson }};
+  const previewUrl = {{ url_for('powerschool_import_preview') | tojson }};
+  const batchBase = {{ url_for('powerschool_import_page') | tojson }} + '/batch/';
+  const canRollback = {{ 'true' if can_rollback else 'false' }};
+  let batch = null;
+  let selectionDirty = false;
+
+  const byId = id => document.getElementById(id);
+  const node = (tag, text, classes) => {
+    const item = document.createElement(tag);
+    if (text !== undefined && text !== null) item.textContent = String(text);
+    if (classes) item.className = classes;
+    return item;
+  };
+  const showNotice = (message, kind='info') => {
+    const box = byId('notice');
+    box.textContent = message;
+    box.className = 'rounded-xl border px-4 py-3 text-sm ' + ({
+      error:'bg-red-50 border-red-200 text-red-700',
+      success:'bg-emerald-50 border-emerald-200 text-emerald-700',
+      info:'bg-blue-50 border-blue-200 text-blue-700'
+    }[kind] || 'bg-slate-50 border-slate-200 text-slate-700');
+  };
+  const requestJson = async (url, options={}) => {
+    const response = await fetch(url, options);
+    const data = await response.json().catch(() => ({ok:false, message:'Invalid server response.'}));
+    if (!response.ok || !data.ok) throw new Error(data.message || `Request failed (${response.status}).`);
+    return data;
+  };
+
+  function renderSummary() {
+    const cards = [
+      ['Total', batch.total, 'text-slate-800'], ['Selected', batch.selected, 'text-emerald-600'],
+      ['Excluded', batch.excluded, 'text-slate-500'], ['Rejected', batch.rejected, 'text-red-600'],
+      ['New', batch.counts.new || 0, 'text-blue-600'], ['Updates', batch.counts.update || 0, 'text-indigo-600'],
+      ['Unchanged', batch.counts.unchanged || 0, 'text-slate-500'], ['Conflicts', batch.counts.conflict || 0, 'text-amber-600']
+    ];
+    byId('summary-cards').replaceChildren(...cards.map(([label,value,color]) => {
+      const card = node('div', null, 'bg-white border border-slate-200 rounded-xl p-3 text-center');
+      card.append(node('div', value, `text-xl font-bold ${color}`), node('div', label, 'text-[11px] text-slate-500 mt-1'));
+      return card;
+    }));
+  }
+
+  function fillFilter(id, values, label) {
+    const select = byId(id);
+    select.replaceChildren(node('option', label));
+    select.firstChild.value = '';
+    [...new Set(values.filter(Boolean))].sort().forEach(value => {
+      const option = node('option', value); option.value = value; select.append(option);
+    });
+  }
+
+  function rowAllowed(row) {
+    const data = row.data || {};
+    const search = byId('filter-search').value.trim().toLowerCase();
+    return (!search || `${row.external_key || ''} ${data.group_name || ''}`.toLowerCase().includes(search)) &&
+      (!byId('filter-status').value || row.classification === byId('filter-status').value) &&
+      (!byId('filter-school').value || data.school === byId('filter-school').value) &&
+      (!byId('filter-grade').value || data.grade === byId('filter-grade').value) &&
+      (!byId('filter-group').value || data.group_name === byId('filter-group').value) &&
+      (!byId('filter-problem').value || rowProblems(row).includes(byId('filter-problem').value));
+  }
+
+  function rowProblems(row) {
+    return [...(row.errors || []), ...((row.data && row.data.changes) || []).map(change => change.field)];
+  }
+
+  function renderRows() {
+    const body = byId('review-body');
+    const visible = batch.rows.filter(rowAllowed);
+    body.replaceChildren(...visible.map(row => {
+      const data = row.data || {};
+      const tr = node('tr', null, 'hover:bg-slate-50 align-top'); tr.dataset.rowId = row.id;
+      const use = node('td', null, 'px-3 py-3');
+      const check = document.createElement('input'); check.type = 'checkbox'; check.checked = row.selected;
+      check.dataset.importRow = row.id; check.dataset.classification = row.classification;
+      check.disabled = !['new','update','deactivate_candidate'].includes(row.classification) || ['applied','rolled_back'].includes(batch.status);
+      check.addEventListener('change', () => {
+        row.selected = check.checked;
+        selectionDirty = true;
+        byId('apply-plan').disabled = true;
+        showNotice('Selection changed. Save the selection before applying the plan.');
+      });
+      check.className = 'rounded border-slate-300'; use.append(check);
+      const status = node('td', null, 'px-3 py-3');
+      status.append(node('span', row.classification.replaceAll('_',' '), 'inline-flex px-2 py-1 rounded-full bg-slate-100 text-slate-700 text-xs font-medium'));
+      const student = node('td', null, 'px-3 py-3');
+      student.append(node('div', row.external_key || '—', 'font-mono text-xs text-slate-700'));
+      if (data.first_name || data.last_name) student.append(node('div', `${data.first_name || ''} ${data.last_name || ''}`.trim(), 'text-xs text-slate-500 mt-1'));
+      const school = node('td', null, 'px-3 py-3 text-xs text-slate-600'); school.append(node('div', data.school || '—'), node('div', data.grade || '', 'text-slate-400'));
+      const group = node('td', data.group_name || '—', 'px-3 py-3 text-xs text-slate-600');
+      const details = node('td', null, 'px-3 py-3 text-xs text-slate-600 max-w-md');
+      const messages = [...(row.errors || []), ...(data.changes || []).map(change => `${change.field}: ${change.current || '∅'} → ${change.proposed || '∅'}`)];
+      if (!messages.length) details.textContent = 'No data changes';
+      else messages.slice(0, 6).forEach(message => details.append(node('div', message, 'mb-1 break-words')));
+      tr.append(use, status, student, school, group, details); return tr;
+    }));
+    byId('visible-count').textContent = visible.length;
+  }
+
+  function presentBatch(data) {
+    batch = data;
+    selectionDirty = false;
+    byId('review-section').classList.remove('hidden');
+    byId('report-link').classList.remove('hidden'); byId('report-link').classList.add('inline-flex');
+    byId('report-link').href = `${batchBase}${encodeURIComponent(batch.batch_id)}/report.csv`;
+    fillFilter('filter-status', batch.rows.map(r => r.classification), 'All classifications');
+    fillFilter('filter-school', batch.rows.map(r => r.data && r.data.school), 'All schools');
+    fillFilter('filter-grade', batch.rows.map(r => r.data && r.data.grade), 'All grades');
+    fillFilter('filter-group', batch.rows.map(r => r.data && r.data.group_name), 'All groups');
+    fillFilter('filter-problem', batch.rows.flatMap(rowProblems), 'All change/error types');
+    const hasCandidates = batch.rows.some(r => r.classification === 'deactivate_candidate');
+    byId('deactivation-confirm-wrap').classList.toggle('hidden', !hasCandidates);
+    byId('deactivation-confirm-wrap').classList.toggle('flex', hasCandidates);
+    byId('save-selection').disabled = batch.status !== 'staged';
+    byId('apply-plan').disabled = batch.status !== 'staged' || batch.selected < 1;
+    const rollback = byId('rollback-plan'); if (rollback) rollback.classList.toggle('hidden', batch.status !== 'applied');
+    renderSummary(); renderRows();
+    byId('review-section').scrollIntoView({behavior:'smooth', block:'start'});
+  }
+
+  byId('upload-form').addEventListener('submit', async event => {
+    event.preventDefault(); const button = byId('analyze-button'); button.disabled = true;
+    showNotice('Uploading, validating and creating an immutable normalized stage…');
+    try { presentBatch(await requestJson(previewUrl, {method:'POST', body:new FormData(event.currentTarget)})); showNotice('Analysis complete. Review every classification before approval.', 'success'); }
+    catch (error) { showNotice(error.message, 'error'); }
+    finally { button.disabled = false; }
+  });
+
+  ['filter-search','filter-status','filter-school','filter-grade','filter-group','filter-problem'].forEach(id => byId(id).addEventListener('input', renderRows));
+
+  byId('save-selection').addEventListener('click', async () => {
+    const regular = [], deactivations = [];
+    batch.rows.filter(row => row.selected).forEach(row => {
+      (row.classification === 'deactivate_candidate' ? deactivations : regular).push(row.id);
+    });
+    try {
+      const summary = await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}/selection`, {
+        method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},
+        body:JSON.stringify({plan_hash:batch.plan_hash, selected_row_ids:regular, deactivation_row_ids:deactivations, confirm_deactivations:byId('confirm-deactivations').checked})
+      });
+      const refreshed = await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}`);
+      presentBatch(refreshed);
+      showNotice(`Selection saved and plan hash regenerated (${summary.plan_hash.slice(0, 12)}…).`, 'success');
+    } catch (error) { showNotice(error.message, 'error'); }
+  });
+
+  byId('apply-plan').addEventListener('click', async () => {
+    if (selectionDirty) {
+      showNotice('Save the changed selection before applying the plan.', 'error');
+      return;
+    }
+    if (!window.confirm(`Apply exactly ${batch.selected} selected change(s)? This operation is atomic and audited.`)) return;
+    byId('apply-plan').disabled = true;
+    try {
+      const result = await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}/apply`, {
+        method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':csrf}, body:JSON.stringify({plan_hash:batch.plan_hash})
+      });
+      const refreshed = await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}`); presentBatch(refreshed);
+      showNotice(result.already_applied ? 'This batch was already applied; no duplicates were created.' : 'Batch applied successfully. Download the final report and verify counts.', 'success');
+    } catch (error) { showNotice(error.message, 'error'); byId('apply-plan').disabled = false; }
+  });
+
+  const rollback = byId('rollback-plan');
+  if (rollback) rollback.addEventListener('click', async () => {
+    if (!window.confirm('Reverse this batch? Rollback will stop if any imported record was edited later.')) return;
+    try {
+      await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}/rollback`, {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':csrf}, body:'{}'});
+      presentBatch(await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}`)); showNotice('Batch rolled back successfully.', 'success');
+    } catch (error) { showNotice(error.message, 'error'); }
+  });
+
+  document.querySelectorAll('.recent-batch').forEach(button => button.addEventListener('click', async () => {
+    try { presentBatch(await requestJson(`${batchBase}${encodeURIComponent(button.dataset.batchId)}`)); showNotice('Stored batch loaded.'); }
+    catch (error) { showNotice(error.message, 'error'); }
+  }));
+})();
+</script>
+{% endblock %}

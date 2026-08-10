@@ -257,11 +257,17 @@ Operational exports are redacted and never include passwords, hashes, notificati
 contacts, users, or audit data. Store the encryption key outside the repository and
 back it up independently; losing it makes encrypted backups unrecoverable.
 
-Legacy subscriber CSV imports are now analyzed into a private immutable stage under
-the instance directory. Confirmation is bound to the staged rows and SHA-256-derived
-plan hash, so the browser cannot substitute a different file after preview. A batch
-can be applied only once. The additive PowerSchool staging schema is installed but
-remains unavailable while `POWERSCHOOL_IMPORT_ENABLED=0`; Phase 3 owns activation.
+Legacy subscriber CSV imports are analyzed into a private immutable stage under the
+instance directory. Confirmation is bound to the staged rows and SHA-256-derived plan
+hash, so the browser cannot substitute a different file after preview. A batch can be
+applied only once.
+
+PowerSchool Import v1 accepts separate Transportation and Contacts CSV exports through
+versioned name-based mappings. It normalizes into private staging, classifies and filters
+each review row, binds inclusion/exclusion to `plan_hash`, applies atomically, records
+before/after changes and supports fail-closed compensating rollback. It remains unavailable
+unless `POWERSCHOOL_IMPORT_ENABLED=1`. See
+[`docs/powerschool-import-runbook.md`](docs/powerschool-import-runbook.md).
 
 ---
 
@@ -282,6 +288,11 @@ remains unavailable while `POWERSCHOOL_IMPORT_ENABLED=0`; Phase 3 owns activatio
 | `LOGIN_RATE_LIMIT_LOCK_SECONDS` | Login lock duration | `300` |
 | `RESTORE_JOB_TTL_SECONDS` | Validity of staged restore jobs | `1800` |
 | `RESTORE_SNAPSHOT_RETENTION_DAYS` | Encrypted pre-restore snapshot retention | `30` |
+| `IMPORT_MAX_ROWS` | Maximum rows accepted per staged CSV | `25000` |
+| `IMPORT_MAX_COLUMNS` | Maximum columns accepted per staged CSV | `64` |
+| `IMPORT_STAGE_TTL_HOURS` | Unapplied private staging lifetime | `24` |
+| `POWERSCHOOL_IMPORT_ENABLED` | Expose the capability-protected PowerSchool workflow | `0` |
+| `POWERSCHOOL_ROLLBACK_RETENTION_DAYS` | PII/compensating rollback retention window | `30` |
 | `FLASK_ENV` | Set to `production` to enable secure cookies | `development` |
 | `PORT` | Port to expose (Docker only) | `5000` |
 | `DB_NAME` | PostgreSQL database name (Docker only) | `bustrack` |

@@ -101,6 +101,12 @@
         <i class="fas fa-file-csv text-xs"></i>Export CSV
       </a>{% endif %}
       {% if can_write %}
+      {% if powerschool_enabled and can_powerschool_import %}
+      <a href="{{ url_for('powerschool_import_page') }}"
+         class="inline-flex items-center gap-1.5 px-3 py-2 border border-indigo-200 bg-indigo-50 hover:border-indigo-400 text-indigo-700 rounded-xl text-sm font-medium transition-colors">
+        <i class="fas fa-school text-xs"></i>PowerSchool
+      </a>
+      {% endif %}
       <button onclick="document.getElementById('modal-import').classList.remove('hidden')"
               class="inline-flex items-center gap-1.5 px-3 py-2 border border-slate-200 hover:border-blue-400 text-slate-600 hover:text-blue-700 rounded-xl text-sm font-medium transition-colors">
         <i class="fas fa-file-import text-xs"></i>Import CSV

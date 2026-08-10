@@ -237,6 +237,8 @@ def test_all_templates_compile():
 def test_docker_image_packages_shared_safe_output_module():
     dockerfile = (Path(__file__).resolve().parents[1] / 'Dockerfile').read_text()
     assert 'COPY --chown=1000:1000 static/js ./static/js' in dockerfile
+    assert 'COPY --chown=1000:1000 powerschool_import.py ./powerschool_import.py' in dockerfile
+    assert 'COPY --chown=1000:1000 static/templates ./static/templates' in dockerfile
 
 
 def test_dependency_versions_are_pinned():
