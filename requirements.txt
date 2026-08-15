@@ -11,6 +11,6 @@ psycopg2-binary==2.9.12
 python-dotenv==1.2.2
 gunicorn==26.0.0
 psutil==7.2.2
-twilio==9.10.9
+twilio==9.11.0
 cryptography==50.0.0
 Pillow==12.3.0
