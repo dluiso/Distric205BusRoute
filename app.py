@@ -14,7 +14,8 @@ from datetime import datetime, date, timedelta, timezone
 from contextlib import contextmanager
 from functools import wraps
 from types import SimpleNamespace
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
+from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import IntegrityError
 from urllib.parse import urlsplit
 import click
@@ -1229,6 +1230,76 @@ def _database_init_lock():
         except ImportError:
             pass
         os.close(lock_fd)
+
+
+@contextmanager
+def _roster_import_lock():
+    """Try to serialize roster-changing imports across every web worker."""
+    db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+    if db_url.startswith('postgresql'):
+        from sqlalchemy import text
+        database_name = db.engine.url.database or 'default'
+        lock_material = f'{database_name}:bustrack-roster-import:v1'.encode(
+            'utf-8')
+        lock_key = int.from_bytes(
+            hashlib.sha256(lock_material).digest()[:8], 'big', signed=True)
+        lock_connection = db.engine.connect()
+        acquired = False
+        try:
+            acquired = bool(lock_connection.execute(
+                text('SELECT pg_try_advisory_lock(:lock_key)'),
+                {'lock_key': lock_key}).scalar())
+            yield acquired
+        finally:
+            try:
+                if acquired:
+                    lock_connection.execute(
+                        text('SELECT pg_advisory_unlock(:lock_key)'),
+                        {'lock_key': lock_key})
+            finally:
+                lock_connection.close()
+        return
+
+    lock_path = os.path.join(INSTANCE_DIR, '.roster-import.lock')
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        try:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            acquired = False
+        except ImportError:
+            acquired = True  # Single-process development fallback.
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except ImportError:
+            pass
+        os.close(lock_fd)
+
+
+def _serialized_roster_mutation(response_kind='json'):
+    """Fail fast when another import or rollback owns the roster mutex."""
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            with _roster_import_lock() as acquired:
+                if acquired:
+                    return view(*args, **kwargs)
+                message = (
+                    'Another roster import or rollback is in progress. '
+                    'Wait for it to finish and try again.')
+                if response_kind == 'html':
+                    flash(message, 'warning')
+                    return redirect(url_for('notifications'))
+                return jsonify({'ok': False, 'message': message}), 409
+        return wrapped
+    return decorator
 
 
 def _initialize_database_unlocked():
@@ -2820,6 +2891,7 @@ def buses():
 @app.route('/admin/buses/add', methods=['POST'])
 @login_required
 @require_module('buses', 'full')
+@_serialized_roster_mutation('html')
 def add_bus():
     identifier = request.form.get('identifier', '').strip().upper()
     name       = request.form.get('name', '').strip()
@@ -2847,6 +2919,7 @@ def add_bus():
 @app.route('/admin/buses/<int:bus_id>/edit', methods=['POST'])
 @login_required
 @require_module('buses', 'full')
+@_serialized_roster_mutation('html')
 def edit_bus(bus_id):
     bus = Bus.query.get_or_404(bus_id)
     new_identifier = request.form.get('identifier', bus.identifier).strip().upper()
@@ -2877,6 +2950,7 @@ def edit_bus(bus_id):
 @app.route('/admin/buses/<int:bus_id>/delete', methods=['POST'])
 @login_required
 @require_module('buses', 'full')
+@_serialized_roster_mutation('html')
 def delete_bus(bus_id):
     bus = Bus.query.get_or_404(bus_id)
     bus.active = False
@@ -3963,6 +4037,7 @@ def _save_contacts(subscriber_id, form):
 @app.route('/admin/notifications/add', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
+@_serialized_roster_mutation('html')
 def add_subscriber():
     s = NotificationSubscriber(
         notes=request.form.get('notes', '').strip() or None,
@@ -3979,6 +4054,7 @@ def add_subscriber():
 @app.route('/admin/notifications/<int:sid>/edit', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
+@_serialized_roster_mutation('html')
 def edit_subscriber(sid):
     s = NotificationSubscriber.query.get_or_404(sid)
     s.notes    = request.form.get('notes', '').strip() or None
@@ -3994,6 +4070,7 @@ def edit_subscriber(sid):
 @app.route('/admin/notifications/<int:sid>/delete', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
+@_serialized_roster_mutation('html')
 def delete_subscriber(sid):
     s = NotificationSubscriber.query.get_or_404(sid)
     name = s.full_name
@@ -4007,6 +4084,7 @@ def delete_subscriber(sid):
 @app.route('/admin/notifications/bulk-delete', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
+@_serialized_roster_mutation('html')
 def bulk_delete_subscribers():
     ids = request.form.getlist('subscriber_ids')
     count = 0
@@ -4211,15 +4289,56 @@ def _purge_import_raw_files(batch):
     return failures
 
 
+def _expire_powerschool_stage(batch):
+    """Expire one owned PowerSchool stage before it can mutate the roster."""
+    if (batch.source_type != 'powerschool'
+            or batch.status not in {'staged', 'selecting', 'applying'}
+            or batch.expires_at > _utcnow()):
+        return False
+    cleanup_failures = _purge_import_raw_files(batch)
+    ImportRow.query.filter_by(batch_id=batch.id).delete(
+        synchronize_session=False)
+    batch.status = 'expired'
+    db.session.commit()
+    _audit(
+        'powerschool_import_expired', 'notifications', batch.public_id,
+        f'Staged plan expired before mutation; cleanup_warnings='
+        f'{len(cleanup_failures)}')
+    return True
+
+
+def _active_powerschool_roster_exists():
+    """Return whether PowerSchool identities own any active subscriber."""
+    return db.session.query(ExternalIdentity.id).join(
+        NotificationSubscriber,
+        NotificationSubscriber.id == ExternalIdentity.local_id,
+    ).filter(
+        ExternalIdentity.source_type == 'powerschool',
+        ExternalIdentity.entity_type == 'student',
+        ExternalIdentity.local_table == 'notification_subscriber',
+        NotificationSubscriber.active.is_(True),
+    ).first() is not None
+
+
 def _cleanup_import_stages():
     now = _utcnow()
+    processing_grace = now - timedelta(minutes=15)
     expired = ImportBatch.query.filter(
-        ImportBatch.expires_at <= now,
-        ImportBatch.status.in_([
-            'staged', 'selecting', 'blocked', 'applying', 'applied', 'failed', 'expired',
-            'rolling_back', 'rollback_failed', 'rolled_back',
-            'retention_closed',
-        ]),
+        or_(
+            and_(
+                ImportBatch.expires_at <= now,
+                ImportBatch.status.in_([
+                    'staged', 'blocked', 'applied', 'failed', 'expired',
+                    'rollback_failed', 'rolled_back', 'retention_closed',
+                ]),
+            ),
+            and_(
+                ImportBatch.expires_at <= processing_grace,
+                ImportBatch.status.in_([
+                    'selecting', 'applying', 'rolling_back',
+                ]),
+            ),
+        ),
     ).all()
     for batch in expired:
         failures = _purge_import_raw_files(batch)
@@ -4257,12 +4376,15 @@ def _cleanup_import_stages():
                 ip_address='background'))
             continue
         for row in ImportRow.query.filter_by(batch_id=batch.id).all():
+            external_key_sha256 = (
+                hashlib.sha256(row.external_key.encode()).hexdigest()
+                if row.external_key else None
+            )
             minimal = {
                 'retained': True, 'classification': row.classification,
-                'external_key_sha256': hashlib.sha256(
-                    (row.external_key or '').encode()).hexdigest()
-                    if row.external_key else None,
+                'external_key_sha256': external_key_sha256,
             }
+            row.external_key = None
             row.normalized_json = json.dumps(minimal, sort_keys=True)
             row.errors_json = '[]'
         for change in ImportChange.query.filter_by(batch_id=batch.id).all():
@@ -4292,6 +4414,14 @@ def preview_import_csv():
     from collections import OrderedDict
 
     _cleanup_import_stages()
+    if _active_powerschool_roster_exists():
+        return jsonify({
+            'ok': False,
+            'message': (
+                'Legacy CSV import is disabled because an active PowerSchool '
+                'roster is authoritative. Use PowerSchool Import for roster '
+                'updates.'),
+        }), 409
     file = request.files.get('csv_file')
     if not _valid_csv_upload(file):
         return jsonify({'ok': False, 'message':
@@ -4462,6 +4592,7 @@ def preview_import_csv():
 @app.route('/admin/notifications/import-csv', methods=['POST'])
 @login_required
 @require_capability('import.legacy')
+@_serialized_roster_mutation('html')
 def import_subscribers_csv():
     batch_id = (request.form.get('batch_id') or '').strip()
     plan_hash = (request.form.get('plan_hash') or '').strip()
@@ -4486,6 +4617,12 @@ def import_subscribers_csv():
         return redirect(url_for('notifications'))
     if batch.status != 'staged':
         flash('This import batch is not eligible to be applied.', 'error')
+        return redirect(url_for('notifications'))
+    if _active_powerschool_roster_exists():
+        flash(
+            'Legacy CSV import is disabled because an active PowerSchool '
+            'roster is authoritative. Use PowerSchool Import for roster updates.',
+            'error')
         return redirect(url_for('notifications'))
 
     # A conditional UPDATE is atomic on both SQLite and PostgreSQL. It closes
@@ -4648,7 +4785,18 @@ def _powerschool_preflight_failure(parsed, snapshot_type='delta'):
         }
     if (snapshot_type == 'full_district'
             and preflight.get('transportation_contract')
-            == TRANSPORTATION_V2_CONTRACT):
+            != TRANSPORTATION_V2_CONTRACT):
+        return {
+            'code': 'powerschool_full_snapshot_requires_transportation_v2',
+            'message': (
+                'Full Snapshot requires the approved Transportation v2 '
+                'dual-route export. Use Delta for legacy/v1 files or '
+                're-export template 941; no batch was created.'),
+            'errors': [
+                'Transportation v1 cannot prove district-wide AM/PM coverage.'
+            ],
+        }
+    if snapshot_type == 'full_district':
         transport = (parsed.get('metrics') or {}).get('transportation') or {}
         missing_periods = [
             period for period, key in (
@@ -4682,13 +4830,56 @@ def _powerschool_preflight_failure(parsed, snapshot_type='delta'):
     return None
 
 
-def _subscriber_snapshot(subscriber):
+def _powerschool_apply_contract_error(batch):
+    """Reject staged Full Snapshot plans that predate the v2-only gate."""
+    if batch.snapshot_type != 'full_district':
+        return None
+    preflight = (_import_metadata(batch).get('preflight') or {})
+    if preflight.get('transportation_contract') == TRANSPORTATION_V2_CONTRACT:
+        return None
+    return (
+        'This Full Snapshot was not analyzed from the approved '
+        'Transportation v2 dual-route export. Analyze the three files again; '
+        'the stored plan cannot be applied.')
+
+
+def _snapshot_datetime(value):
+    """Serialize an audit timestamp consistently across supported databases."""
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.isoformat(timespec='microseconds')
+
+
+def _row_incarnation_matches(created_at, expected, change_created_at):
+    """Bind an audit target to the row incarnation that produced the change.
+
+    New snapshots carry the exact creation timestamp. Older snapshots did
+    not, so their safe compatibility boundary is that the target row must have
+    existed no later than the immutable ImportChange record. Missing
+    timestamps cannot prove identity and therefore fail closed.
+    """
+    if (created_at is None or change_created_at is None
+            or created_at > change_created_at):
+        return False
+    if 'created_at' not in expected:
+        return True
+    expected_created_at = expected.get('created_at')
+    return (expected_created_at is not None
+            and _snapshot_datetime(created_at) == expected_created_at)
+
+
+def _subscriber_snapshot(subscriber, contact_identities=None):
     contacts = []
     for contact in sorted(subscriber.contacts, key=lambda item: item.id):
-        identities = ExternalIdentity.query.filter_by(
-            source_type='powerschool', local_table='subscriber_contact',
-            local_id=contact.id).order_by(ExternalIdentity.entity_type,
-                                          ExternalIdentity.external_key).all()
+        if contact_identities is None:
+            identities = ExternalIdentity.query.filter_by(
+                source_type='powerschool', local_table='subscriber_contact',
+                local_id=contact.id).order_by(ExternalIdentity.entity_type,
+                                              ExternalIdentity.external_key).all()
+        else:
+            identities = contact_identities.get(contact.id, [])
         contacts.append({
             'id': contact.id, 'first_name': contact.first_name,
             'last_name': contact.last_name, 'email': contact.email,
@@ -4700,8 +4891,50 @@ def _subscriber_snapshot(subscriber):
     return {
         'id': subscriber.id, 'notes': subscriber.notes,
         'active': bool(subscriber.active), 'group_id': subscriber.group_id,
+        'created_at': _snapshot_datetime(subscriber.created_at),
         'contacts': contacts,
     }
+
+
+def _subscriber_matches_snapshot(subscriber, expected,
+                                 contact_identities=None,
+                                 change_created_at=None):
+    """Compare a subscriber while accepting pre-incarnation snapshots."""
+    if not subscriber or not isinstance(expected, dict):
+        return False
+    if not _row_incarnation_matches(
+            subscriber.created_at, expected, change_created_at):
+        return False
+    current = _subscriber_snapshot(subscriber, contact_identities)
+    if 'created_at' not in expected:
+        current.pop('created_at', None)
+    return _snapshot_hash(current) == _snapshot_hash(expected)
+
+
+def _contact_identity_map(subscribers, for_update=False):
+    contact_ids = {
+        contact.id
+        for subscriber in subscribers
+        for contact in subscriber.contacts
+    }
+    if not contact_ids:
+        return {}
+    query = ExternalIdentity.query.filter(
+        ExternalIdentity.source_type == 'powerschool',
+        ExternalIdentity.local_table == 'subscriber_contact',
+        ExternalIdentity.local_id.in_(contact_ids),
+    ).order_by(
+        ExternalIdentity.local_id,
+        ExternalIdentity.entity_type,
+        ExternalIdentity.external_key,
+    )
+    if for_update:
+        query = query.with_for_update()
+    identities = query.all()
+    result = {}
+    for identity in identities:
+        result.setdefault(identity.local_id, []).append(identity)
+    return result
 
 
 def _snapshot_hash(snapshot):
@@ -4710,6 +4943,42 @@ def _snapshot_hash(snapshot):
     payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True,
                          separators=(',', ':'))
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _subscriber_group_snapshot(group):
+    if group is None:
+        return None
+    return {
+        'id': group.id,
+        'name': group.name,
+        'description': group.description or '',
+        'color': group.color or '',
+        'created_at': _snapshot_datetime(group.created_at),
+        'assignments': sorted([
+            [item.bus_id, item.schedule_type_id]
+            for item in group.bus_assignments
+        ], key=lambda item: (item[0], item[1] or 0)),
+    }
+
+
+def _subscriber_group_matches_snapshot(group, expected,
+                                       change_created_at=None):
+    """Compare a group while accepting older snapshots with fewer fields."""
+    if not group or not isinstance(expected, dict):
+        return False
+    expected = dict(expected)
+    if not _row_incarnation_matches(
+            group.created_at, expected, change_created_at):
+        return False
+    # PowerSchool-created groups have always used these fixed values.  Filling
+    # them for older audit snapshots avoids ignoring later edits merely because
+    # those two fields were not serialized by the original recorder.
+    expected.setdefault('description', 'Created by PowerSchool Import v1')
+    expected.setdefault('color', 'blue')
+    current = _subscriber_group_snapshot(group)
+    if 'created_at' not in expected:
+        current.pop('created_at', None)
+    return all(current.get(key) == value for key, value in expected.items())
 
 
 def _powerschool_identity(entity_type, external_key):
@@ -4971,6 +5240,192 @@ def _powerschool_compare_proposal(proposal):
     return ('update', True, []) if changes else ('unchanged', False, [])
 
 
+def _legacy_cutover_inventory():
+    """Return provenance-bound legacy candidates and reincarnation exclusions.
+
+    ImportChange is the authoritative provenance boundary.  Names, emails,
+    phones and household labels are deliberately not used to infer identity,
+    and manually-created subscribers are therefore never swept into a
+    PowerSchool cutover.  The creation timestamps also bind the audit target
+    to the same row incarnation because SQLite may reuse a deleted integer PK.
+    """
+    provenance = {
+        target_id: created_at
+        for target_id, created_at in db.session.query(
+            ImportChange.target_id,
+            func.max(ImportChange.created_at),
+        ).join(
+            ImportBatch, ImportBatch.id == ImportChange.batch_id
+        ).filter(
+            ImportBatch.source_type == 'legacy_csv',
+            ImportBatch.status == 'applied',
+            ImportChange.operation == 'create',
+            ImportChange.target_table == 'notification_subscriber',
+            ImportChange.target_id.isnot(None),
+        ).group_by(ImportChange.target_id).all()
+    }
+    imported_ids = set(provenance)
+    if not imported_ids:
+        return [], 0
+    powerschool_ids = {
+        local_id for (local_id,) in db.session.query(
+            ExternalIdentity.local_id
+        ).filter(
+            ExternalIdentity.source_type == 'powerschool',
+            ExternalIdentity.entity_type == 'student',
+            ExternalIdentity.local_table == 'notification_subscriber',
+            ExternalIdentity.local_id.in_(imported_ids),
+        ).distinct().all()
+    }
+    candidates = imported_ids - powerschool_ids
+    if not candidates:
+        return [], 0
+    loaded = NotificationSubscriber.query.options(
+        selectinload(NotificationSubscriber.contacts),
+        selectinload(NotificationSubscriber.group),
+    ).filter(
+        NotificationSubscriber.id.in_(candidates),
+        NotificationSubscriber.active.is_(True),
+    ).order_by(NotificationSubscriber.id).all()
+    verified = []
+    incarnation_excluded = 0
+    for subscriber in loaded:
+        imported_at = provenance.get(subscriber.id)
+        if (not subscriber.created_at or not imported_at
+                or subscriber.created_at > imported_at):
+            incarnation_excluded += 1
+            continue
+        verified.append(subscriber)
+    return verified, incarnation_excluded
+
+
+def _active_legacy_cutover_subscribers():
+    subscribers, _ = _legacy_cutover_inventory()
+    return subscribers
+
+
+def _legacy_cutover_rows(batch):
+    result = []
+    for row in ImportRow.query.filter_by(
+            batch_id=batch.id, classification='deactivate_candidate').all():
+        try:
+            data = json.loads(row.normalized_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if data.get('cutover_source') == 'legacy_csv':
+            result.append((row, data))
+    return result
+
+
+def _legacy_cutover_payload(batch, metadata):
+    stored = dict(metadata.get('legacy_cutover') or {})
+    defaults = {
+        'required': False,
+        'candidate_count': 0,
+        'incarnation_excluded_count': 0,
+        'approved': False,
+        'blocked': False,
+        'requires_reanalysis': False,
+        'message': '',
+    }
+    result = {**defaults, **stored}
+    if batch.status != 'staged':
+        return result
+
+    live_ids = {
+        subscriber.id for subscriber in _active_legacy_cutover_subscribers()
+    }
+    counts = metadata.get('counts') or {}
+    has_replacement_roster = any(
+        int(counts.get(classification) or 0) > 0
+        for classification in ('new', 'update', 'unchanged', 'conflict')
+    )
+    if not result['required'] and live_ids and has_replacement_roster:
+        return {
+            **defaults,
+            'required': True,
+            'candidate_count': len(live_ids),
+            'blocked': True,
+            'requires_reanalysis': True,
+            'message': (
+                'This staged batch predates the Legacy CSV cutover guard. '
+                'Analyze the three files again before approval.'),
+        }
+
+    if result['required'] and not result['blocked']:
+        staged_ids = {
+            int(data.get('target_subscriber_id'))
+            for _, data in _legacy_cutover_rows(batch)
+            if data.get('target_subscriber_id') is not None
+        }
+        if staged_ids != live_ids:
+            result.update({
+                'approved': False,
+                'blocked': True,
+                'requires_reanalysis': True,
+                'candidate_count': len(live_ids),
+                'message': (
+                    'The active Legacy CSV roster changed after analysis. '
+                    'Analyze the three files again.'),
+            })
+    return result
+
+
+def _legacy_cutover_apply_error(batch):
+    regular_rows = ImportRow.query.filter(
+        ImportRow.batch_id == batch.id,
+        ImportRow.classification.in_(['new', 'update']),
+    ).all()
+    regular_ids = {row.id for row in regular_rows}
+    selected_regular_ids = {row.id for row in regular_rows if row.selected}
+    live_ids = {
+        subscriber.id for subscriber in _active_legacy_cutover_subscribers()
+    }
+    metadata = _import_metadata(batch)
+    cutover = _legacy_cutover_payload(batch, metadata)
+    selected_legacy_ids = {
+        int(data['target_subscriber_id'])
+        for row, data in _legacy_cutover_rows(batch)
+        if row.selected and data.get('target_subscriber_id') is not None
+    }
+    if not cutover.get('required') and not selected_legacy_ids:
+        return None
+    if (not cutover.get('required') or not cutover.get('approved')
+            or cutover.get('blocked') or cutover.get('requires_reanalysis')):
+        return (cutover.get('message') or
+                'Approve the complete Legacy CSV cutover before applying this batch.')
+    if not hmac.compare_digest(
+            str(cutover.get('approved_plan_hash') or ''),
+            str(batch.plan_hash or '')):
+        return ('The Legacy CSV cutover approval is not bound to the current '
+                'plan. Save the complete selection and approve it again.')
+    preflight = metadata.get('preflight') or {}
+    if (batch.snapshot_type != 'full_district'
+            or preflight.get('transportation_contract')
+            != TRANSPORTATION_V2_CONTRACT):
+        return ('Legacy CSV cutover requires a current Transportation v2 '
+                'district-wide Full Snapshot. Analyze the three files again.')
+    counts = metadata.get('counts') or {}
+    replacement_count = sum(
+        int(counts.get(classification) or 0)
+        for classification in ('new', 'update', 'unchanged')
+    )
+    if replacement_count < 1 or selected_regular_ids != regular_ids:
+        return ('Legacy CSV cutover requires every importable New and Update '
+                'row to remain selected. Restore the complete selection and '
+                'save it before applying.')
+    staged_legacy_ids = {
+        int(data['target_subscriber_id'])
+        for _, data in _legacy_cutover_rows(batch)
+        if data.get('target_subscriber_id') is not None
+    }
+    if (selected_legacy_ids != staged_legacy_ids
+            or staged_legacy_ids != live_ids):
+        return ('The active Legacy CSV roster no longer matches the approved '
+                'cutover. Analyze the three files again.')
+    return None
+
+
 def _powerschool_row_records(batch):
     return [{
         'id': row.id, 'row_hash': row.row_hash,
@@ -5016,6 +5471,7 @@ def _powerschool_batch_payload(batch, include_rows=True):
         'created_at': batch.created_at.isoformat() + 'Z',
         'applied_at': batch.applied_at.isoformat() + 'Z' if batch.applied_at else None,
         'rolled_back_at': metadata.get('rolled_back_at'),
+        'legacy_cutover': _legacy_cutover_payload(batch, metadata),
     }
     if include_rows:
         rows = ImportRow.query.filter_by(batch_id=batch.id).order_by(
@@ -5275,6 +5731,46 @@ def powerschool_import_preview():
                 row_hash=hashlib.sha256(normalized_json.encode()).hexdigest()))
             row_number += 1
 
+        legacy_subscribers, legacy_incarnation_excluded = (
+            _legacy_cutover_inventory())
+        legacy_contact_identities = _contact_identity_map(legacy_subscribers)
+        legacy_cutover_required = bool(
+            legacy_subscribers and parsed['students'])
+        legacy_cutover_contract_blocked = bool(
+            legacy_cutover_required
+            and (parsed.get('preflight') or {}).get(
+                'transportation_contract') != TRANSPORTATION_V2_CONTRACT)
+        legacy_cutover_scope_blocked = bool(
+            legacy_cutover_required
+            and (snapshot_type != 'full_district'
+                 or legacy_cutover_contract_blocked))
+        legacy_cutover_blocked = bool(
+            legacy_cutover_required
+            and (legacy_cutover_scope_blocked
+                 or counts['conflict'] or counts['rejected']))
+        if legacy_cutover_required and not legacy_cutover_blocked:
+            for subscriber in legacy_subscribers:
+                candidate = {
+                    'target_subscriber_id': subscriber.id,
+                    'cutover_source': 'legacy_csv',
+                    'group_name': subscriber.group.name if subscriber.group else '',
+                    'expected_state_hash': _snapshot_hash(
+                        _subscriber_snapshot(
+                            subscriber, legacy_contact_identities)),
+                    'changes': [{'field': 'active', 'current': 'yes',
+                                 'proposed': 'no'}],
+                }
+                normalized_json = json.dumps(candidate, sort_keys=True)
+                db.session.add(ImportRow(
+                    batch_id=batch.id, row_number=row_number,
+                    external_key=None,
+                    classification='deactivate_candidate', selected=False,
+                    normalized_json=normalized_json, errors_json='[]',
+                    row_hash=hashlib.sha256(
+                        normalized_json.encode()).hexdigest()))
+                counts['deactivate_candidate'] += 1
+                row_number += 1
+
         transportation_rejections = any(
             issue.get('file') == 'transportation'
             and issue.get('classification') in {'rejected', 'conflict'}
@@ -5324,6 +5820,27 @@ def powerschool_import_preview():
             'analysis_context_sha256': analysis_context_sha256,
             'deactivation_policy': 'separate_explicit_approval',
             'snapshot_complete_for_deactivation': snapshot_complete_for_deactivation,
+            'legacy_cutover': {
+                'required': legacy_cutover_required,
+                'candidate_count': len(legacy_subscribers),
+                'incarnation_excluded_count': legacy_incarnation_excluded,
+                'approved': False,
+                'blocked': legacy_cutover_blocked,
+                'requires_reanalysis': legacy_cutover_blocked,
+                'message': (
+                    'Legacy CSV cutover requires the approved Transportation '
+                    'v2 export and a district-wide Full Snapshot. Select Full '
+                    'Snapshot and analyze the three files again before '
+                    'replacing the active legacy roster.'
+                    if legacy_cutover_scope_blocked else
+                    'Resolve every conflict and rejected row, then analyze '
+                    'again before replacing the active Legacy CSV roster.'
+                    if legacy_cutover_blocked else
+                    'Approve the atomic Legacy CSV to PowerSchool roster '
+                    'cutover before applying this first PowerSchool batch.'
+                    if legacy_cutover_required else ''
+                ),
+            },
         }
         if duplicate and force_reanalyze:
             metadata['reanalyzed_from'] = duplicate.public_id
@@ -5338,7 +5855,8 @@ def powerschool_import_preview():
         raise
     _audit('powerschool_import_staged', 'notifications', batch.public_id,
            f'PowerSchool v{batch.schema_version}; {batch.total_rows} review rows; '
-           f'sha256={batch.file_sha256[:12]}')
+           f'sha256={batch.file_sha256[:12]}; legacy_reincarnation_excluded='
+           f'{legacy_incarnation_excluded}')
     if duplicate and force_reanalyze:
         _audit('powerschool_import_reanalyzed', 'notifications', batch.public_id,
                f'New immutable analysis from {duplicate.public_id[:12]}; '
@@ -5362,6 +5880,10 @@ def _owned_powerschool_batch(public_id, statuses=None):
 def powerschool_import_batch(public_id):
     _powerschool_enabled()
     batch = _owned_powerschool_batch(public_id)
+    if batch.status == 'expired' or _expire_powerschool_stage(batch):
+        return jsonify({'ok': False, 'status': 'expired', 'message':
+                        'This staged analysis expired. Analyze the three '
+                        'files again.'}), 410
     return jsonify(_powerschool_batch_payload(batch))
 
 
@@ -5372,6 +5894,10 @@ def powerschool_import_batch(public_id):
 def powerschool_import_selection(public_id):
     _powerschool_enabled()
     batch = _owned_powerschool_batch(public_id)
+    if batch.status == 'expired' or _expire_powerschool_stage(batch):
+        return jsonify({'ok': False, 'status': 'expired', 'message':
+                        'This staged analysis expired. Analyze the three '
+                        'files again.'}), 410
     if batch.status != 'staged':
         return jsonify({'ok': False, 'message':
                         'The batch is not available for selection changes.'}), 409
@@ -5389,9 +5915,9 @@ def powerschool_import_selection(public_id):
         deactivation_ids = {int(value) for value in deactivation_ids}
     except (TypeError, ValueError):
         return jsonify({'ok': False, 'message': 'Selection contains an invalid row.'}), 400
-    if deactivation_ids and not payload.get('confirm_deactivations'):
-        return jsonify({'ok': False, 'message':
-                        'Deactivations require separate explicit approval.'}), 409
+    metadata = _import_metadata(batch)
+    cutover = _legacy_cutover_payload(batch, metadata)
+    legacy_cutover_approved = payload.get('legacy_cutover_approved') is True
     claimed = ImportBatch.query.filter_by(
         id=batch.id, status='staged', plan_hash=expected_plan_hash).update(
             {'status': 'selecting'}, synchronize_session=False)
@@ -5400,24 +5926,99 @@ def powerschool_import_selection(public_id):
         return jsonify({'ok': False, 'message':
                         'The batch is being changed by another request.'}), 409
     batch = db.session.get(ImportBatch, batch.id)
+    if _expire_powerschool_stage(batch):
+        return jsonify({'ok': False, 'status': 'expired', 'message':
+                        'This staged analysis expired during selection. '
+                        'Analyze the three files again.'}), 410
     rows = ImportRow.query.filter_by(batch_id=batch.id).all()
+    legacy_rows = _legacy_cutover_rows(batch)
+    legacy_ids = {row.id for row, _ in legacy_rows}
+    requested_legacy_ids = deactivation_ids & legacy_ids
+    deactivation_ids -= legacy_ids
+    if requested_legacy_ids and not legacy_cutover_approved:
+        batch.status = 'staged'
+        db.session.commit()
+        return jsonify({'ok': False, 'message':
+                        'Legacy CSV cutover rows require the separate cutover approval.'}), 409
+    if deactivation_ids and not payload.get('confirm_deactivations'):
+        batch.status = 'staged'
+        db.session.commit()
+        return jsonify({'ok': False, 'message':
+                        'Deactivations require separate explicit approval.'}), 409
     valid_regular = {row.id for row in rows
                      if row.classification in {'new', 'update'}}
-    valid_deactivation = {row.id for row in rows
-                          if row.classification == 'deactivate_candidate'}
+    valid_deactivation = {
+        row.id for row in rows
+        if row.classification == 'deactivate_candidate'
+        and row.id not in legacy_ids
+    }
     if not selected_ids <= valid_regular or not deactivation_ids <= valid_deactivation:
         batch.status = 'staged'
         db.session.commit()
         return jsonify({'ok': False, 'message':
                         'Selection contains a non-importable row.'}), 409
+    if legacy_cutover_approved:
+        if not cutover.get('required'):
+            batch.status = 'staged'
+            db.session.commit()
+            return jsonify({'ok': False, 'message':
+                            'This batch does not require a Legacy CSV cutover.'}), 409
+        if cutover.get('blocked') or cutover.get('requires_reanalysis'):
+            batch.status = 'staged'
+            db.session.commit()
+            return jsonify({'ok': False, 'message':
+                            cutover.get('message') or
+                            'Analyze the files again before approving the cutover.'}), 409
+        if len(legacy_ids) != int(cutover.get('candidate_count') or 0):
+            batch.status = 'staged'
+            db.session.commit()
+            return jsonify({'ok': False, 'message':
+                            'The staged Legacy CSV cutover is incomplete; analyze again.'}), 409
+        replacement_count = sum(
+            int((metadata.get('counts') or {}).get(classification) or 0)
+            for classification in ('new', 'update', 'unchanged')
+        )
+        if replacement_count < 1 or selected_ids != valid_regular:
+            batch.status = 'staged'
+            db.session.commit()
+            return jsonify({'ok': False, 'message':
+                            'Legacy CSV cutover requires every importable New '
+                            'and Update row to remain selected.'}), 409
+    selected_legacy_ids = legacy_ids if legacy_cutover_approved else set()
     for row in rows:
-        row.selected = row.id in selected_ids or row.id in deactivation_ids
+        row.selected = (
+            row.id in selected_ids
+            or row.id in deactivation_ids
+            or row.id in selected_legacy_ids
+        )
+    stored_cutover = dict(metadata.get('legacy_cutover') or {})
+    if stored_cutover:
+        stored_cutover['approved'] = bool(legacy_cutover_approved)
+        if legacy_cutover_approved:
+            stored_cutover['approved_by_id'] = current_user.id
+            stored_cutover['approved_at'] = _utcnow().isoformat() + 'Z'
+        else:
+            for field in ('approved_by_id', 'approved_at',
+                          'approved_plan_hash'):
+                stored_cutover.pop(field, None)
+        metadata['legacy_cutover'] = stored_cutover
     _refresh_import_counts_and_hash(batch)
+    if stored_cutover and legacy_cutover_approved:
+        stored_cutover['approved_plan_hash'] = batch.plan_hash
+        metadata['legacy_cutover'] = stored_cutover
+    batch.metadata_json = json.dumps(metadata, sort_keys=True)
     batch.status = 'staged'
     db.session.commit()
+    cutover_audit = (
+        f'; legacy_cutover=approved; candidates='
+        f'{int(stored_cutover.get("candidate_count") or 0)}; '
+        f'approver_id={current_user.id}; plan_hash={batch.plan_hash}'
+        if stored_cutover and legacy_cutover_approved else
+        '; legacy_cutover=not_approved'
+        if stored_cutover.get('required') else '')
     _audit('powerschool_import_selection', 'notifications', batch.public_id,
            f'{batch.selected_rows} selected; {batch.excluded_rows} excluded; '
-           f'{batch.rejected_rows} rejected')
+           f'{batch.rejected_rows} rejected{cutover_audit}')
     return jsonify(_powerschool_batch_payload(batch, include_rows=False))
 
 
@@ -5453,15 +6054,11 @@ def _apply_powerschool_proposal(batch, row, proposal, created_groups):
         raise ValueError(group_error)
     if created and group.id not in created_groups:
         created_groups.add(group.id)
-        group_snapshot = {
-            'id': group.id, 'name': group.name,
-            'assignments': sorted([[item.bus_id, item.schedule_type_id]
-                                   for item in group.bus_assignments]),
-        }
         db.session.add(ImportChange(
             batch_id=batch.id, row_id=row.id, operation='create',
             target_table='subscriber_group', target_id=group.id,
-            after_json=json.dumps(group_snapshot, sort_keys=True)))
+            after_json=json.dumps(
+                _subscriber_group_snapshot(group), sort_keys=True)))
     operation = 'update' if subscriber else 'create'
     if not subscriber:
         subscriber = NotificationSubscriber(active=True)
@@ -5515,6 +6112,7 @@ def _apply_powerschool_proposal(batch, row, proposal, created_groups):
            methods=['POST'])
 @login_required
 @require_capability('import.powerschool')
+@_serialized_roster_mutation('json')
 def powerschool_import_apply(public_id):
     _powerschool_enabled()
     payload = request.get_json(silent=True) or request.form
@@ -5524,6 +6122,10 @@ def powerschool_import_apply(public_id):
         return jsonify({'ok': True, 'already_applied': True,
                         'batch': _powerschool_batch_payload(
                             batch, include_rows=False)})
+    if batch.status == 'expired' or _expire_powerschool_stage(batch):
+        return jsonify({'ok': False, 'status': 'expired', 'message':
+                        'This staged analysis expired. Analyze the three '
+                        'files again.'}), 410
     if batch.status != 'staged':
         return jsonify({'ok': False, 'message':
                         'The batch is not available to apply.'}), 409
@@ -5532,6 +6134,12 @@ def powerschool_import_apply(public_id):
                         'The approved plan no longer matches the staged selection.'}), 409
     if batch.selected_rows < 1:
         return jsonify({'ok': False, 'message': 'Select at least one change.'}), 409
+    contract_error = _powerschool_apply_contract_error(batch)
+    if contract_error:
+        return jsonify({'ok': False, 'message': contract_error}), 409
+    cutover_error = _legacy_cutover_apply_error(batch)
+    if cutover_error:
+        return jsonify({'ok': False, 'message': cutover_error}), 409
     claimed = ImportBatch.query.filter_by(
         id=batch.id, status='staged', plan_hash=plan_hash).update(
             {'status': 'applying'}, synchronize_session=False)
@@ -5540,19 +6148,60 @@ def powerschool_import_apply(public_id):
         return jsonify({'ok': False, 'message':
                         'The batch is already being processed.'}), 409
     batch = db.session.get(ImportBatch, batch.id)
+    if _expire_powerschool_stage(batch):
+        return jsonify({'ok': False, 'status': 'expired', 'message':
+                        'This staged analysis expired before Apply could '
+                        'mutate the roster. Analyze the three files again.'}), 410
+    contract_error = _powerschool_apply_contract_error(batch)
+    if contract_error:
+        batch.status = 'staged'
+        db.session.commit()
+        return jsonify({'ok': False, 'message': contract_error}), 409
     selected = ImportRow.query.filter_by(
         batch_id=batch.id, selected=True).order_by(ImportRow.row_number).all()
+    cutover_error = _legacy_cutover_apply_error(batch)
+    if cutover_error:
+        batch.status = 'staged'
+        db.session.commit()
+        return jsonify({'ok': False, 'message': cutover_error}), 409
     created_groups = set()
     try:
-        for row in selected:
-            proposal = json.loads(row.normalized_json)
+        selected_items = [
+            (row, json.loads(row.normalized_json)) for row in selected
+        ]
+        target_ids = {
+            int(proposal['target_subscriber_id'])
+            for _, proposal in selected_items
+            if proposal.get('target_subscriber_id') is not None
+        }
+        locked_subscribers = (
+            NotificationSubscriber.query.options(
+                selectinload(NotificationSubscriber.contacts),
+            ).filter(
+                NotificationSubscriber.id.in_(target_ids),
+            ).with_for_update().all()
+            if target_ids else []
+        )
+        if target_ids:
+            SubscriberContact.query.filter(
+                SubscriberContact.subscriber_id.in_(target_ids),
+            ).with_for_update().all()
+        locked_by_id = {
+            subscriber.id: subscriber for subscriber in locked_subscribers
+        }
+        locked_contact_identities = _contact_identity_map(
+            locked_subscribers, for_update=True)
+
+        for row, proposal in selected_items:
             if row.classification in {'new', 'update'}:
                 _apply_powerschool_proposal(
                     batch, row, proposal, created_groups)
             elif row.classification == 'deactivate_candidate':
-                subscriber = db.session.get(
-                    NotificationSubscriber, proposal['target_subscriber_id'])
-                current = _subscriber_snapshot(subscriber) if subscriber else None
+                subscriber = locked_by_id.get(
+                    int(proposal['target_subscriber_id']))
+                current = (_subscriber_snapshot(
+                    subscriber, locked_contact_identities)
+                    if subscriber else None)
                 if not subscriber or _snapshot_hash(current) != proposal.get(
                         'expected_state_hash'):
                     raise ValueError('A deactivation candidate changed after preview.')
@@ -5562,8 +6211,8 @@ def powerschool_import_apply(public_id):
                     batch_id=batch.id, row_id=row.id, operation='deactivate',
                     target_table='notification_subscriber', target_id=subscriber.id,
                     before_json=json.dumps(current, sort_keys=True),
-                    after_json=json.dumps(_subscriber_snapshot(subscriber),
-                                          sort_keys=True)))
+                    after_json=json.dumps(_subscriber_snapshot(
+                        subscriber, locked_contact_identities), sort_keys=True)))
             else:
                 raise ValueError('The staged selection contains a non-importable row.')
         batch.status = 'applied'
@@ -5649,6 +6298,7 @@ def _detach_notification_history(*, subscriber_id=None, group_id=None):
            methods=['POST'])
 @login_required
 @require_capability('import.rollback')
+@_serialized_roster_mutation('json')
 def powerschool_import_rollback(public_id):
     _powerschool_enabled()
     batch = _owned_powerschool_batch(public_id)
@@ -5659,19 +6309,7 @@ def powerschool_import_rollback(public_id):
     if batch.status not in {'applied', 'rollback_failed'}:
         return jsonify({'ok': False, 'message':
                         'The batch is not available to roll back.'}), 409
-    changes = ImportChange.query.filter_by(batch_id=batch.id).order_by(
-        ImportChange.id.desc()).all()
-    # Preflight every mutable target before changing any row.  Later manual edits
-    # cause a fail-closed rollback instead of being silently overwritten.
-    for change in changes:
-        if change.target_table != 'notification_subscriber':
-            continue
-        subscriber = db.session.get(NotificationSubscriber, change.target_id)
-        current = _subscriber_snapshot(subscriber) if subscriber else None
-        expected = json.loads(change.after_json) if change.after_json else None
-        if _snapshot_hash(current) != _snapshot_hash(expected):
-            return jsonify({'ok': False, 'message':
-                            'Rollback blocked because imported data was edited later.'}), 409
+    rollback_from_status = batch.status
     claimed = ImportBatch.query.filter(
         ImportBatch.id == batch.id,
         ImportBatch.status.in_(['applied', 'rollback_failed'])).update(
@@ -5680,6 +6318,80 @@ def powerschool_import_rollback(public_id):
     if claimed != 1:
         return jsonify({'ok': False, 'message': 'Rollback is already running.'}), 409
     try:
+        batch = db.session.get(ImportBatch, batch.id)
+        changes = ImportChange.query.filter_by(batch_id=batch.id).order_by(
+            ImportChange.id.desc()).all()
+        subscriber_ids = {
+            change.target_id for change in changes
+            if change.target_table == 'notification_subscriber'
+            and change.target_id is not None
+        }
+        group_ids = {
+            change.target_id for change in changes
+            if change.target_table == 'subscriber_group'
+            and change.operation == 'create'
+            and change.target_id is not None
+        }
+        locked_subscribers = (
+            NotificationSubscriber.query.options(
+                selectinload(NotificationSubscriber.contacts),
+            ).filter(
+                NotificationSubscriber.id.in_(subscriber_ids),
+            ).with_for_update().all()
+            if subscriber_ids else []
+        )
+        if subscriber_ids:
+            SubscriberContact.query.filter(
+                SubscriberContact.subscriber_id.in_(subscriber_ids),
+            ).with_for_update().all()
+        subscribers_by_id = {
+            subscriber.id: subscriber for subscriber in locked_subscribers
+        }
+        locked_contact_identities = _contact_identity_map(
+            locked_subscribers, for_update=True)
+        locked_groups = (
+            SubscriberGroup.query.options(
+                selectinload(SubscriberGroup.bus_assignments),
+            ).filter(
+                SubscriberGroup.id.in_(group_ids),
+            ).with_for_update().all()
+            if group_ids else []
+        )
+        if group_ids:
+            GroupBusAssignment.query.filter(
+                GroupBusAssignment.group_id.in_(group_ids),
+            ).with_for_update().all()
+        groups_by_id = {group.id: group for group in locked_groups}
+
+        # Validate after the batch claim and while PostgreSQL row locks are
+        # held, so a later manual edit cannot slip between preflight and restore.
+        for change in changes:
+            if change.target_table != 'notification_subscriber':
+                continue
+            subscriber = subscribers_by_id.get(change.target_id)
+            expected = json.loads(change.after_json) if change.after_json else None
+            if not _subscriber_matches_snapshot(
+                    subscriber, expected, locked_contact_identities,
+                    change.created_at):
+                batch.status = rollback_from_status
+                db.session.commit()
+                return jsonify({'ok': False, 'message':
+                                'Rollback blocked because imported data was '
+                                'edited later.'}), 409
+        for change in changes:
+            if (change.target_table != 'subscriber_group'
+                    or change.operation != 'create'):
+                continue
+            group = groups_by_id.get(change.target_id)
+            expected = json.loads(change.after_json) if change.after_json else None
+            if not _subscriber_group_matches_snapshot(
+                    group, expected, change.created_at):
+                batch.status = rollback_from_status
+                db.session.commit()
+                return jsonify({'ok': False, 'message':
+                                'Rollback blocked because an imported group '
+                                'was edited later.'}), 409
+
         detached_history = {'notification_log': 0, 'email_outbox': 0}
         for change in changes:
             if change.target_table == 'external_identity':
@@ -5687,7 +6399,7 @@ def powerschool_import_rollback(public_id):
                 if identity:
                     db.session.delete(identity)
             elif change.target_table == 'notification_subscriber':
-                subscriber = db.session.get(NotificationSubscriber, change.target_id)
+                subscriber = subscribers_by_id.get(change.target_id)
                 if change.operation == 'create':
                     if subscriber:
                         detached = _detach_notification_history(
@@ -5699,7 +6411,7 @@ def powerschool_import_rollback(public_id):
                     _restore_subscriber_snapshot(
                         subscriber, json.loads(change.before_json))
             elif change.target_table == 'subscriber_group' and change.operation == 'create':
-                group = db.session.get(SubscriberGroup, change.target_id)
+                group = groups_by_id.get(change.target_id)
                 if group:
                     db.session.flush()
                     if NotificationSubscriber.query.filter_by(
@@ -5738,11 +6450,21 @@ def powerschool_import_rollback(public_id):
 def powerschool_import_report(public_id):
     _powerschool_enabled()
     batch = _owned_powerschool_batch(public_id)
+    if batch.status == 'expired' or _expire_powerschool_stage(batch):
+        return jsonify({'ok': False, 'status': 'expired', 'message':
+                        'This staged analysis expired. Analyze the three '
+                        'files again before downloading a report.'}), 410
+    cutover = _legacy_cutover_payload(batch, _import_metadata(batch))
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(['schema_version', 'batch_id', 'school_year', 'row_number',
                      'external_key', 'classification', 'selected', 'status',
-                     'school', 'grade', 'group', 'errors'])
+                     'school', 'grade', 'group', 'errors',
+                     'legacy_cutover_approved',
+                     'legacy_cutover_candidate_count',
+                     'legacy_cutover_approved_by_id',
+                     'legacy_cutover_approved_at',
+                     'legacy_cutover_approved_plan_hash'])
     can_view_pii = current_user.has_capability('notifications.pii')
     for row in ImportRow.query.filter_by(batch_id=batch.id).order_by(
             ImportRow.row_number).all():
@@ -5758,6 +6480,11 @@ def powerschool_import_report(public_id):
             data.get('school', ''), data.get('grade', ''),
             data.get('group_name', ''),
             '; '.join(json.loads(row.errors_json or '[]')),
+            'yes' if cutover.get('approved') else 'no',
+            int(cutover.get('candidate_count') or 0),
+            cutover.get('approved_by_id', ''),
+            cutover.get('approved_at', ''),
+            cutover.get('approved_plan_hash', ''),
         )])
     response = make_response('\ufeff' + output.getvalue())
     response.headers['Content-Type'] = 'text/csv; charset=utf-8'
@@ -5770,6 +6497,7 @@ def powerschool_import_report(public_id):
 @app.route('/admin/notifications/groups/add', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
+@_serialized_roster_mutation('html')
 def add_subscriber_group():
     name  = request.form.get('name', '').strip()
     color = request.form.get('color', 'blue').strip()
@@ -5799,6 +6527,7 @@ def add_subscriber_group():
 @app.route('/admin/notifications/groups/<int:gid>/delete', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
+@_serialized_roster_mutation('html')
 def delete_subscriber_group(gid):
     g = SubscriberGroup.query.get_or_404(gid)
     # Unassign subscribers from this group before deleting
@@ -5812,6 +6541,7 @@ def delete_subscriber_group(gid):
 @app.route('/admin/notifications/groups/bulk-delete', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
+@_serialized_roster_mutation('html')
 def bulk_delete_groups():
     ids = request.form.getlist('group_ids')
     count = 0
@@ -5834,6 +6564,7 @@ def bulk_delete_groups():
 @app.route('/admin/notifications/groups/<int:gid>/edit', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
+@_serialized_roster_mutation('html')
 def edit_subscriber_group(gid):
     g = SubscriberGroup.query.get_or_404(gid)
     name = request.form.get('name', '').strip()

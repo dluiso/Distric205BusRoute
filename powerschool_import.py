@@ -18,7 +18,7 @@ from collections import defaultdict
 
 EMAIL_RE = re.compile(r"^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
-NORMALIZER_REVISION = "2026-08-27.4"
+NORMALIZER_REVISION = "2026-08-27.6"
 STUDENT_SELF_CONTACT_ID = "student-self"
 TRANSPORTATION_V2_CONTRACT = "students_combined_dual_route"
 ROUTE_RE = re.compile(
@@ -343,6 +343,12 @@ def _ignored_transport_route_reason(value):
             r"DOOR\s*[- ]*\s*TO\s*[- ]*\s*DOOR(?:\b.*)?", normalized):
         return "known_non_bus"
     if re.fullmatch(r"NTW(?:\s*-\s*.*)?", normalized):
+        return "known_non_bus"
+    if re.fullmatch(r"0", normalized):
+        return "known_non_bus"
+    if re.fullmatch(r"WALKER\s*WALKER", normalized):
+        return "known_non_bus"
+    if re.fullmatch(r"DOOR\s*-\s*T0\s*-\s*DOOR", normalized):
         return "known_non_bus"
     return None
 

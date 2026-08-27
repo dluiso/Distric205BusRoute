@@ -98,6 +98,34 @@ def test_import_ui_exposes_duplicate_recovery_and_preflight_without_unsafe_dom()
     assert "eval(" not in source
 
 
+def test_import_ui_requires_explicit_legacy_cutover_approval_and_labels_new_rows():
+    source = (ROOT / "templates" / "admin" / "powerschool_import.html").read_text(
+        encoding="utf-8")
+
+    assert 'id="legacy-cutover-banner"' in source
+    assert 'id="approve-legacy-cutover"' in source
+    assert "batch.legacy_cutover" in source
+    assert "cutover.required === true" in source
+    assert "cutover.approved !== true" in source
+    assert "cutover.blocked === true" in source
+    assert "cutover.requires_reanalysis === true" in source
+    assert "legacyCutoverBlocksApply()" in source
+    assert "legacy_cutover_approved:byId('approve-legacy-cutover').checked" in source
+    assert "Apply is blocked" in source
+    assert "atomically deactivate ALL subscribers created by applied Legacy CSV batches" in source
+    assert "Manual subscribers will be preserved" in source
+    assert "rollback remains available for this batch" in source
+    assert "ALL importable new/update rows" in source
+    assert "an empty or partial selection is blocked" in source.lower()
+    assert "Legacy CSV cutover is prohibited in Delta" in source
+    assert "approved Transportation v2 dual-route export" in source
+    assert "Transportation v1 remains blocked even when marked Full" in source
+    assert "Complete district snapshot" in source
+    assert "zero conflicts and zero rejected rows" in source
+    assert "row.classification === 'new'" in source
+    assert "Creates a new PowerSchool subscriber" in source
+
+
 def test_operator_guidance_covers_source_sentinels_and_safe_delta_policy():
     guide = (ROOT / "templates" / "admin" / "powerschool_guide.html").read_text(
         encoding="utf-8")
@@ -145,3 +173,29 @@ def test_transportation_v2_guidance_models_dual_routes_and_gates_full_snapshot()
         assert "Delta" in source
         assert "anomal" in source.lower()
         assert "AM fallback" not in source
+
+
+def test_operator_guidance_documents_provenance_bound_legacy_cutover():
+    guide = (ROOT / "templates" / "admin" / "powerschool_guide.html").read_text(
+        encoding="utf-8")
+    runbook = (ROOT / "docs" / "powerschool-import-runbook.md").read_text(
+        encoding="utf-8")
+
+    for source in (guide, runbook):
+        assert "applied Legacy CSV batches" in source
+        assert "provenance" in source
+        assert "ExternalIdentity" in source
+        assert "database is empty" in source
+        assert "zero" in source and "conflict" in source and "rejected" in source
+        assert "Re-analyze against current state" in source
+        assert "atomically" in source
+        assert "manual subscribers" in source.lower()
+        assert "rollbackable" in source
+        assert "all importable" in source.lower()
+        assert "empty or partial" in source.lower()
+        assert "cutover is prohibited in" in source.lower()
+        assert "complete district snapshot" in source.lower()
+        assert "transportation v2" in source.lower() and "dual-route export" in source.lower()
+        assert "transportation v1" in source.lower() and "marked full" in source.lower()
+        assert "legacy csv" in source.lower() and "disabled as a roster source" in source.lower()
+        assert "powerschool import" in source.lower()

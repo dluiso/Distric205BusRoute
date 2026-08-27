@@ -1,3 +1,5 @@
+import csv
+import hashlib
 import io
 import json
 from datetime import timedelta
@@ -18,6 +20,10 @@ from test_phase1_security import add_group, add_user
 TRANSPORT_HEADER = (
     'student_number,student_id,household_id,first_name,last_name,school,grade,'
     'route,stop,period,transport_status,school_year,source_id\n'
+)
+TRANSPORT_V2_HEADER = (
+    'student_number,first_name,last_name,grade,transport_status,route_am,'
+    'route_pm,school,student_id\n'
 )
 CONTACT_HEADER = (
     'student_number,contact_id,first_name,last_name,relationship,email,phone,'
@@ -68,6 +74,12 @@ def transport_row(student='0001', first='Ada', last='Lovelace', period='AM',
     return f'{student},SID-{student},HH-{student},{first},{last},{school},5,TEST1,10,{period},active,2026-27,T-{student}-{period}\n'
 
 
+def transport_v2_row(student='0001', first='Ada', last='Lovelace',
+                     route_am='TEST1 AM', route_pm='TEST1 PM', school='205'):
+    return (f'{student},{first},{last},5,active,{route_am},{route_pm},'
+            f'{school},SID-{student}\n')
+
+
 def contact_row(student='0001', contact='C-1', first='Grace', last='Hopper',
                 relationship='guardian', email='GRACE@EXAMPLE.TEST',
                 phone='708-555-0101'):
@@ -80,6 +92,39 @@ def profile_id():
             source_type='powerschool', schema_version='1').one().id
 
 
+def seed_applied_legacy_subscriber(notes='Legacy roster subscriber'):
+    with application.app.app_context():
+        owner = application.User.query.filter_by(username='admin').one()
+        subscriber = application.NotificationSubscriber(
+            notes=notes, active=True)
+        application.db.session.add(subscriber)
+        application.db.session.flush()
+        now = application._utcnow()
+        batch = application.ImportBatch(
+            public_id=application.secrets.token_urlsafe(24),
+            source_type='legacy_csv', schema_version='1', status='applied',
+            snapshot_type='delta', school_year='2026-27',
+            uploaded_by_id=owner.id, file_sha256='a' * 64,
+            plan_hash='b' * 64, total_rows=1, selected_rows=1,
+            rejected_rows=0, excluded_rows=0, metadata_json='{}',
+            created_at=now, applied_at=now,
+            expires_at=now + timedelta(days=1))
+        application.db.session.add(batch)
+        application.db.session.flush()
+        row = application.ImportRow(
+            batch_id=batch.id, row_number=1, external_key=None,
+            classification='new', selected=True, normalized_json='{}',
+            errors_json='[]', row_hash='c' * 64)
+        application.db.session.add(row)
+        application.db.session.flush()
+        application.db.session.add(application.ImportChange(
+            batch_id=batch.id, row_id=row.id, operation='create',
+            target_table='notification_subscriber', target_id=subscriber.id,
+            after_json=json.dumps({'subscriber_id': subscriber.id})))
+        application.db.session.commit()
+        return subscriber.id
+
+
 def preview(client, transportation, contacts, snapshot='delta'):
     return client.post('/admin/notifications/powerschool/preview', data={
         '_csrf': csrf_token(client), 'school_year': '2026-27',
@@ -87,6 +132,19 @@ def preview(client, transportation, contacts, snapshot='delta'):
         'transportation_file': (
             io.BytesIO((TRANSPORT_HEADER + transportation).encode()),
             'transportation.csv', 'text/csv'),
+        'contacts_file': (
+            io.BytesIO((CONTACT_HEADER + contacts).encode()),
+            'contacts.csv', 'text/csv'),
+    }, content_type='multipart/form-data')
+
+
+def preview_v2(client, transportation, contacts, snapshot='delta'):
+    return client.post('/admin/notifications/powerschool/preview', data={
+        '_csrf': csrf_token(client), 'school_year': '2026-27',
+        'snapshot_type': snapshot, 'mapping_profile_id': str(profile_id()),
+        'transportation_file': (
+            io.BytesIO((TRANSPORT_V2_HEADER + transportation).encode()),
+            'transportation-v2.csv', 'text/csv'),
         'contacts_file': (
             io.BytesIO((CONTACT_HEADER + contacts).encode()),
             'contacts.csv', 'text/csv'),
@@ -268,6 +326,712 @@ def test_powerschool_new_apply_is_idempotent_reported_and_rollbackable(logged_in
             public_id=report['batch_id']).one().status == 'rolled_back'
 
 
+def test_first_powerschool_batch_requires_atomic_legacy_cutover(logged_in_client):
+    setup_route()
+    legacy_id = seed_applied_legacy_subscriber()
+    with application.app.app_context():
+        manual = application.NotificationSubscriber(
+            notes='Manual subscriber', active=True)
+        application.db.session.add(manual)
+        application.db.session.commit()
+        manual_id = manual.id
+
+    report = preview_v2(
+        logged_in_client, transport_v2_row(), contact_row(),
+        snapshot='full_district').get_json()
+    cutover = report['legacy_cutover']
+    assert cutover == {
+        'required': True,
+        'candidate_count': 1,
+        'incarnation_excluded_count': 0,
+        'approved': False,
+        'blocked': False,
+        'requires_reanalysis': False,
+        'message': (
+            'Approve the atomic Legacy CSV to PowerSchool roster cutover '
+            'before applying this first PowerSchool batch.'),
+    }
+    legacy_row = next(
+        row for row in report['rows']
+        if row['data'].get('cutover_source') == 'legacy_csv')
+    new_row = next(
+        row for row in report['rows'] if row['classification'] == 'new')
+    assert legacy_row['classification'] == 'deactivate_candidate'
+    assert legacy_row['selected'] is False
+    assert apply_batch(logged_in_client, report).status_code == 409
+
+    approved = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/selection",
+        json={
+            'plan_hash': report['plan_hash'],
+            'selected_row_ids': [new_row['id']],
+            'deactivation_row_ids': [],
+            'confirm_deactivations': False,
+            'legacy_cutover_approved': True,
+        },
+        headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert approved.status_code == 200, approved.get_data(as_text=True)
+    summary = approved.get_json()
+    assert summary['selected'] == 2
+    assert summary['legacy_cutover']['approved'] is True
+    assert summary['legacy_cutover']['approved_by_id']
+    assert summary['legacy_cutover']['approved_at'].endswith('Z')
+    assert summary['legacy_cutover']['approved_plan_hash'] == summary['plan_hash']
+    report['plan_hash'] = summary['plan_hash']
+    committed = apply_batch(logged_in_client, report)
+    assert committed.status_code == 200, committed.get_data(as_text=True)
+    with application.app.app_context():
+        assert application.db.session.get(
+            application.NotificationSubscriber, legacy_id).active is False
+        assert application.db.session.get(
+            application.NotificationSubscriber, manual_id).active is True
+        imported = application.ExternalIdentity.query.filter_by(
+            source_type='powerschool', entity_type='student',
+            external_key='0001').one()
+        assert application.db.session.get(
+            application.NotificationSubscriber, imported.local_id).active is True
+        approval_audit = application.AuditLog.query.filter_by(
+            action='powerschool_import_selection').order_by(
+                application.AuditLog.id.desc()).first()
+        assert 'legacy_cutover=approved' in approval_audit.details
+        assert f'plan_hash={summary["plan_hash"]}' in approval_audit.details
+
+    csv_report = logged_in_client.get(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/report.csv")
+    assert csv_report.status_code == 200
+    csv_text = csv_report.get_data(as_text=True)
+    assert 'legacy_cutover_approved_plan_hash' in csv_text.splitlines()[0]
+    assert summary['plan_hash'] in csv_text
+
+    rolled_back = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/rollback",
+        json={}, headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert rolled_back.status_code == 200, rolled_back.get_data(as_text=True)
+    with application.app.app_context():
+        assert application.db.session.get(
+            application.NotificationSubscriber, legacy_id).active is True
+        assert application.db.session.get(
+            application.NotificationSubscriber, manual_id).active is True
+        assert application.ExternalIdentity.query.filter_by(
+            source_type='powerschool', entity_type='student',
+            external_key='0001').count() == 0
+
+
+@pytest.mark.parametrize('selected_count', [0, 1])
+def test_legacy_cutover_rejects_empty_or_partial_new_roster_selection(
+        logged_in_client, selected_count):
+    setup_route()
+    legacy_id = seed_applied_legacy_subscriber()
+    report = preview_v2(
+        logged_in_client,
+        transport_v2_row('0001')
+        + transport_v2_row('0002', 'Alan', 'Turing'),
+        contact_row('0001', 'C-1') + contact_row('0002', 'C-2'),
+        snapshot='full_district',
+    ).get_json()
+    new_rows = [
+        row for row in report['rows'] if row['classification'] == 'new'
+    ]
+    assert len(new_rows) == 2
+
+    denied = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/selection",
+        json={
+            'plan_hash': report['plan_hash'],
+            'selected_row_ids': [
+                row['id'] for row in new_rows[:selected_count]
+            ],
+            'deactivation_row_ids': [],
+            'confirm_deactivations': False,
+            'legacy_cutover_approved': True,
+        },
+        headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert denied.status_code == 409
+    assert 'every importable New and Update row' in denied.get_json()['message']
+
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        assert batch.status == 'staged'
+        assert application.db.session.get(
+            application.NotificationSubscriber, legacy_id).active is True
+
+
+def test_legacy_cutover_preserves_manual_subscriber_that_reuses_deleted_id(
+        logged_in_client):
+    setup_route()
+    genuine_legacy_id = seed_applied_legacy_subscriber('Genuine legacy')
+    deleted_legacy_id = seed_applied_legacy_subscriber('Deleted legacy')
+    with application.app.app_context():
+        deleted = application.db.session.get(
+            application.NotificationSubscriber, deleted_legacy_id)
+        application.db.session.delete(deleted)
+        application.db.session.commit()
+        manual = application.NotificationSubscriber(
+            notes='Manual reused ID', active=True,
+            created_at=application._utcnow() + timedelta(seconds=1))
+        application.db.session.add(manual)
+        application.db.session.commit()
+        assert manual.id == deleted_legacy_id
+        manual_id = manual.id
+
+    report = preview_v2(
+        logged_in_client, transport_v2_row(), contact_row(),
+        snapshot='full_district').get_json()
+    cutover = report['legacy_cutover']
+    assert cutover['required'] is True
+    assert cutover['candidate_count'] == 1
+    assert cutover['incarnation_excluded_count'] == 1
+    new_row = next(
+        row for row in report['rows'] if row['classification'] == 'new')
+    approved = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/selection",
+        json={
+            'plan_hash': report['plan_hash'],
+            'selected_row_ids': [new_row['id']],
+            'deactivation_row_ids': [],
+            'confirm_deactivations': False,
+            'legacy_cutover_approved': True,
+        },
+        headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert approved.status_code == 200, approved.get_data(as_text=True)
+    report['plan_hash'] = approved.get_json()['plan_hash']
+    assert apply_batch(logged_in_client, report).status_code == 200
+
+    with application.app.app_context():
+        assert application.db.session.get(
+            application.NotificationSubscriber,
+            genuine_legacy_id).active is False
+        manual = application.db.session.get(
+            application.NotificationSubscriber, manual_id)
+        assert manual.active is True
+        assert manual.notes == 'Manual reused ID'
+
+
+def test_staged_batch_before_cutover_guard_must_be_reanalyzed(logged_in_client):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    assert report['legacy_cutover']['required'] is False
+    seed_applied_legacy_subscriber()
+
+    refreshed = logged_in_client.get(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}")
+    assert refreshed.status_code == 200
+    cutover = refreshed.get_json()['legacy_cutover']
+    assert cutover['required'] is True
+    assert cutover['blocked'] is True
+    assert cutover['requires_reanalysis'] is True
+    denied = apply_batch(logged_in_client, report)
+    assert denied.status_code == 409
+    assert 'Analyze the three files again' in denied.get_json()['message']
+
+
+def test_delta_batch_cannot_replace_the_district_legacy_roster(
+        logged_in_client):
+    setup_route()
+    legacy_id = seed_applied_legacy_subscriber()
+    report = preview_v2(
+        logged_in_client, transport_v2_row(), contact_row(), snapshot='delta',
+    ).get_json()
+    cutover = report['legacy_cutover']
+    assert cutover['required'] is True
+    assert cutover['blocked'] is True
+    assert cutover['requires_reanalysis'] is True
+    assert 'district-wide Full Snapshot' in cutover['message']
+    assert not any(
+        row['data'].get('cutover_source') == 'legacy_csv'
+        for row in report['rows'])
+    assert apply_batch(logged_in_client, report).status_code == 409
+    with application.app.app_context():
+        assert application.db.session.get(
+            application.NotificationSubscriber, legacy_id).active is True
+
+
+def test_v1_transport_cannot_cut_over_legacy_even_when_marked_full_snapshot(
+        logged_in_client):
+    setup_route()
+    legacy_id = seed_applied_legacy_subscriber()
+    response = preview(
+        logged_in_client, transport_row(), contact_row(),
+        snapshot='full_district')
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload['code'] == (
+        'powerschool_full_snapshot_requires_transportation_v2')
+    assert 'approved Transportation v2' in payload['message']
+    with application.app.app_context():
+        assert application.ImportBatch.query.filter_by(
+            source_type='powerschool').count() == 0
+        assert application.db.session.get(
+            application.NotificationSubscriber, legacy_id).active is True
+
+
+def test_preexisting_staged_v1_full_snapshot_cannot_apply_deactivations(
+        logged_in_client, monkeypatch):
+    setup_route()
+    first = preview(
+        logged_in_client, transport_row('0001'),
+        contact_row('0001', 'C-1')).get_json()
+    assert apply_batch(logged_in_client, first).status_code == 200
+
+    # Simulate the analysis behavior of a deployment before Full Snapshot was
+    # restricted to Transportation v2.  Apply must still reject the stored plan.
+    monkeypatch.setattr(
+        application, '_powerschool_preflight_failure',
+        lambda parsed, snapshot_type='delta': None)
+    old_response = preview(
+        logged_in_client, transport_row('0002', 'Alan', 'Turing'),
+        contact_row('0002', 'C-2'), snapshot='full_district')
+    assert old_response.status_code == 200, old_response.get_data(as_text=True)
+    old_plan = old_response.get_json()
+    candidate = next(
+        row for row in old_plan['rows']
+        if row['classification'] == 'deactivate_candidate')
+    new_row = next(
+        row for row in old_plan['rows'] if row['classification'] == 'new')
+    selected = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{old_plan['batch_id']}/selection",
+        json={
+            'plan_hash': old_plan['plan_hash'],
+            'selected_row_ids': [new_row['id']],
+            'deactivation_row_ids': [candidate['id']],
+            'confirm_deactivations': True,
+        },
+        headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert selected.status_code == 200
+    old_plan['plan_hash'] = selected.get_json()['plan_hash']
+
+    denied = apply_batch(logged_in_client, old_plan)
+    assert denied.status_code == 409
+    assert 'not analyzed from the approved Transportation v2' in (
+        denied.get_json()['message'])
+    with application.app.app_context():
+        existing = application.ExternalIdentity.query.filter_by(
+            entity_type='student', external_key='0001').one()
+        assert application.db.session.get(
+            application.NotificationSubscriber, existing.local_id).active is True
+        assert application.ExternalIdentity.query.filter_by(
+            entity_type='student', external_key='0002').count() == 0
+
+
+def test_full_snapshot_can_clean_up_residual_legacy_when_roster_is_unchanged(
+        logged_in_client):
+    setup_route()
+    initial = preview_v2(
+        logged_in_client, transport_v2_row(), contact_row(), snapshot='delta',
+    ).get_json()
+    assert apply_batch(logged_in_client, initial).status_code == 200
+    legacy_id = seed_applied_legacy_subscriber('Residual legacy subscriber')
+
+    report = preview_v2(
+        logged_in_client, transport_v2_row(), contact_row(),
+        snapshot='full_district').get_json()
+    assert report['counts']['unchanged'] == 1
+    assert report['counts']['new'] == 0
+    assert report['counts']['update'] == 0
+    assert report['legacy_cutover']['required'] is True
+    assert report['legacy_cutover']['blocked'] is False
+
+    approved = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/selection",
+        json={
+            'plan_hash': report['plan_hash'],
+            'selected_row_ids': [],
+            'deactivation_row_ids': [],
+            'confirm_deactivations': False,
+            'legacy_cutover_approved': True,
+        },
+        headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert approved.status_code == 200, approved.get_data(as_text=True)
+    summary = approved.get_json()
+    assert summary['selected'] == 1
+    report['plan_hash'] = summary['plan_hash']
+    assert apply_batch(logged_in_client, report).status_code == 200
+
+    with application.app.app_context():
+        assert application.db.session.get(
+            application.NotificationSubscriber, legacy_id).active is False
+        powerschool_identity = application.ExternalIdentity.query.filter_by(
+            source_type='powerschool', entity_type='student',
+            external_key='0001').one()
+        assert application.db.session.get(
+            application.NotificationSubscriber,
+            powerschool_identity.local_id).active is True
+
+
+def test_staged_legacy_apply_is_blocked_after_powerschool_becomes_authoritative(
+        logged_in_client):
+    setup_route()
+    legacy_csv = (
+        'schema_version,subscriber_id,household_label,group,active,role,'
+        'first_name,last_name,email,phone\n'
+        'Legacy CSV v1,,Legacy Household,TEST 1,yes,parent,Legacy,Parent,'
+        'legacy@example.test,17085550109\n'
+    ).encode()
+    staged = logged_in_client.post(
+        '/admin/notifications/import-csv/preview',
+        data={
+            '_csrf': csrf_token(logged_in_client),
+            'csv_file': (io.BytesIO(legacy_csv), 'legacy.csv', 'text/csv'),
+        },
+        content_type='multipart/form-data')
+    assert staged.status_code == 200, staged.get_data(as_text=True)
+    staged_report = staged.get_json()
+
+    powerschool = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    assert apply_batch(logged_in_client, powerschool).status_code == 200
+    blocked = logged_in_client.post(
+        '/admin/notifications/import-csv',
+        data={
+            '_csrf': csrf_token(logged_in_client),
+            'batch_id': staged_report['batch_id'],
+            'plan_hash': staged_report['plan_hash'],
+        })
+    assert blocked.status_code == 302
+    with application.app.app_context():
+        assert application.NotificationSubscriber.query.count() == 1
+        assert application.ImportBatch.query.filter_by(
+            public_id=staged_report['batch_id']).one().status == 'staged'
+
+    rejected_preview = logged_in_client.post(
+        '/admin/notifications/import-csv/preview',
+        data={
+            '_csrf': csrf_token(logged_in_client),
+            'csv_file': (io.BytesIO(legacy_csv), 'legacy.csv', 'text/csv'),
+        },
+        content_type='multipart/form-data')
+    assert rejected_preview.status_code == 409
+    assert 'active PowerSchool roster is authoritative' in (
+        rejected_preview.get_json()['message'])
+
+
+def test_roster_mutex_blocks_powerschool_apply(logged_in_client, monkeypatch):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+
+    @application.contextmanager
+    def unavailable_roster_lock():
+        yield False
+
+    monkeypatch.setattr(application, '_roster_import_lock',
+                        unavailable_roster_lock)
+    denied = apply_batch(logged_in_client, report)
+    assert denied.status_code == 409
+    assert 'Another roster import or rollback is in progress' in (
+        denied.get_json()['message'])
+    with application.app.app_context():
+        assert application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one().status == 'staged'
+        assert application.NotificationSubscriber.query.count() == 0
+
+
+@pytest.mark.parametrize('operation', ['get', 'selection', 'apply', 'report'])
+def test_expired_powerschool_stage_cannot_mutate_roster(
+        logged_in_client, operation):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        batch.expires_at = application._utcnow() - timedelta(seconds=1)
+        application.db.session.commit()
+
+    if operation == 'get':
+        response = logged_in_client.get(
+            f"/admin/notifications/powerschool/batch/{report['batch_id']}")
+    elif operation == 'selection':
+        new_row = next(
+            row for row in report['rows'] if row['classification'] == 'new')
+        response = logged_in_client.post(
+            f"/admin/notifications/powerschool/batch/{report['batch_id']}/selection",
+            json={
+                'plan_hash': report['plan_hash'],
+                'selected_row_ids': [new_row['id']],
+                'deactivation_row_ids': [],
+                'confirm_deactivations': False,
+            },
+            headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    elif operation == 'apply':
+        response = apply_batch(logged_in_client, report)
+    else:
+        response = logged_in_client.get(
+            f"/admin/notifications/powerschool/batch/"
+            f"{report['batch_id']}/report.csv")
+
+    assert response.status_code == 410
+    assert response.get_json()['status'] == 'expired'
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        assert batch.status == 'expired'
+        assert application.ImportRow.query.filter_by(
+            batch_id=batch.id).count() == 0
+        assert application.ImportFile.query.filter_by(
+            batch_id=batch.id).count() == 0
+        assert application.NotificationSubscriber.query.count() == 0
+
+
+def test_apply_rechecks_expiry_after_claim(logged_in_client, monkeypatch):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    original = application._expire_powerschool_stage
+    calls = {'count': 0}
+
+    def expire_after_claim(batch):
+        calls['count'] += 1
+        if calls['count'] == 2:
+            batch.expires_at = application._utcnow() - timedelta(seconds=1)
+        return original(batch)
+
+    monkeypatch.setattr(
+        application, '_expire_powerschool_stage', expire_after_claim)
+    denied = apply_batch(logged_in_client, report)
+    assert denied.status_code == 410
+    assert calls['count'] == 2
+    with application.app.app_context():
+        assert application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one().status == 'expired'
+        assert application.NotificationSubscriber.query.count() == 0
+
+
+def test_rollback_fails_closed_after_imported_subscriber_is_edited(
+        logged_in_client):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    assert apply_batch(logged_in_client, report).status_code == 200
+    with application.app.app_context():
+        subscriber = application.NotificationSubscriber.query.one()
+        subscriber.notes = 'Edited after import'
+        application.db.session.commit()
+
+    denied = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/rollback",
+        json={}, headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert denied.status_code == 409
+    assert 'edited later' in denied.get_json()['message']
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        assert batch.status == 'applied'
+        assert application.NotificationSubscriber.query.one().notes == (
+            'Edited after import')
+
+
+def test_rollback_fails_closed_after_subscriber_pk_is_reused_identically(
+        logged_in_client):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    assert apply_batch(logged_in_client, report).status_code == 200
+    with application.app.app_context():
+        change = application.ImportChange.query.filter_by(
+            target_table='notification_subscriber').one()
+        change_created_at = change.created_at
+        expected = json.loads(change.after_json)
+        assert expected['created_at']
+        subscriber = application.NotificationSubscriber.query.one()
+        application.db.session.delete(subscriber)
+        application.db.session.commit()
+
+        replacement = application.NotificationSubscriber(
+            id=expected['id'], notes=expected['notes'],
+            active=expected['active'], group_id=expected['group_id'],
+            created_at=change_created_at + timedelta(seconds=1))
+        application.db.session.add(replacement)
+        application.db.session.flush()
+        for item in expected['contacts']:
+            application.db.session.add(application.SubscriberContact(
+                id=item['id'], subscriber_id=replacement.id,
+                first_name=item['first_name'], last_name=item['last_name'],
+                email=item['email'], phone=item['phone'], role=item['role'],
+                sort_order=item['sort_order']))
+        application.db.session.commit()
+        current = application._subscriber_snapshot(replacement)
+        current.pop('created_at')
+        identical = dict(expected)
+        identical.pop('created_at')
+        assert current == identical
+        assert replacement.created_at > change_created_at
+
+    denied = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/rollback",
+        json={}, headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert denied.status_code == 409
+    assert 'edited later' in denied.get_json()['message']
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        assert batch.status == 'applied'
+        assert application.NotificationSubscriber.query.one().created_at > (
+            change_created_at)
+
+
+def test_rollback_fails_closed_after_imported_group_is_edited(
+        logged_in_client):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    assert apply_batch(logged_in_client, report).status_code == 200
+    with application.app.app_context():
+        group = application.SubscriberGroup.query.one()
+        group.description = 'Edited after import'
+        application.db.session.commit()
+
+    denied = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/rollback",
+        json={}, headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert denied.status_code == 409
+    assert 'imported group was edited later' in denied.get_json()['message']
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        assert batch.status == 'applied'
+        assert application.SubscriberGroup.query.one().description == (
+            'Edited after import')
+        assert application.NotificationSubscriber.query.count() == 1
+
+
+def test_rollback_fails_closed_after_group_pk_is_reused_identically(
+        logged_in_client):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    assert apply_batch(logged_in_client, report).status_code == 200
+    with application.app.app_context():
+        change = application.ImportChange.query.filter_by(
+            target_table='subscriber_group', operation='create').one()
+        change_created_at = change.created_at
+        expected = json.loads(change.after_json)
+        assert expected['created_at']
+        subscriber = application.NotificationSubscriber.query.one()
+        group = application.SubscriberGroup.query.one()
+        subscriber.group_id = None
+        application.db.session.delete(group)
+        application.db.session.commit()
+
+        replacement = application.SubscriberGroup(
+            id=expected['id'], name=expected['name'],
+            description=expected['description'], color=expected['color'],
+            created_at=change_created_at + timedelta(seconds=1))
+        application.db.session.add(replacement)
+        application.db.session.flush()
+        for bus_id, schedule_type_id in expected['assignments']:
+            application.db.session.add(application.GroupBusAssignment(
+                group_id=replacement.id, bus_id=bus_id,
+                schedule_type_id=schedule_type_id))
+        subscriber = application.NotificationSubscriber.query.one()
+        subscriber.group_id = replacement.id
+        application.db.session.commit()
+        current = application._subscriber_group_snapshot(replacement)
+        current.pop('created_at')
+        identical = dict(expected)
+        identical.pop('created_at')
+        assert current == identical
+        assert replacement.created_at > change_created_at
+
+    denied = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/rollback",
+        json={}, headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert denied.status_code == 409
+    assert 'imported group was edited later' in denied.get_json()['message']
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        assert batch.status == 'applied'
+        assert application.SubscriberGroup.query.one().created_at > (
+            change_created_at)
+        assert application.NotificationSubscriber.query.count() == 1
+
+
+def test_rollback_accepts_unchanged_old_snapshots_without_created_at(
+        logged_in_client):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    assert apply_batch(logged_in_client, report).status_code == 200
+    with application.app.app_context():
+        changes = application.ImportChange.query.filter(
+            application.ImportChange.target_table.in_([
+                'notification_subscriber', 'subscriber_group',
+            ])).all()
+        assert {change.target_table for change in changes} == {
+            'notification_subscriber', 'subscriber_group',
+        }
+        for change in changes:
+            snapshot = json.loads(change.after_json)
+            assert snapshot.pop('created_at')
+            change.after_json = json.dumps(snapshot, sort_keys=True)
+        application.db.session.commit()
+
+    rolled_back = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/rollback",
+        json={}, headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert rolled_back.status_code == 200, rolled_back.get_data(as_text=True)
+    with application.app.app_context():
+        assert application.NotificationSubscriber.query.count() == 0
+        assert application.SubscriberGroup.query.count() == 0
+
+
+def test_rollback_old_group_snapshot_still_detects_description_edit(
+        logged_in_client):
+    setup_route()
+    report = preview(
+        logged_in_client, transport_row(), contact_row()).get_json()
+    assert apply_batch(logged_in_client, report).status_code == 200
+    with application.app.app_context():
+        group_change = application.ImportChange.query.filter_by(
+            target_table='subscriber_group', operation='create').one()
+        old_snapshot = json.loads(group_change.after_json)
+        old_snapshot.pop('description')
+        old_snapshot.pop('color')
+        old_snapshot.pop('created_at')
+        group_change.after_json = json.dumps(old_snapshot, sort_keys=True)
+        application.SubscriberGroup.query.one().description = (
+            'Edited after old-format snapshot')
+        application.db.session.commit()
+
+    denied = logged_in_client.post(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/rollback",
+        json={}, headers={'X-CSRF-Token': csrf_token(logged_in_client)})
+    assert denied.status_code == 409
+    assert 'imported group was edited later' in denied.get_json()['message']
+
+
+def test_legacy_cutover_is_blocked_until_student_conflicts_are_resolved(
+        logged_in_client):
+    setup_route()
+    seed_applied_legacy_subscriber()
+    transportation = (
+        transport_v2_row('0001')
+        + transport_v2_row(
+            '0002', 'Alan', 'Turing', route_am='ELL1 AM',
+            route_pm='ELL1 PM')
+    )
+    contacts = contact_row('0001', 'C-1') + contact_row('0002', 'C-2')
+    response = preview_v2(
+        logged_in_client, transportation, contacts,
+        snapshot='full_district')
+    assert response.status_code == 200, response.get_data(as_text=True)
+    report = response.get_json()
+    assert report['counts']['new'] == 1
+    assert report['counts']['conflict'] == 1
+    assert report['legacy_cutover']['required'] is True
+    assert report['legacy_cutover']['blocked'] is True
+    assert report['legacy_cutover']['requires_reanalysis'] is True
+    assert not any(
+        row['data'].get('cutover_source') == 'legacy_csv'
+        for row in report['rows'])
+    denied = apply_batch(logged_in_client, report)
+    assert denied.status_code == 409
+    assert 'Resolve every conflict' in denied.get_json()['message']
+
+
 def test_split_exports_apply_student_and_guardian_contacts(logged_in_client):
     setup_route()
     response = preview_split(
@@ -384,11 +1148,13 @@ def test_mid_transaction_failure_changes_no_operational_records(logged_in_client
 
 def test_complete_snapshot_never_selects_deactivation_without_separate_approval(logged_in_client):
     setup_route()
-    first = preview(logged_in_client, transport_row('0001'), contact_row('0001', 'C-1')).get_json()
+    first = preview_v2(
+        logged_in_client, transport_v2_row('0001'),
+        contact_row('0001', 'C-1')).get_json()
     assert apply_batch(logged_in_client, first).status_code == 200
 
-    second = preview(
-        logged_in_client, transport_row('0002', 'Alan', 'Turing'),
+    second = preview_v2(
+        logged_in_client, transport_v2_row('0002', 'Alan', 'Turing'),
         contact_row('0002', 'C-2'), snapshot='full_district').get_json()
     candidate = next(row for row in second['rows']
                      if row['classification'] == 'deactivate_candidate')
@@ -436,14 +1202,22 @@ def test_complete_snapshot_never_selects_deactivation_without_separate_approval(
 
 def test_incomplete_snapshot_cannot_propose_deactivations(logged_in_client):
     setup_route()
-    first = preview(logged_in_client, transport_row('0001'), contact_row('0001', 'C-1')).get_json()
+    first = preview_v2(
+        logged_in_client, transport_v2_row('0001'),
+        contact_row('0001', 'C-1')).get_json()
     assert apply_batch(logged_in_client, first).status_code == 200
-    incomplete_transport = transport_row('0002', 'Alan', 'Turing') + transport_row(
-        '0003', 'Bad', 'Route').replace('TEST1', 'NOT-A-BUS')
-    report = preview(
+    incomplete_transport = (
+        transport_v2_row('0002', 'Alan', 'Turing')
+        + transport_v2_row(
+            '0003', 'Bad', 'Route', route_am='ELL1 AM',
+            route_pm='ELL1 PM')
+    )
+    response = preview_v2(
         logged_in_client, incomplete_transport,
-        contact_row('0002', 'C-2'), snapshot='full_district').get_json()
-    assert report['rejected'] >= 1
+        contact_row('0002', 'C-2'), snapshot='full_district')
+    assert response.status_code == 200, response.get_data(as_text=True)
+    report = response.get_json()
+    assert report['counts']['conflict'] >= 1
     assert not any(row['classification'] == 'deactivate_candidate'
                    for row in report['rows'])
     with application.app.app_context():
@@ -589,11 +1363,13 @@ def test_deactivation_candidates_mask_all_student_numbers_for_limited_operator(c
         add_user('masked-deactivation', group)
         application.db.session.commit()
     login(client, 'masked-deactivation', 'Another-Safe-Password')
-    first = preview(client, transport_row('0001'), contact_row('0001', 'C-1')).get_json()
+    first = preview_v2(
+        client, transport_v2_row('0001'),
+        contact_row('0001', 'C-1')).get_json()
     assert apply_batch(client, first).status_code == 200
 
-    second = preview(
-        client, transport_row('0002', 'Alan', 'Turing'),
+    second = preview_v2(
+        client, transport_v2_row('0002', 'Alan', 'Turing'),
         contact_row('0002', 'C-2'), snapshot='full_district').get_json()
     candidate = next(row for row in second['rows']
                      if row['classification'] == 'deactivate_candidate')
@@ -613,12 +1389,25 @@ def test_retention_purges_normalized_pii_and_closes_rollback(logged_in_client):
         application._cleanup_import_stages()
         batch = application.db.session.get(application.ImportBatch, batch.id)
         assert batch.status == 'retention_closed'
-        assert json.loads(application.ImportRow.query.filter_by(
-            batch_id=batch.id).first().normalized_json)['retained'] is True
+        row = application.ImportRow.query.filter_by(batch_id=batch.id).first()
+        retained = json.loads(row.normalized_json)
+        assert retained['retained'] is True
+        assert retained['external_key_sha256'] == hashlib.sha256(
+            b'0001').hexdigest()
+        assert row.external_key is None
         assert all(change.before_json is None and change.after_json is None
                    for change in application.ImportChange.query.filter_by(
                        batch_id=batch.id).all())
         assert json.loads(batch.metadata_json)['pii_purged_at']
+
+    exported = logged_in_client.get(
+        f"/admin/notifications/powerschool/batch/{report['batch_id']}/report.csv")
+    assert exported.status_code == 200
+    csv_rows = list(csv.DictReader(io.StringIO(
+        exported.get_data(as_text=True).lstrip('\ufeff'))))
+    assert csv_rows
+    assert all(row['external_key'] == '' for row in csv_rows)
+    assert '0001' not in exported.get_data(as_text=True)
 
 
 def test_retention_also_purges_failed_rollback_pii(logged_in_client):

@@ -32,14 +32,15 @@ def enable_powerschool():
 
 def preview_with_options(client, transportation, contacts, *,
                          snapshot='delta', school_year='2026-27',
-                         force_reanalyze=False):
+                         force_reanalyze=False,
+                         transport_header=TRANSPORT_HEADER):
     data = {
         '_csrf': csrf_token(client),
         'school_year': school_year,
         'snapshot_type': snapshot,
         'mapping_profile_id': str(profile_id()),
         'transportation_file': (
-            io.BytesIO((TRANSPORT_HEADER + transportation).encode()),
+            io.BytesIO((transport_header + transportation).encode()),
             'transportation.csv', 'text/csv'),
         'contacts_file': (
             io.BytesIO((CONTACT_HEADER + contacts).encode()),
@@ -104,11 +105,14 @@ def test_exact_context_can_open_existing_or_explicitly_reanalyze(
 
 def test_snapshot_policy_is_part_of_analysis_context(logged_in_client):
     setup_route()
+    transportation = (
+        '0001,Ada,Lovelace,5,Active,TEST1 AM,TEST1 PM,205,SID-0001\n')
     delta = preview_with_options(
-        logged_in_client, transport_row(), contact_row(), snapshot='delta')
+        logged_in_client, transportation, contact_row(), snapshot='delta',
+        transport_header=V2_TRANSPORT_HEADER)
     complete = preview_with_options(
-        logged_in_client, transport_row(), contact_row(),
-        snapshot='full_district')
+        logged_in_client, transportation, contact_row(),
+        snapshot='full_district', transport_header=V2_TRANSPORT_HEADER)
 
     assert delta.status_code == 200
     assert complete.status_code == 200
@@ -148,6 +152,56 @@ def test_transportation_v2_blocks_unproven_complete_snapshot_before_staging(
     assert payload['preflight']['dual_route'] is True
     with application.app.app_context():
         assert application.ImportBatch.query.count() == 0
+
+
+@pytest.mark.parametrize('artifact', [
+    'Res verify add',
+    'PO Box Address',
+    '7:16 AM',
+])
+def test_suspicious_route_artifact_allows_delta_but_blocks_full_snapshot(
+        logged_in_client, artifact):
+    setup_route()
+    transportation = (
+        f'0001,Ada,Lovelace,5,Active,{artifact},TEST1 PM,205,SID-0001\n'
+    )
+
+    delta = preview_with_options(
+        logged_in_client,
+        transportation,
+        contact_row(),
+        snapshot='delta',
+        transport_header=V2_TRANSPORT_HEADER,
+    )
+
+    assert delta.status_code == 200, delta.get_data(as_text=True)
+    delta_payload = delta.get_json()
+    delta_metrics = delta_payload['metrics']['transportation']
+    assert delta_metrics['period_am_rows'] == 0
+    assert delta_metrics['period_pm_rows'] == 1
+    assert delta_metrics['invalid_route_am_rows'] == 1
+    assert delta_metrics['ignored_non_bus_route_rows'] == 0
+    assert delta_metrics['warning_rows'] == 1
+
+    full_snapshot = preview_with_options(
+        logged_in_client,
+        transportation,
+        contact_row(),
+        snapshot='full_district',
+        transport_header=V2_TRANSPORT_HEADER,
+    )
+
+    assert full_snapshot.status_code == 400
+    full_payload = full_snapshot.get_json()
+    assert full_payload['code'] == (
+        'transportation_v2_full_snapshot_not_proven'
+    )
+    assert full_payload['metrics']['transportation'][
+        'invalid_route_am_rows'
+    ] == 1
+    assert 'Select Delta' in full_payload['message']
+    with application.app.app_context():
+        assert application.ImportBatch.query.count() == 1
 
 
 def test_transportation_v2_clean_dual_route_snapshot_can_stage(

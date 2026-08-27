@@ -112,7 +112,7 @@ def test_brightarrow_transportation_v2_raw_headers_expand_am_and_pm():
 
     student = result["students"][0]
     assert result["normalizer_revision"] == NORMALIZER_REVISION
-    assert NORMALIZER_REVISION == "2026-08-27.4"
+    assert NORMALIZER_REVISION == "2026-08-27.6"
     assert result["preflight"]["transportation_contract"] == (
         TRANSPORTATION_V2_CONTRACT
     )
@@ -199,6 +199,105 @@ def test_v2_ignores_blank_and_known_non_bus_categories_without_row_issues():
     )
 
 
+@pytest.mark.parametrize(("artifact", "artifact_period"), [
+    ("  0  ", "PM"),
+    ("wAlKeR   wAlKeR", "PM"),
+    ("door - t0 - door", "AM"),
+])
+def test_v2_confirmed_non_bus_artifact_keeps_valid_opposite_leg(
+        artifact, artifact_period):
+    route_am = artifact if artifact_period == "AM" else "BUS 42 AM"
+    route_pm = artifact if artifact_period == "PM" else "BUS 42 PM"
+    expected_period = "PM" if artifact_period == "AM" else "AM"
+    result = _plan(
+        V2_HEADERS,
+        [_v2_row("0001", route_am, route_pm)],
+        [_contact_row("0001", "C-1")],
+    )
+
+    metrics = result["metrics"]["transportation"]
+    assert result["preflight"]["ok"] is True
+    assert metrics["accepted_rows"] == 1
+    assert metrics["ignored_rows"] == 1
+    assert metrics["ignored_non_bus_route_rows"] == 1
+    assert metrics["invalid_route_am_rows"] == 0
+    assert metrics["invalid_route_pm_rows"] == 0
+    assert metrics["warning_rows"] == 0
+    assert result["issues"] == []
+    assert result["students"][0]["assignments"] == [{
+        "route_prefix": "BUS", "route_number": "42",
+        "period": expected_period,
+    }]
+
+
+@pytest.mark.parametrize(("artifact", "artifact_period"), [
+    ("rEs   VeRiFy   AdD", "AM"),
+    ("po   BOX address", "PM"),
+    ("7 : 16   am", "AM"),
+    ("03:22 pm", "PM"),
+])
+def test_v2_address_incident_and_time_artifacts_warn_and_keep_opposite_leg(
+        artifact, artifact_period):
+    route_am = artifact if artifact_period == "AM" else "BUS 42 AM"
+    route_pm = artifact if artifact_period == "PM" else "BUS 42 PM"
+    expected_period = "PM" if artifact_period == "AM" else "AM"
+    result = _plan(
+        V2_HEADERS,
+        [_v2_row("0001", route_am, route_pm)],
+        [_contact_row("0001", "C-1")],
+    )
+
+    metrics = result["metrics"]["transportation"]
+    assert result["preflight"]["ok"] is True
+    assert metrics["accepted_rows"] == 1
+    assert metrics["ignored_rows"] == 0
+    assert metrics["ignored_non_bus_route_rows"] == 0
+    assert metrics[f"invalid_route_{artifact_period.lower()}_rows"] == 1
+    assert metrics["warning_rows"] == 1
+    assert result["students"][0]["assignments"] == [{
+        "route_prefix": "BUS", "route_number": "42",
+        "period": expected_period,
+    }]
+    assert result["issues"] == [{
+        "file": "transportation",
+        "row_number": 2,
+        "classification": "warning",
+        "errors": [
+            f"route_{artifact_period.lower()} is populated but cannot be "
+            "normalized"
+        ],
+    }]
+
+
+@pytest.mark.parametrize("unknown_value", [
+    "WalkerWalker extra",
+    "door-t0-door PM",
+    "Res verify add",
+    "Res verify address",
+    "PO Box Address",
+    "PO Box",
+    "7:16 AM",
+    "13:22 PM",
+    "7:99 AM",
+])
+def test_v2_similar_unrecognized_values_remain_invalid(unknown_value):
+    result = _plan(
+        V2_HEADERS,
+        [_v2_row("0001", unknown_value, "BUS 42 PM")],
+        [_contact_row("0001", "C-1")],
+    )
+
+    metrics = result["metrics"]["transportation"]
+    assert metrics["accepted_rows"] == 1
+    assert metrics["ignored_non_bus_route_rows"] == 0
+    assert metrics["invalid_route_am_rows"] == 1
+    assert metrics["warning_rows"] == 1
+    assert result["students"][0]["assignments"] == [{
+        "route_prefix": "BUS", "route_number": "42", "period": "PM",
+    }]
+    assert result["issues"][0]["classification"] == "warning"
+
+
 def test_v2_preflight_blocks_when_every_transport_row_is_ignored():
     result = _plan(
         V2_HEADERS,
@@ -263,6 +362,7 @@ def test_v2_invalid_direction_keeps_valid_opposite_assignment():
     assert metrics["accepted_rows"] == 1
     assert metrics["invalid_route_am_rows"] == 1
     assert metrics["invalid_route_pm_rows"] == 0
+    assert metrics["ignored_non_bus_route_rows"] == 0
     assert metrics["period_am_rows"] == 0
     assert metrics["period_pm_rows"] == 1
     assert metrics["rejected_rows"] == 0

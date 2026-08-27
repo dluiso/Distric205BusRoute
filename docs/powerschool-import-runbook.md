@@ -1,8 +1,11 @@
 # PowerSchool roster export and import runbook
 
-PowerSchool Import v1 is an additive, feature-flagged workflow. It does not replace
-Legacy CSV v1 and it never treats absence from an upload as permission to delete or
-deactivate a subscriber.
+PowerSchool Import v1 is a feature-flagged workflow. Routine Delta batches are additive
+and never treat absence from an upload as permission to deactivate a subscriber. The
+first PowerSchool migration can also perform a separately approved, provenance-bound
+cutover from Legacy CSV v1: it deactivates only subscribers proven to have been created
+by applied Legacy CSV batches, never manual subscribers. That cutover is prohibited in
+Delta and requires a validated Complete district snapshot.
 
 ## Security and authorization
 
@@ -161,6 +164,58 @@ The v1 mapping accepts the verified `BRIGHTARROW.600_*`, `601_*`–`609_*` and
 conflicts. Invalid email values are surfaced for review; they are never silently converted
 into a different destination.
 
+## First PowerSchool batch: Legacy CSV cutover
+
+The first applicable PowerSchool batch detects legacy subscribers by import provenance:
+the application uses the applied Legacy CSV batch and change history that created them.
+It does not infer ownership from names, household labels, email addresses or phone
+numbers. Subscribers without that proven Legacy CSV provenance are manual and remain
+active.
+
+A large `new` count does **not** mean the notification database is empty. `new` means the
+student number has no PowerSchool `ExternalIdentity` yet. The same student or household
+can therefore already exist as a Legacy CSV subscriber and still appear as `new` in the
+first PowerSchool analysis. The cutover prevents those proven legacy records from
+remaining active beside the newly linked PowerSchool subscribers.
+
+When the analysis reports that a Legacy CSV cutover is required, Apply remains blocked
+until all of these conditions are satisfied:
+
+1. The policy is `full_district` (**Complete district snapshot**) and Transportation is
+   the approved v2/template 941 dual-route export, with district-wide AM and PM coverage
+   validated. A Legacy CSV cutover is prohibited in `delta`. Transportation v1 remains
+   blocked for cutover even if its batch is marked Full; the policy label cannot upgrade
+   the legacy single-route contract. Delta remains the normal safe policy for subsequent
+   PowerSchool updates.
+2. The batch is a current analysis of the present application state. Any PowerSchool
+   batch staged before the cutover protection was deployed, or otherwise marked as
+   requiring reanalysis, must use **Re-analyze against current state**. Opening an older
+   staged batch is useful for inspection only; it is not an approval shortcut.
+3. The review has zero `conflict` rows and zero `rejected` rows. Correct the source or
+   configuration and re-analyze; never exclude an error merely to unlock the cutover.
+4. Every importable `new` and `update` row remains selected. An empty or partial
+   importable selection blocks the cutover. If any importable proposal should not proceed,
+   correct its source or configuration and re-analyze instead of excluding it.
+5. The operator reconciles the displayed legacy candidate count, explicitly approves
+   the Legacy CSV cutover checkbox and saves the selection so the approval is bound to
+   the regenerated `plan_hash`.
+
+Apply then performs one atomic transaction: it applies the selected PowerSchool changes
+and deactivates **all** subscribers proven to have been created by applied Legacy CSV
+batches. It preserves manual subscribers. If any selected change or cutover operation
+fails, none of them are committed. This one-time provenance cutover is distinct from
+absence-based deactivation and cannot accompany a Delta batch.
+
+The cutover is recorded as part of the PowerSchool batch and is rollbackable within the
+normal rollback retention window. A successful batch rollback reverses the selected
+PowerSchool changes and restores the prior active state of its legacy cutover candidates,
+provided the usual later-edit safety check passes.
+
+Once a PowerSchool roster is active, Legacy CSV is disabled as a roster source. Do not
+use Legacy CSV to add, replace or refresh subscribers after the cutover. All later roster
+updates and new-year imports must use PowerSchool Import so stable `ExternalIdentity`
+links, preview classifications, atomic apply and rollback protections remain intact.
+
 ## Annual workflow
 
 1. Confirm the active bus catalog and its AM and PM schedule assignments.
@@ -169,8 +224,9 @@ into a different destination.
    manually combine their CSV output.
 3. Open **Notifications → PowerSchool Guide** for the operational checklist, then open
    the importer and choose the mapping version.
-4. Select `Delta` by default. Select `Complete district snapshot` only after independently
-   validating both AM and PM coverage and reconciling all route-pair anomalies.
+4. Select `Delta` by default for routine updates. A first Legacy CSV cutover is the
+   exception: it is prohibited in Delta and requires `Complete district snapshot` after
+   independently validating both AM and PM coverage and reconciling all route-pair anomalies.
 5. Keep `PowerSchool saved templates` selected and upload Transportation, Student
    Contacts and Guardian Contacts. Analyze. The server first runs blocking preflight,
    then validates UTF-8, MIME/type, exact mapped headers, cumulative column/row limits,
@@ -179,19 +235,31 @@ into a different destination.
    route counters and `different_am_pm_route_rows`, plus every `new`, `update`,
    `unchanged`, `duplicate`, `conflict` and `rejected` classification. Filter by
    classification, school, grade, group/route, or change/error type.
-7. Include or exclude rows and save the selection. This regenerates `plan_hash`; any
-   stale browser plan is rejected.
-8. For a separately validated Complete district snapshot, deactivation candidates remain
+7. Remember that `new` means no PowerSchool `ExternalIdentity`; it does not mean the
+   database is empty or prove that no Legacy CSV version of the subscriber exists.
+8. If the Legacy CSV cutover banner appears, require the approved Transportation v2
+   dual-route export in a Complete district snapshot, current reanalysis, zero conflicts,
+   zero rejected rows and reconciliation of its provenance-derived candidate count.
+   Transportation v1 cannot authorize cutover even when marked Full.
+   Keep all importable `new` and `update` rows selected: an empty or partial selection is
+   blocked. Explicitly approve the atomic cutover; manual subscribers remain active.
+9. Without a cutover, include or exclude importable rows according to the reviewed plan.
+   With a cutover, retain the complete importable selection. Save the selection to
+   regenerate `plan_hash`; any stale browser plan is rejected.
+10. For a separately validated Complete district snapshot, deactivation candidates remain
    unselected and require explicit approval. Absence alone never selects them.
-9. Apply the exact plan. The batch first revalidates target state and then applies all
-   selected changes in one transaction. A failure changes no operational records.
-10. Download the final CSV report and reconcile:
+11. Apply the exact plan. The batch first revalidates target state and then applies all
+   selected changes and any approved provenance cutover in one transaction. A failure
+   changes no operational records.
+12. Download the final CSV report and reconcile:
     `selected + excluded + rejected = total`.
-11. Resubmitting the same files presents two explicit choices. **Open existing analysis**
+13. Resubmitting the same files presents two explicit choices. **Open existing analysis**
    loads the immutable earlier batch. **Re-analyze against current state** creates a new
    linked batch with current mappings and operational data. Neither choice imports data,
    changes the source CSVs or silently overwrites the prior analysis.
-12. Monitor audit logs and notifications before expanding a pilot to more schools.
+14. Monitor audit logs and notifications before expanding a pilot to more schools.
+15. After a PowerSchool roster becomes active, perform every later roster update through
+    PowerSchool Import. Legacy CSV is no longer an allowed roster source.
 
 ## Rapid go/no-go checklist
 
@@ -206,6 +274,14 @@ Before applying any batch, all answers must be **yes**:
   reconciled for a Complete district snapshot?
 - Were non-rider, out-of-Transportation contact, sentinel and placeholder metrics
   reviewed without manually changing source IDs?
+- Is this a current analysis rather than an older staged batch that requires reanalysis?
+- Are both the `conflict` and `rejected` counts zero?
+- If a Legacy CSV cutover is required, is the policy Complete district snapshot rather
+  than Delta, is Transportation the approved v2 dual-route export, and is district-wide
+  AM/PM coverage proven? A Transportation v1 Full batch remains a NO-GO.
+- If a Legacy CSV cutover is required, was its provenance-derived candidate count
+  reconciled, are all importable `new`/`update` rows selected, and was its atomic
+  deactivation explicitly approved and saved? An empty or partial selection is a NO-GO.
 - Do selected, excluded and rejected totals reconcile exactly?
 - Was the final plan reviewed by the authorized operator before Apply?
 
@@ -214,7 +290,8 @@ transform the CSV to make it pass.
 
 ## Classification and preservation rules
 
-- `new`: no PowerSchool student identity exists locally.
+- `new`: no PowerSchool student `ExternalIdentity` exists locally. It does not mean the
+  database is empty and does not rule out an equivalent unlinked Legacy CSV subscriber.
 - `update`: a mapped enrollment/contact differs from the normalized proposal.
 - `unchanged`: the mapped target already matches.
 - `duplicate`: repeated source assignment or identical stable contact identity.
@@ -225,6 +302,11 @@ transform the CSV to make it pass.
 
 Manual contacts without PowerSchool identities are preserved. The importer never matches
 or overwrites a person using a name, address, email, phone number or household label.
+The first cutover deactivates only subscribers whose applied Legacy CSV creation provenance
+is recorded; manual subscribers are preserved.
+
+After an active PowerSchool roster exists, Legacy CSV cannot be used as a roster source.
+Use PowerSchool Import for every subsequent addition, correction and annual refresh.
 
 ## Rollback
 
@@ -234,6 +316,8 @@ batch changed a target, rollback fails closed without changing any record. Other
 
 - deletes identities, contacts, enrollments and groups created by the batch;
 - restores the exact prior values for updates and approved deactivations;
+- restores the prior active state of subscribers deactivated by an approved Legacy CSV
+  cutover;
 - preserves notification/outbox history while detaching references to removed imported
   subscribers and groups;
 - commits the reversal atomically; and

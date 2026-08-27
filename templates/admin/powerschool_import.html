@@ -158,6 +158,23 @@
   <section id="review-section" class="hidden space-y-4">
     <div id="summary-cards" class="grid grid-cols-2 md:grid-cols-5 xl:grid-cols-10 gap-3"></div>
 
+    <section id="legacy-cutover-banner" class="hidden rounded-2xl border border-amber-300 bg-amber-50 p-5" aria-live="polite">
+      <div class="flex items-start gap-3">
+        <i class="fas fa-triangle-exclamation mt-0.5 text-amber-700"></i>
+        <div class="min-w-0 flex-1">
+          <h2 class="font-semibold text-amber-950">Legacy CSV cutover required</h2>
+          <p id="legacy-cutover-message" class="text-sm text-amber-900 mt-1"></p>
+          <p id="legacy-cutover-count" class="text-xs font-semibold text-amber-800 mt-2"></p>
+          <p class="mt-2 text-xs font-semibold text-amber-900">Safety gate: Legacy CSV cutover is prohibited in Delta and requires the approved Transportation v2 dual-route export as a Complete district snapshot, with zero conflicts and zero rejected rows. Transportation v1 remains blocked even when marked Full. ALL importable new/update rows must remain selected; an empty or partial selection is blocked.</p>
+          <p id="legacy-cutover-blocked-message" class="hidden mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-800"></p>
+          <label id="legacy-cutover-approval-wrap" class="hidden mt-3 items-start gap-2 rounded-xl border border-amber-300 bg-white p-3 text-xs text-amber-950">
+            <input id="approve-legacy-cutover" type="checkbox" class="mt-0.5">
+            <span>I confirm this Complete district snapshot uses the approved Transportation v2 dual-route export, has zero conflicts and zero rejected rows, and includes ALL importable new/update rows. I explicitly approve that Apply will atomically deactivate ALL subscribers created by applied Legacy CSV batches. Manual subscribers will be preserved, and rollback remains available for this batch.</span>
+          </label>
+        </div>
+      </div>
+    </section>
+
     <div class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
       <div class="p-4 border-b border-slate-100 space-y-3">
         <div class="flex flex-wrap items-center justify-between gap-3">
@@ -413,6 +430,65 @@
     return [...(row.errors || []), ...((row.data && row.data.changes) || []).map(change => change.field)];
   }
 
+  function currentLegacyCutover() {
+    return (batch && batch.legacy_cutover && typeof batch.legacy_cutover === 'object')
+      ? batch.legacy_cutover : {};
+  }
+
+  function legacyCutoverBlocksApply() {
+    const cutover = currentLegacyCutover();
+    return cutover.required === true && (
+      cutover.approved !== true || cutover.blocked === true || cutover.requires_reanalysis === true
+    );
+  }
+
+  function updateApplyAvailability() {
+    byId('apply-plan').disabled = !batch || batch.status !== 'staged' || batch.selected < 1 ||
+      selectionDirty || legacyCutoverBlocksApply();
+  }
+
+  function renderLegacyCutover() {
+    const cutover = currentLegacyCutover();
+    const required = cutover.required === true;
+    const banner = byId('legacy-cutover-banner');
+    const approvalWrap = byId('legacy-cutover-approval-wrap');
+    const approval = byId('approve-legacy-cutover');
+    const blockedMessage = byId('legacy-cutover-blocked-message');
+    banner.classList.toggle('hidden', !required);
+    if (!required) {
+      approval.checked = false;
+      approval.disabled = true;
+      approvalWrap.classList.add('hidden');
+      approvalWrap.classList.remove('flex');
+      blockedMessage.classList.add('hidden');
+      return;
+    }
+
+    const candidateCount = Number.isFinite(Number(cutover.candidate_count))
+      ? Number(cutover.candidate_count) : 0;
+    const incarnationExcluded = Number.isFinite(Number(cutover.incarnation_excluded_count))
+      ? Number(cutover.incarnation_excluded_count) : 0;
+    byId('legacy-cutover-message').textContent = cutover.message ||
+      'This PowerSchool batch overlaps subscribers previously created by applied Legacy CSV batches.';
+    byId('legacy-cutover-count').textContent =
+      `${candidateCount} legacy subscriber${candidateCount === 1 ? '' : 's'} will be included in the atomic cutover.` +
+      (incarnationExcluded
+        ? ` ${incarnationExcluded} reused or unverifiable record ID${incarnationExcluded === 1 ? '' : 's'} will be preserved.`
+        : '');
+
+    const unavailable = cutover.blocked === true || cutover.requires_reanalysis === true;
+    approval.checked = cutover.approved === true;
+    approval.disabled = unavailable || batch.status !== 'staged';
+    approvalWrap.classList.toggle('hidden', unavailable);
+    approvalWrap.classList.toggle('flex', !unavailable);
+    blockedMessage.classList.toggle('hidden', !unavailable);
+    if (unavailable) {
+      blockedMessage.textContent = cutover.requires_reanalysis === true
+        ? 'Apply is blocked because this stored analysis must be re-analyzed with the current legacy cutover plan.'
+        : 'Apply is blocked because the legacy cutover cannot be approved for this batch.';
+    }
+  }
+
   function renderRows() {
     const body = byId('review-body');
     const visible = batch.rows.filter(rowAllowed);
@@ -426,7 +502,9 @@
       const use = node('td', null, 'px-3 py-3');
       const check = document.createElement('input'); check.type = 'checkbox'; check.checked = row.selected;
       check.dataset.importRow = row.id; check.dataset.classification = row.classification;
-      check.disabled = !['new','update','deactivate_candidate'].includes(row.classification) || ['applied','rolled_back'].includes(batch.status);
+      check.disabled = data.cutover_source === 'legacy_csv' ||
+        !['new','update','deactivate_candidate'].includes(row.classification) ||
+        ['applied','rolled_back'].includes(batch.status);
       check.addEventListener('change', () => {
         row.selected = check.checked;
         selectionDirty = true;
@@ -443,7 +521,8 @@
       const group = node('td', data.group_name || '—', 'px-3 py-3 text-xs text-slate-600');
       const details = node('td', null, 'px-3 py-3 text-xs text-slate-600 max-w-md');
       const messages = [...(row.errors || []), ...(data.changes || []).map(change => `${change.field}: ${change.current || '∅'} → ${change.proposed || '∅'}`)];
-      if (!messages.length) details.textContent = 'No data changes';
+      if (!messages.length) details.textContent = row.classification === 'new'
+        ? 'Creates a new PowerSchool subscriber' : 'No data changes';
       else messages.slice(0, 6).forEach(message => details.append(node('div', message, 'mb-1 break-words')));
       tr.append(use, status, student, school, group, details); return tr;
     }));
@@ -471,11 +550,13 @@
     fillFilter('filter-grade', batch.rows.map(r => r.data && r.data.grade), 'All grades');
     fillFilter('filter-group', batch.rows.map(r => r.data && r.data.group_name), 'All groups');
     fillFilter('filter-problem', batch.rows.flatMap(rowProblems), 'All change/error types');
-    const hasCandidates = batch.rows.some(r => r.classification === 'deactivate_candidate');
+    const hasCandidates = batch.rows.some(r => r.classification === 'deactivate_candidate' &&
+      (!r.data || r.data.cutover_source !== 'legacy_csv'));
     byId('deactivation-confirm-wrap').classList.toggle('hidden', !hasCandidates);
     byId('deactivation-confirm-wrap').classList.toggle('flex', hasCandidates);
     byId('save-selection').disabled = batch.status !== 'staged';
-    byId('apply-plan').disabled = batch.status !== 'staged' || batch.selected < 1;
+    renderLegacyCutover();
+    updateApplyAvailability();
     const rollback = byId('rollback-plan'); if (rollback) rollback.classList.toggle('hidden', batch.status !== 'applied');
     renderSummary(); renderRows();
     byId('review-section').scrollIntoView({behavior:'smooth', block:'start'});
@@ -543,15 +624,23 @@
     renderRows();
   });
 
+  byId('approve-legacy-cutover').addEventListener('change', () => {
+    selectionDirty = true;
+    updateApplyAvailability();
+    showNotice('Legacy cutover approval changed. Save the selection before applying the plan.');
+  });
+
   byId('save-selection').addEventListener('click', async () => {
     const regular = [], deactivations = [];
     batch.rows.filter(row => row.selected).forEach(row => {
-      (row.classification === 'deactivate_candidate' ? deactivations : regular).push(row.id);
+      if (row.classification === 'deactivate_candidate') {
+        if (!row.data || row.data.cutover_source !== 'legacy_csv') deactivations.push(row.id);
+      } else regular.push(row.id);
     });
     try {
       const summary = await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}/selection`, {
         method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},
-        body:JSON.stringify({plan_hash:batch.plan_hash, selected_row_ids:regular, deactivation_row_ids:deactivations, confirm_deactivations:byId('confirm-deactivations').checked})
+        body:JSON.stringify({plan_hash:batch.plan_hash, selected_row_ids:regular, deactivation_row_ids:deactivations, confirm_deactivations:byId('confirm-deactivations').checked, legacy_cutover_approved:byId('approve-legacy-cutover').checked})
       });
       const refreshed = await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}`);
       presentBatch(refreshed);
@@ -564,7 +653,16 @@
       showNotice('Save the changed selection before applying the plan.', 'error');
       return;
     }
-    if (!window.confirm(`Apply exactly ${batch.selected} selected change(s)? This operation is atomic and audited.`)) return;
+    if (legacyCutoverBlocksApply()) {
+      showNotice('Apply is blocked until the required legacy cutover is approved in a current analysis.', 'error');
+      updateApplyAvailability();
+      return;
+    }
+    const cutover = currentLegacyCutover();
+    const cutoverConfirmation = cutover.required === true
+      ? ` The same atomic transaction will deactivate ${Number(cutover.candidate_count) || 0} Legacy CSV subscriber(s).`
+      : '';
+    if (!window.confirm(`Apply exactly ${batch.selected} selected change(s)? This operation is atomic and audited.${cutoverConfirmation}`)) return;
     byId('apply-plan').disabled = true;
     try {
       const result = await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}/apply`, {
@@ -572,7 +670,7 @@
       });
       const refreshed = await requestJson(`${batchBase}${encodeURIComponent(batch.batch_id)}`); presentBatch(refreshed);
       showNotice(result.already_applied ? 'This batch was already applied; no duplicates were created.' : 'Batch applied successfully. Download the final report and verify counts.', 'success');
-    } catch (error) { showNotice(error.message, 'error'); byId('apply-plan').disabled = false; }
+    } catch (error) { showNotice(error.message, 'error'); updateApplyAvailability(); }
   });
 
   const rollback = byId('rollback-plan');
