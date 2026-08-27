@@ -9,8 +9,8 @@
         <a href="{{ url_for('notifications') }}" class="hover:text-blue-600">Notifications</a>
         <i class="fas fa-chevron-right text-[9px]"></i><span>PowerSchool Import</span>
       </div>
-      <h1 class="text-2xl font-bold text-slate-900">PowerSchool Import v1</h1>
-      <p class="text-sm text-slate-500 mt-1">Normalize, review, select, approve and roll back an annual roster batch.</p>
+      <h1 class="text-2xl font-bold text-slate-900">PowerSchool Import</h1>
+      <p class="text-sm text-slate-500 mt-1">Preflight, normalize, review, select, approve and roll back a roster batch.</p>
     </div>
     <div class="flex flex-wrap gap-2">
       <a href="{{ url_for('powerschool_import_guide') }}"
@@ -29,17 +29,35 @@
     <div class="flex items-start justify-between gap-4 mb-5">
       <div>
         <h2 class="font-semibold text-slate-800">1. Upload the three saved PowerSchool exports</h2>
-        <p class="text-xs text-slate-500 mt-1">Files remain private, are normalized once, and are purged after apply or expiry.</p>
+        <p class="text-xs text-slate-500 mt-1">Files remain private; every analysis is immutable and raw uploads are purged after apply or expiry.</p>
       </div>
       <div class="flex flex-wrap gap-2">
         <a href="{{ url_for('static', filename='templates/powerschool-transportation-v1.csv') }}" download
            class="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:text-blue-700">
-          <i class="fas fa-download mr-1"></i>Transportation template
+          <i class="fas fa-download mr-1"></i>Transportation contract
         </a>
-        <a href="{{ url_for('static', filename='templates/powerschool-contacts-v1.csv') }}" download
+        <a href="{{ url_for('static', filename='templates/powerschool-student-contacts-v1.csv') }}" download
            class="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:text-blue-700">
-          <i class="fas fa-download mr-1"></i>Contacts template
+          <i class="fas fa-download mr-1"></i>Student contract
         </a>
+        <a href="{{ url_for('static', filename='templates/powerschool-guardian-contacts-v1.csv') }}" download
+           class="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:text-blue-700">
+          <i class="fas fa-download mr-1"></i>Guardian contract
+        </a>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-5" aria-label="Required preflight checks">
+      <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+        <div class="text-xs font-semibold text-slate-700"><i class="fas fa-bus mr-1 text-blue-600"></i>Transportation is authoritative</div>
+        <p class="text-[11px] text-slate-500 mt-1">It must contain valid student, bus and route assignments. A header-only or route-empty export is blocked.</p>
+      </div>
+      <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
+        <div class="text-xs font-semibold text-slate-700"><i class="fas fa-address-book mr-1 text-indigo-600"></i>Keep contacts separated</div>
+        <p class="text-[11px] text-slate-500 mt-1">Upload Student and Guardian exports in their labeled fields. Source sentinel IDs such as <code>0</code> are handled by file role.</p>
+      </div>
+      <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+        <div class="text-xs font-semibold text-emerald-800"><i class="fas fa-shield-halved mr-1"></i>Delta is the safe default</div>
+        <p class="text-[11px] text-emerald-700 mt-1">Analysis never imports data. Use a complete snapshot only after independently proving full-district scope.</p>
       </div>
     </div>
     <form id="upload-form" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -51,10 +69,11 @@
       </label>
       <label class="block">
         <span class="block text-xs font-semibold text-slate-600 mb-1.5">Import policy</span>
-        <select name="snapshot_type" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white">
+        <select id="snapshot-type" name="snapshot_type" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white">
           <option value="delta">Delta — never propose deactivation</option>
           <option value="full_district">Complete district snapshot</option>
         </select>
+        <span id="full-snapshot-warning" class="hidden mt-1 text-[11px] font-medium text-amber-700">Use only after reconciling a complete district export. Missing students can become deactivation candidates.</span>
       </label>
       <label class="block">
         <span class="block text-xs font-semibold text-slate-600 mb-1.5">Mapping profile</span>
@@ -97,7 +116,7 @@
         </label>
       </div>
       <div class="md:col-span-2 xl:col-span-3 flex items-center justify-between gap-3 pt-1">
-        <p class="text-xs text-slate-400">Identity is based only on <code>student_number</code> and stable contact IDs.</p>
+        <p class="text-xs text-slate-400">Do not edit source IDs. Student sentinel IDs and guardian placeholder rows are normalized by source role; PII is never used as identity.</p>
         <button id="analyze-button" type="submit" class="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-sm font-semibold">
           <i class="fas fa-magnifying-glass mr-1"></i>Analyze and normalize
         </button>
@@ -105,8 +124,38 @@
     </form>
   </section>
 
+  <section id="preflight-result" class="hidden rounded-2xl border p-5" aria-live="polite">
+    <div class="flex items-start gap-3">
+      <i id="preflight-icon" class="fas fa-clipboard-check mt-0.5"></i>
+      <div class="min-w-0 flex-1">
+        <h2 id="preflight-title" class="font-semibold"></h2>
+        <p id="preflight-message" class="text-sm mt-1"></p>
+        <div id="preflight-metrics" class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3"></div>
+        <ul id="preflight-details" class="mt-3 space-y-1 text-xs list-disc pl-5"></ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="existing-analysis-actions" class="hidden rounded-2xl border border-amber-200 bg-amber-50 p-5">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <h2 class="font-semibold text-amber-900">These files already have an analysis</h2>
+        <p id="existing-analysis-message" class="text-sm text-amber-800 mt-1"></p>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <button id="open-existing-analysis" type="button" class="px-3 py-2 border border-amber-300 bg-white text-amber-800 rounded-xl text-sm font-semibold hover:bg-amber-100">
+          <i class="fas fa-folder-open mr-1"></i>Open existing analysis
+        </button>
+        <button id="reanalyze-files" type="button" class="px-3 py-2 bg-amber-700 hover:bg-amber-800 text-white rounded-xl text-sm font-semibold">
+          <i class="fas fa-rotate mr-1"></i>Re-analyze against current state
+        </button>
+      </div>
+    </div>
+    <p class="text-xs text-amber-700 mt-3">Re-analysis creates a new immutable batch using the current mapping and application state. It does not import or overwrite the previous batch.</p>
+  </section>
+
   <section id="review-section" class="hidden space-y-4">
-    <div id="summary-cards" class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3"></div>
+    <div id="summary-cards" class="grid grid-cols-2 md:grid-cols-5 xl:grid-cols-10 gap-3"></div>
 
     <div class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
       <div class="p-4 border-b border-slate-100 space-y-3">
@@ -142,7 +191,14 @@
           <tbody id="review-body" class="divide-y divide-slate-100"></tbody>
         </table>
       </div>
-      <div class="px-4 py-3 border-t border-slate-100 text-xs text-slate-500"><span id="visible-count">0</span> rows shown</div>
+      <div class="px-4 py-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+        <span id="visible-count">0 rows shown</span>
+        <div class="flex items-center gap-2" aria-label="Review table pages">
+          <button id="review-prev-page" type="button" class="px-2.5 py-1.5 border border-slate-200 rounded-lg disabled:opacity-40 hover:border-blue-300">Previous</button>
+          <span id="review-page-label" class="min-w-24 text-center">Page 1 of 1</span>
+          <button id="review-next-page" type="button" class="px-2.5 py-1.5 border border-slate-200 rounded-lg disabled:opacity-40 hover:border-blue-300">Next</button>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -172,6 +228,9 @@
   const canRollback = {{ 'true' if can_rollback else 'false' }};
   let batch = null;
   let selectionDirty = false;
+  let existingAnalysis = null;
+  let reviewPage = 1;
+  const reviewPageSize = 250;
 
   const byId = id => document.getElementById(id);
   const node = (tag, text, classes) => {
@@ -192,9 +251,92 @@
   const requestJson = async (url, options={}) => {
     const response = await fetch(url, options);
     const data = await response.json().catch(() => ({ok:false, message:'Invalid server response.'}));
-    if (!response.ok || !data.ok) throw new Error(data.message || `Request failed (${response.status}).`);
+    if (!response.ok || !data.ok) {
+      const error = new Error(data.message || `Request failed (${response.status}).`);
+      error.payload = data;
+      error.status = response.status;
+      throw error;
+    }
     return data;
   };
+
+  const readableLabel = value => String(value || '')
+    .replaceAll('_', ' ').replace(/\b\w/g, character => character.toUpperCase());
+
+  function preflightMessages(preflight) {
+    if (!preflight || typeof preflight !== 'object') return [];
+    const messages = [];
+    ['blocking_errors', 'errors', 'warnings', 'messages'].forEach(key => {
+      const values = Array.isArray(preflight[key]) ? preflight[key] : [];
+      values.forEach(value => {
+        if (typeof value === 'string') messages.push(value);
+        else if (value && typeof value.message === 'string') messages.push(value.message);
+      });
+    });
+    return [...new Set(messages)];
+  }
+
+  function renderPreflight(payload, blocking=false) {
+    const preflight = payload && payload.preflight;
+    const metrics = (payload && payload.metrics) || (preflight && preflight.metrics);
+    const hasPreflight = preflight && Object.keys(preflight).length > 0;
+    const hasMetrics = metrics && Object.keys(metrics).length > 0;
+    if (!hasPreflight && !hasMetrics && !(payload && payload.code)) return;
+    const section = byId('preflight-result');
+    section.classList.remove('hidden');
+    section.className = `rounded-2xl border p-5 ${blocking ? 'border-red-200 bg-red-50 text-red-800' : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`;
+    byId('preflight-icon').className = `fas ${blocking ? 'fa-circle-xmark' : 'fa-circle-check'} mt-0.5`;
+    byId('preflight-title').textContent = blocking ? 'Preflight blocked this analysis' : 'Preflight completed';
+    byId('preflight-message').textContent = blocking
+      ? 'No records were imported. Correct the source export and analyze again.'
+      : 'The source files passed the blocking checks. Reconcile the metrics before selecting rows.';
+    const transportation = (metrics && metrics.transportation) || {};
+    const contacts = (metrics && metrics.contacts) || {};
+    const metricValues = [
+      ['Transportation rows', preflight && preflight.transport_rows !== undefined ? preflight.transport_rows : transportation.input_rows],
+      ['Valid assignments', preflight && preflight.valid_transport_rows !== undefined ? preflight.valid_transport_rows : transportation.accepted_rows],
+      ['Valid students', preflight && preflight.valid_students !== undefined ? preflight.valid_students : transportation.valid_students],
+      ['Transport rejected', transportation.rejected_rows],
+      ['Contact rows', contacts.input_rows],
+      ['Contacts not processed', contacts.not_processed_rows],
+      ['Contacts accepted', contacts.accepted_rows],
+      ['Placeholders ignored', contacts.ignored_placeholder_rows],
+      ['Student overlaps ignored', contacts.ignored_guardian_student_overlap_rows],
+      ['Guardian ID 0 anomalies', contacts.ignored_guardian_zero_anomaly_rows],
+      ['Invalid email rows', contacts.invalid_email_rows],
+      ['Contact warnings', contacts.warning_rows],
+      ['Contact conflicts', contacts.conflict_rows],
+      ['Contacts rejected', contacts.rejected_rows]
+    ].filter(([, value]) => value !== undefined && value !== null);
+    const metricNodes = metricValues.map(([label, value]) => {
+      const card = node('div', null, 'rounded-lg border border-current/20 bg-white/70 px-3 py-2');
+      card.append(node('div', value, 'font-bold'), node('div', readableLabel(label), 'text-[11px] opacity-80'));
+      return card;
+    });
+    byId('preflight-metrics').replaceChildren(...metricNodes);
+    const messages = preflightMessages(preflight);
+    if (payload && payload.code) messages.unshift(`Validation code: ${payload.code}`);
+    byId('preflight-details').replaceChildren(...messages.slice(0, 12).map(message => node('li', message)));
+  }
+
+  function hideExistingAnalysis() {
+    existingAnalysis = null;
+    byId('existing-analysis-actions').classList.add('hidden');
+  }
+
+  function hidePreflight() {
+    byId('preflight-result').classList.add('hidden');
+  }
+
+  function offerExistingAnalysis(payload) {
+    existingAnalysis = payload;
+    const section = byId('existing-analysis-actions');
+    section.classList.remove('hidden');
+    byId('existing-analysis-message').textContent = `Batch ${payload.existing_batch_id} is ${payload.existing_status || 'available'}. Choose whether to open it or create a fresh comparison.`;
+    byId('open-existing-analysis').disabled = payload.can_open === false;
+    byId('reanalyze-files').disabled = payload.reanalyze_allowed === false;
+    section.scrollIntoView({behavior:'smooth', block:'center'});
+  }
 
   function updateContactMode() {
     const split = byId('contacts-mode').value === 'powerschool_split';
@@ -213,12 +355,20 @@
   byId('contacts-mode').addEventListener('change', updateContactMode);
   updateContactMode();
 
+  function updateSnapshotWarning() {
+    byId('full-snapshot-warning').classList.toggle('hidden', byId('snapshot-type').value !== 'full_district');
+  }
+  byId('snapshot-type').addEventListener('change', updateSnapshotWarning);
+  updateSnapshotWarning();
+
   function renderSummary() {
+    const contactMetrics = (batch.metrics && batch.metrics.contacts) || {};
     const cards = [
-      ['Total', batch.total, 'text-slate-800'], ['Selected', batch.selected, 'text-emerald-600'],
+      ['Review rows', batch.total, 'text-slate-800'], ['Selected', batch.selected, 'text-emerald-600'],
       ['Excluded', batch.excluded, 'text-slate-500'], ['Rejected', batch.rejected, 'text-red-600'],
       ['New', batch.counts.new || 0, 'text-blue-600'], ['Updates', batch.counts.update || 0, 'text-indigo-600'],
-      ['Unchanged', batch.counts.unchanged || 0, 'text-slate-500'], ['Conflicts', batch.counts.conflict || 0, 'text-amber-600']
+      ['Unchanged', batch.counts.unchanged || 0, 'text-slate-500'], ['Source ignored', contactMetrics.ignored_rows || batch.counts.ignored || 0, 'text-sky-600'],
+      ['Warnings', batch.counts.warning || 0, 'text-amber-600'], ['Conflicts', batch.counts.conflict || 0, 'text-red-600']
     ];
     byId('summary-cards').replaceChildren(...cards.map(([label,value,color]) => {
       const card = node('div', null, 'bg-white border border-slate-200 rounded-xl p-3 text-center');
@@ -254,7 +404,11 @@
   function renderRows() {
     const body = byId('review-body');
     const visible = batch.rows.filter(rowAllowed);
-    body.replaceChildren(...visible.map(row => {
+    const pageCount = Math.max(1, Math.ceil(visible.length / reviewPageSize));
+    reviewPage = Math.min(Math.max(1, reviewPage), pageCount);
+    const firstIndex = (reviewPage - 1) * reviewPageSize;
+    const pageRows = visible.slice(firstIndex, firstIndex + reviewPageSize);
+    body.replaceChildren(...pageRows.map(row => {
       const data = row.data || {};
       const tr = node('tr', null, 'hover:bg-slate-50 align-top'); tr.dataset.rowId = row.id;
       const use = node('td', null, 'px-3 py-3');
@@ -281,12 +435,22 @@
       else messages.slice(0, 6).forEach(message => details.append(node('div', message, 'mb-1 break-words')));
       tr.append(use, status, student, school, group, details); return tr;
     }));
-    byId('visible-count').textContent = visible.length;
+    const firstShown = visible.length ? firstIndex + 1 : 0;
+    const lastShown = Math.min(firstIndex + pageRows.length, visible.length);
+    byId('visible-count').textContent = `${firstShown}–${lastShown} of ${visible.length} matching rows`;
+    byId('review-page-label').textContent = `Page ${reviewPage} of ${pageCount}`;
+    byId('review-prev-page').disabled = reviewPage <= 1;
+    byId('review-next-page').disabled = reviewPage >= pageCount;
   }
 
   function presentBatch(data) {
     batch = data;
     selectionDirty = false;
+    reviewPage = 1;
+    byId('confirm-deactivations').checked = false;
+    hideExistingAnalysis();
+    hidePreflight();
+    renderPreflight(data, false);
     byId('review-section').classList.remove('hidden');
     byId('report-link').classList.remove('hidden'); byId('report-link').classList.add('inline-flex');
     byId('report-link').href = `${batchBase}${encodeURIComponent(batch.batch_id)}/report.csv`;
@@ -305,15 +469,67 @@
     byId('review-section').scrollIntoView({behavior:'smooth', block:'start'});
   }
 
-  byId('upload-form').addEventListener('submit', async event => {
-    event.preventDefault(); const button = byId('analyze-button'); button.disabled = true;
-    showNotice('Uploading, validating and creating an immutable normalized stage…');
-    try { presentBatch(await requestJson(previewUrl, {method:'POST', body:new FormData(event.currentTarget)})); showNotice('Analysis complete. Review every classification before approval.', 'success'); }
-    catch (error) { showNotice(error.message, 'error'); }
-    finally { button.disabled = false; }
+  async function analyze(formData, reanalysis=false) {
+    const button = byId('analyze-button');
+    button.disabled = true;
+    byId('reanalyze-files').disabled = true;
+    hidePreflight();
+    showNotice(reanalysis
+      ? 'Re-running preflight against the current mapping and application state…'
+      : 'Uploading and running blocking preflight checks…');
+    try {
+      const result = await requestJson(previewUrl, {method:'POST', body:formData});
+      presentBatch(result);
+      showNotice('Analysis complete. Review every classification and preflight metric before approval.', 'success');
+    } catch (error) {
+      const payload = error.payload || {};
+      showNotice(error.message, 'error');
+      renderPreflight(payload, true);
+      if (error.status === 409 && payload.existing_batch_id) offerExistingAnalysis(payload);
+    } finally {
+      button.disabled = false;
+      if (existingAnalysis) byId('reanalyze-files').disabled = existingAnalysis.reanalyze_allowed === false;
+    }
+  }
+
+  byId('upload-form').addEventListener('submit', event => {
+    event.preventDefault();
+    hideExistingAnalysis();
+    analyze(new FormData(event.currentTarget));
   });
 
-  ['filter-search','filter-status','filter-school','filter-grade','filter-group','filter-problem'].forEach(id => byId(id).addEventListener('input', renderRows));
+  byId('open-existing-analysis').addEventListener('click', async () => {
+    if (!existingAnalysis || existingAnalysis.can_open === false) return;
+    const button = byId('open-existing-analysis'); button.disabled = true;
+    try {
+      presentBatch(await requestJson(`${batchBase}${encodeURIComponent(existingAnalysis.existing_batch_id)}`));
+      showNotice('Existing immutable analysis opened. Review its status and rows before taking action.', 'success');
+    } catch (error) {
+      showNotice(error.message, 'error');
+      button.disabled = false;
+    }
+  });
+
+  byId('reanalyze-files').addEventListener('click', () => {
+    if (!existingAnalysis || existingAnalysis.reanalyze_allowed === false) return;
+    const formData = new FormData(byId('upload-form'));
+    formData.set('force_reanalyze', '1');
+    analyze(formData, true);
+  });
+
+  ['filter-search','filter-status','filter-school','filter-grade','filter-group','filter-problem'].forEach(id => byId(id).addEventListener('input', () => {
+    reviewPage = 1;
+    renderRows();
+  }));
+
+  byId('review-prev-page').addEventListener('click', () => {
+    reviewPage -= 1;
+    renderRows();
+  });
+  byId('review-next-page').addEventListener('click', () => {
+    reviewPage += 1;
+    renderRows();
+  });
 
   byId('save-selection').addEventListener('click', async () => {
     const regular = [], deactivations = [];

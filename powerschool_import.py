@@ -18,6 +18,8 @@ from collections import defaultdict
 
 EMAIL_RE = re.compile(r"^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
+NORMALIZER_REVISION = "2026-08-27.1"
+STUDENT_SELF_CONTACT_ID = "student-self"
 ROUTE_RE = re.compile(
     r"^([A-Z]+(?:\s+[A-Z]+)*)\s*0*([0-9]+)\s*(AM|MD|PM|A|P)?$",
     re.IGNORECASE,
@@ -285,6 +287,36 @@ def _normalize_period(value, aliases):
     return aliases.get(raw)
 
 
+def _new_row_metrics(input_rows):
+    return {
+        "input_rows": input_rows,
+        "accepted_rows": 0,
+        "duplicate_rows": 0,
+        "conflict_rows": 0,
+        "rejected_rows": 0,
+        "ignored_rows": 0,
+        "warning_rows": 0,
+    }
+
+
+def _contact_has_payload(row, resolved):
+    """Return whether a source row contains anything beyond its student key.
+
+    BrightArrow emits one empty guardian placeholder for some students. Those
+    rows are not contacts and must not be converted into identities. The check
+    deliberately considers only mapped fields and never derives an identity
+    from names, email addresses, or phone numbers.
+    """
+    return any(
+        normalize_text(value)
+        for canonical in (
+            "first_name", "last_name", "relationship", "email", "phone",
+            "notification_preference", "priority",
+        )
+        for value in _values(row, resolved, canonical)
+    )
+
+
 def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows,
                           max_columns, contact_sources=None):
     files = mapping.get("files") or {}
@@ -341,6 +373,7 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
     students = {}
     row_issues = []
     seen_transport = set()
+    transportation_metrics = _new_row_metrics(len(transport_rows))
     for row_number, row in transport_rows:
         student_number = normalize_identifier(_first(row, transport_map, "student_number"))
         route = normalize_route(_first(row, transport_map, "route"))
@@ -358,6 +391,7 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
         if period_raw and not period:
             errors.append("period is not a configured AM/MD/PM alias")
         if errors:
+            transportation_metrics["rejected_rows"] += 1
             row_issues.append({
                 "file": "transportation", "row_number": row_number,
                 "classification": "rejected", "errors": errors,
@@ -366,6 +400,7 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
         route_key = f"{route['prefix']}|{route['number']}"
         duplicate_key = (student_number, route_key, period or "ALL")
         if duplicate_key in seen_transport:
+            transportation_metrics["duplicate_rows"] += 1
             row_issues.append({
                 "file": "transportation", "row_number": row_number,
                 "classification": "duplicate",
@@ -373,6 +408,7 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             })
             continue
         seen_transport.add(duplicate_key)
+        transportation_metrics["accepted_rows"] += 1
         proposal = students.setdefault(student_number, {
             "student_number": student_number,
             "student_id": normalize_identifier(_first(row, transport_map, "student_id")),
@@ -401,17 +437,112 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             elif incoming:
                 proposal[field] = incoming
 
+    transportation_metrics.update({
+        "valid_assignments": len(seen_transport),
+        "valid_students": len(students),
+    })
+    valid_transport_rows = transportation_metrics["accepted_rows"]
+    preflight = {
+        "ok": bool(valid_transport_rows),
+        "errors": [] if valid_transport_rows else [
+            "No valid bus assignments were found. Verify that the PowerSchool "
+            "Transportation export contains populated student_number and "
+            "busnumber values before processing contacts."
+        ],
+        "warnings": [],
+        "transport_rows": len(transport_rows),
+        "valid_transport_rows": valid_transport_rows,
+        "valid_students": len(students),
+        "transportation": dict(transportation_metrics),
+    }
+
     seen_contacts = {}
-    for source in parsed_contact_sources:
+    contact_metrics = _new_row_metrics(total_contact_rows)
+    contact_metrics.update({
+        "invalid_email_rows": 0,
+        "invalid_email_values": 0,
+        "ignored_placeholder_rows": 0,
+        "ignored_guardian_student_overlap_rows": 0,
+        "ignored_guardian_zero_anomaly_rows": 0,
+        "student_self_identity_rows": 0,
+    })
+    source_metrics = {
+        source["key"]: {
+            **_new_row_metrics(len(source["rows"])),
+            "invalid_email_rows": 0,
+            "invalid_email_values": 0,
+            "ignored_placeholder_rows": 0,
+            "ignored_guardian_student_overlap_rows": 0,
+            "ignored_guardian_zero_anomaly_rows": 0,
+            "student_self_identity_rows": 0,
+            "not_processed_rows": len(source["rows"]) if not students else 0,
+        }
+        for source in parsed_contact_sources
+    }
+    contact_metrics["not_processed_rows"] = total_contact_rows if not students else 0
+    for source in (parsed_contact_sources if students else []):
         contact_map = source["mapping"]
+        current_metrics = source_metrics[source["key"]]
         for row_number, row in source["rows"]:
             student_number = normalize_identifier(
                 _first(row, contact_map, "student_number"))
-            contact_id = normalize_identifier(_first(row, contact_map, "contact_id"))
+            contact_ids = []
+            for value in _values(row, contact_map, "contact_id"):
+                normalized_contact_id = normalize_identifier(value)
+                if normalized_contact_id:
+                    contact_ids.append(normalized_contact_id)
+            contact_id = next(
+                (value for value in contact_ids if value != "0"),
+                contact_ids[0] if contact_ids else "",
+            )
+            raw_relationship = normalize_text(
+                _first(row, contact_map, "relationship"), 40).lower()
+
+            if not contact_id and not _contact_has_payload(row, contact_map):
+                current_metrics["ignored_rows"] += 1
+                current_metrics["ignored_placeholder_rows"] += 1
+                contact_metrics["ignored_rows"] += 1
+                contact_metrics["ignored_placeholder_rows"] += 1
+                continue
+
+            is_split_student = bool(
+                split_contacts and source["force_relationship"] == "student")
+            is_split_guardian = bool(
+                split_contacts and not source["force_relationship"]
+                and source["default_relationship"] == "guardian")
+            if contact_id == "0" and is_split_student:
+                # BrightArrow uses zero for the student's own contact in this
+                # export. A constant semantic key, scoped by student_number by
+                # the importer, is stable and contains no contact PII.
+                contact_id = STUDENT_SELF_CONTACT_ID
+                current_metrics["student_self_identity_rows"] += 1
+                contact_metrics["student_self_identity_rows"] += 1
+            elif contact_id == "0" and is_split_guardian:
+                # The guardian export also contains the student-self row. Do
+                # not relabel the reserved zero sentinel as a guardian or let
+                # it collide with the corresponding Student Contacts export.
+                current_metrics["ignored_rows"] += 1
+                current_metrics["ignored_guardian_student_overlap_rows"] += 1
+                contact_metrics["ignored_rows"] += 1
+                contact_metrics["ignored_guardian_student_overlap_rows"] += 1
+                if raw_relationship:
+                    current_metrics["ignored_guardian_zero_anomaly_rows"] += 1
+                    contact_metrics["ignored_guardian_zero_anomaly_rows"] += 1
+                    current_metrics["warning_rows"] += 1
+                    contact_metrics["warning_rows"] += 1
+                    row_issues.append({
+                        "file": source["key"], "row_number": row_number,
+                        "classification": "warning",
+                        "errors": [
+                            "guardian row used reserved contact_id 0 with a "
+                            "relationship and was safely ignored"
+                        ],
+                    })
+                continue
+
             email, invalid_emails = normalize_email_values(
                 _values(row, contact_map, "email"))
-            relationship = normalize_text(
-                _first(row, contact_map, "relationship"), 40).lower()
+            relationship = raw_relationship
             if source["force_relationship"]:
                 relationship = source["force_relationship"]
             elif not relationship:
@@ -431,6 +562,16 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
                 "priority": normalize_text(
                     _first(row, contact_map, "priority"), 20),
             }
+            email_warning = None
+            if invalid_emails:
+                email_warning = (
+                    "invalid email value(s) were omitted; valid contact data "
+                    "was retained"
+                )
+                current_metrics["invalid_email_rows"] += 1
+                current_metrics["invalid_email_values"] += len(invalid_emails)
+                contact_metrics["invalid_email_rows"] += 1
+                contact_metrics["invalid_email_values"] += len(invalid_emails)
             errors = []
             if not student_number:
                 errors.append("student_number is required")
@@ -440,18 +581,26 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
                 errors.append("contact_id is required; PII cannot be used as identity")
             elif not IDENTIFIER_RE.fullmatch(contact_id):
                 errors.append("contact_id contains unsupported characters")
-            if invalid_emails:
-                errors.append("one or more email addresses are invalid")
             if len(email) > 500:
                 errors.append("normalized email addresses exceed the 500-character limit")
             if not contact["first_name"] and not contact["email"] and not contact["phone"]:
                 errors.append("contact has no usable name, email, or phone")
             if errors:
+                current_metrics["rejected_rows"] += 1
+                contact_metrics["rejected_rows"] += 1
                 row_issues.append({
                     "file": source["key"], "row_number": row_number,
                     "classification": "rejected", "errors": errors,
                 })
                 continue
+            if invalid_emails:
+                current_metrics["warning_rows"] += 1
+                contact_metrics["warning_rows"] += 1
+                row_issues.append({
+                    "file": source["key"], "row_number": row_number,
+                    "classification": "warning",
+                    "errors": [email_warning],
+                })
             key = (student_number, contact_id)
             canonical = json.dumps(contact, sort_keys=True, separators=(",", ":"))
             if key in seen_contacts:
@@ -462,12 +611,16 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
                     "classification": classification,
                     "errors": [f"contact_id is repeated with {classification} values"],
                 })
+                current_metrics[classification + "_rows"] += 1
+                contact_metrics[classification + "_rows"] += 1
                 if classification == "conflict":
                     students[student_number].setdefault("conflicts", []).append(
                         "contacts contain conflicting values for one contact_id")
                 continue
             seen_contacts[key] = canonical
             students[student_number]["contacts"].append(contact)
+            current_metrics["accepted_rows"] += 1
+            contact_metrics["accepted_rows"] += 1
 
     normalized = []
     for student_number in sorted(students):
@@ -507,10 +660,49 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
         file_metadata[source["key"]] = {
             "headers": source["headers"], "rows": len(source["rows"]),
         }
+    if transportation_metrics["rejected_rows"]:
+        preflight["warnings"].append(
+            f'{transportation_metrics["rejected_rows"]} Transportation row(s) '
+            "could not be normalized."
+        )
+    if students and not contact_metrics["accepted_rows"]:
+        preflight["warnings"].append(
+            "No usable contact rows were accepted; transportation records may "
+            "still be reviewed, but no recipient contact data will be updated."
+        )
+    if contact_metrics["ignored_placeholder_rows"]:
+        preflight["warnings"].append(
+            f'{contact_metrics["ignored_placeholder_rows"]} empty contact '
+            "placeholder row(s) were safely ignored."
+        )
+    if contact_metrics["ignored_guardian_student_overlap_rows"]:
+        preflight["warnings"].append(
+            f'{contact_metrics["ignored_guardian_student_overlap_rows"]} '
+            "student-self row(s) repeated in Guardian Contacts were safely ignored."
+        )
+    if contact_metrics["ignored_guardian_zero_anomaly_rows"]:
+        preflight["warnings"].append(
+            f'{contact_metrics["ignored_guardian_zero_anomaly_rows"]} Guardian '
+            "Contacts row(s) used reserved contact_id 0 with a relationship; "
+            "they were ignored and should be reviewed in PowerSchool."
+        )
+    if contact_metrics["invalid_email_rows"]:
+        preflight["warnings"].append(
+            f'{contact_metrics["invalid_email_rows"]} contact row(s) contained '
+            "invalid email values; invalid values were omitted."
+        )
+    metrics = {
+        "transportation": transportation_metrics,
+        "contacts": contact_metrics,
+        "contact_sources": source_metrics,
+    }
     return {
         "students": normalized,
         "issues": row_issues,
         "files": file_metadata,
+        "metrics": metrics,
+        "preflight": preflight,
+        "normalizer_revision": NORMALIZER_REVISION,
         "combined_sha256": combined_sha,
     }
 

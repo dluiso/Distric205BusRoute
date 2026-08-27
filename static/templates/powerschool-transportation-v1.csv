@@ -1,1 +1,1 @@
-student_number,student_id,household_id,first_name,last_name,school,grade,route,stop,period,transport_status,school_year,source_id
+"TRANSPORTATION.student_number","TRANSPORTATION.student_dcid","TRANSPORTATION.studentfname","TRANSPORTATION.studentlname","TRANSPORTATION.schoolid","TRANSPORTATION.grade_level","TRANSPORTATION.busnumber","TRANSPORTATION.stopnumber","TRANSPORTATION.fromto","TRANSPORTATION.ride_on_enabledToday"

@@ -26,7 +26,12 @@
 
   <section class="bg-blue-50 border border-blue-200 rounded-2xl p-5">
     <h2 class="font-semibold text-blue-900"><i class="fas fa-circle-info mr-2"></i>Why there are three files</h2>
-    <p class="text-sm text-blue-800 mt-2">PowerSchool separates the student contact record from parent and guardian contacts. Use all three saved templates below. The application joins them by stable student and contact identifiers; no one should manually merge the files.</p>
+    <p class="text-sm text-blue-800 mt-2">Transportation determines which students can be assigned to buses. The other two exports identify direct-student and guardian notification destinations. BrightArrow sources can contain sentinel contact IDs, duplicate pseudo-contact rows and empty placeholders; keep the files separated so the application can interpret each row by its source role. Never merge or repair them manually.</p>
+  </section>
+
+  <section class="bg-red-50 border border-red-200 rounded-2xl p-5">
+    <h2 class="font-semibold text-red-900"><i class="fas fa-ban mr-2"></i>Blocking gate: verify Transportation first</h2>
+    <p class="text-sm text-red-800 mt-2">Do not proceed when Transportation is header-only, contains no valid bus assignments, or has blank <code>busnumber</code> values. The importer will stop before staging thousands of secondary contact errors. A large contacts export cannot compensate for an incomplete Transportation export.</p>
   </section>
 
   <section class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5 space-y-4">
@@ -39,9 +44,9 @@
       <table class="w-full text-sm border-separate border-spacing-0">
         <thead><tr class="text-left text-xs uppercase text-slate-500"><th class="p-3 border-b">Saved template</th><th class="p-3 border-b">PowerSchool source</th><th class="p-3 border-b">Expected filename</th></tr></thead>
         <tbody class="divide-y divide-slate-100">
-          <tr><td class="p-3 font-semibold text-slate-800">D205 BusRoute - Transportation v1</td><td class="p-3 text-slate-600">BrightArrow Transportation Current Day Bussing</td><td class="p-3 font-mono text-xs">D205_BusRoute_Transportation_v1.csv</td></tr>
-          <tr><td class="p-3 font-semibold text-slate-800">D205 BusRoute - Student Contacts v1</td><td class="p-3 text-slate-600">BrightArrow - Basic - Students Combined</td><td class="p-3 font-mono text-xs">D205_BusRoute_Student_Contacts_v1.csv</td></tr>
-          <tr><td class="p-3 font-semibold text-slate-800">D205 BusRoute - Guardian Contacts v1</td><td class="p-3 text-slate-600">BrightArrow - Basic - Parents Combined</td><td class="p-3 font-mono text-xs">D205_BusRoute_Guardian_Contacts_v1.csv</td></tr>
+          <tr><td class="p-3 font-semibold text-slate-800">D205 BusRoute - Transportation v1</td><td class="p-3 text-slate-600">BrightArrow Transportation Current Day Bussing<br><span class="text-xs text-slate-400">10-column contract</span></td><td class="p-3 font-mono text-xs">D205_BusRoute_Transportation_v1.csv</td></tr>
+          <tr><td class="p-3 font-semibold text-slate-800">D205 BusRoute - Student Contacts v1</td><td class="p-3 text-slate-600">BrightArrow - Basic - Students Combined<br><span class="text-xs text-slate-400">18-column contract</span></td><td class="p-3 font-mono text-xs">D205_BusRoute_Student_Contacts_v1.csv</td></tr>
+          <tr><td class="p-3 font-semibold text-slate-800">D205 BusRoute - Guardian Contacts v1</td><td class="p-3 text-slate-600">BrightArrow - Basic - Parents Combined<br><span class="text-xs text-slate-400">18-column contract</span></td><td class="p-3 font-mono text-xs">D205_BusRoute_Guardian_Contacts_v1.csv</td></tr>
         </tbody>
       </table>
     </div>
@@ -52,7 +57,7 @@
       <h2 class="text-lg font-semibold text-slate-800">2. Run each export</h2>
       <ol class="mt-3 space-y-2 text-sm text-slate-600 list-decimal pl-5">
         <li>Open the saved template and confirm its name and data source match this guide.</li>
-        <li>Export <strong>all rows</strong> for the same district scope and school year.</li>
+        <li>Confirm the PowerSchool context, school year and <strong>Export All Rows</strong> before every export.</li>
         <li>Keep the saved format: comma delimiter, CR/LF line endings, UTF-8, headers included and values quoted.</li>
         <li>Run the Transportation template <strong>before 6:00 PM</strong>; its PowerSchool source changes to the next service day after 6:00 PM.</li>
         <li>Save with the expected filename. Do not open and resave the CSV in Excel because stable IDs and leading zeroes can change.</li>
@@ -64,23 +69,57 @@
         <li>Treat every file as confidential student and guardian information.</li>
         <li>Do not email, schedule, or place exports in a shared or public folder.</li>
         <li>Confirm all three files were created on the same date and belong to the intended school year.</li>
+        <li>Open each file only with a plain-text/CSV viewer and compare the header to the downloadable contract; do not save it.</li>
+        <li>Transportation must contain a plausible population and populated student and bus values before upload.</li>
         <li>Do not rename columns, delete identifiers, combine sheets, or edit individual records in the CSV.</li>
         <li>If counts or scope are uncertain, stop and obtain a corrected export before selecting a complete district snapshot.</li>
       </ul>
     </div>
   </section>
 
+  <section class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5 space-y-4">
+    <div>
+      <h2 class="text-lg font-semibold text-slate-800">4. Exact saved-template contracts</h2>
+      <p class="text-sm text-slate-600 mt-1">Order the selected columns exactly as shown. The downloadable header-only contracts can be used for comparison, but must not be uploaded as district data.</p>
+    </div>
+    <div class="grid grid-cols-1 xl:grid-cols-3 gap-4">
+      <div class="rounded-xl border border-slate-200 p-4">
+        <h3 class="text-sm font-semibold text-slate-800">Transportation — 10 columns</h3>
+        <ol class="mt-2 text-xs text-slate-600 space-y-1 list-decimal pl-5 font-mono break-all">
+          <li>TRANSPORTATION.student_number</li><li>TRANSPORTATION.student_dcid</li><li>TRANSPORTATION.studentfname</li><li>TRANSPORTATION.studentlname</li><li>TRANSPORTATION.schoolid</li><li>TRANSPORTATION.grade_level</li><li>TRANSPORTATION.busnumber</li><li>TRANSPORTATION.stopnumber</li><li>TRANSPORTATION.fromto</li><li>TRANSPORTATION.ride_on_enabledToday</li>
+        </ol>
+      </div>
+      <div class="rounded-xl border border-slate-200 p-4 xl:col-span-2">
+        <h3 class="text-sm font-semibold text-slate-800">Student and Guardian Contacts — same 18 selected columns</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-x-5">
+          <ol class="mt-2 text-xs text-slate-600 space-y-1 list-decimal pl-5 font-mono break-all">
+            <li>BRIGHTARROW.003_student_number</li><li>BRIGHTARROW.600_00_contact_id</li><li>BRIGHTARROW.600_04_contact_std_detailid</li><li>BRIGHTARROW.600_01_contact_firstname</li><li>BRIGHTARROW.600_02_contact_lastname</li><li>BRIGHTARROW.600_03_contact_relationship</li><li>BRIGHTARROW.601_01_home_phone</li><li>BRIGHTARROW.602_01_phone2</li><li>BRIGHTARROW.603_01_phone3</li>
+          </ol>
+          <ol start="10" class="mt-2 text-xs text-slate-600 space-y-1 list-decimal pl-5 font-mono break-all">
+            <li>BRIGHTARROW.604_01_phone4</li><li>BRIGHTARROW.605_01_phone5</li><li>BRIGHTARROW.606_01_phone6</li><li>BRIGHTARROW.607_01_phone7</li><li>BRIGHTARROW.608_01_phone8</li><li>BRIGHTARROW.609_01_phone9</li><li>BRIGHTARROW.801_email1</li><li>BRIGHTARROW.802_email2</li><li>BRIGHTARROW.803_email3</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+    <div class="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+      <strong>Do not replace source sentinel values.</strong> A Student Contacts row may legitimately use contact ID <code>0</code>; the importer derives a non-PII student identity from its file role and student number. Guardian contact ID <code>0</code> is reserved for overlapping student-self rows and is never imported as a guardian; a nonblank relationship on that ID is reported as an anomaly. Rows containing only a student number are empty placeholders and are also ignored.
+    </div>
+  </section>
+
   <section class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
-    <h2 class="text-lg font-semibold text-slate-800">4. Analyze before importing</h2>
+    <h2 class="text-lg font-semibold text-slate-800">5. Analyze before importing</h2>
     <ol class="mt-3 space-y-2 text-sm text-slate-600 list-decimal pl-5">
       <li>Open the importer and enter the school year in <code>YYYY-YY</code> format.</li>
       <li>Use <strong>Delta</strong> for normal incremental work. Use <strong>Complete district snapshot</strong> only after proving the exports contain the full district population.</li>
       <li>Select <strong>PowerSchool saved templates</strong>, then upload Transportation, Student Contacts and Guardian Contacts in their labeled fields.</li>
-      <li>Choose <strong>Analyze and normalize</strong>. Nothing is imported during analysis.</li>
+      <li>Choose <strong>Analyze and normalize</strong>. Nothing is imported during analysis. A blocking preflight first verifies that Transportation contains usable assignments.</li>
       <li>Review every <code>new</code>, <code>update</code>, <code>unchanged</code>, <code>duplicate</code>, <code>conflict</code> and <code>rejected</code> classification. Filter and exclude any record that should not proceed.</li>
       <li>Save the exact selection, download the review report and reconcile: <code>selected + excluded + rejected = total</code>.</li>
       <li>Apply only after the responsible reviewer approves the plan. Absence from a file never authorizes deletion; deactivation candidates require separate explicit approval.</li>
     </ol>
+    <div class="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-4 text-sm text-blue-800">
+      If the exact files were analyzed before, choose <strong>Open existing analysis</strong> to resume it, or <strong>Re-analyze against current state</strong> to create a separate immutable comparison using the current mapping and application data. Re-analysis never applies the earlier batch and never modifies the uploaded CSVs.
+    </div>
   </section>
 
   <section class="bg-emerald-50 border border-emerald-200 rounded-2xl p-5">

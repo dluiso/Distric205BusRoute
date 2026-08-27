@@ -19,7 +19,8 @@ from urllib.parse import urlsplit
 import click
 import hashlib, hmac, os, json, csv, io, pytz, re, time, secrets, html, math, tempfile, unicodedata
 from powerschool_import import (
-    DEFAULT_MAPPING_V1, ImportValidationError, build_normalized_plan,
+    DEFAULT_MAPPING_V1, NORMALIZER_REVISION, ImportValidationError,
+    build_normalized_plan,
     canonical_plan_hash, safe_csv_cell,
 )
 from email_service import EmailTransportError, SMTPSettings, send_email, verify_connection
@@ -718,6 +719,7 @@ class ImportBatch(db.Model):
     school_year    = db.Column(db.String(20))
     uploaded_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     file_sha256    = db.Column(db.String(64), nullable=False, index=True)
+    analysis_context_sha256 = db.Column(db.String(64), index=True)
     plan_hash      = db.Column(db.String(64), nullable=False)
     total_rows     = db.Column(db.Integer, nullable=False, default=0)
     selected_rows  = db.Column(db.Integer, nullable=False, default=0)
@@ -934,6 +936,7 @@ def _migrate_add_columns():
         ('configuration',           'twilio_sms_cost_per_seg','REAL DEFAULT 0.0079'),
         ('group_bus_assignment',    'schedule_type_id',       'INTEGER'),
         ('user',                    'session_version',        'INTEGER NOT NULL DEFAULT 1'),
+        ('import_batch',            'analysis_context_sha256','VARCHAR(64)'),
     ]
     # Use a separate connection per column so a failed ALTER TABLE (column already
     # exists) never leaves a shared connection in an aborted-transaction state.
@@ -944,6 +947,15 @@ def _migrate_add_columns():
                 conn.commit()
         except Exception:
             pass  # column already exists — safe to ignore
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(text(
+                'CREATE INDEX IF NOT EXISTS '
+                'ix_import_batch_analysis_context_sha256 '
+                'ON import_batch (analysis_context_sha256)'))
+            conn.commit()
+    except Exception:
+        pass
 
 
 def _migrate_email_column():
@@ -1230,6 +1242,8 @@ def _initialize_database_unlocked():
     from sqlalchemy import inspect as sa_inspect
     inspector = sa_inspect(db.engine)
     user_columns = {column['name'] for column in inspector.get_columns('user')}
+    import_batch_columns = {
+        column['name'] for column in inspector.get_columns('import_batch')}
     throttle_columns = ({column['name'] for column in inspector.get_columns('login_throttle')}
                         if 'login_throttle' in inspector.get_table_names() else set())
     required_phase2_tables = {
@@ -1241,6 +1255,8 @@ def _initialize_database_unlocked():
             'throttle_key', 'failed_count', 'window_started_at', 'locked_until'
     }.issubset(throttle_columns):
         raise RuntimeError('Security schema migration did not complete; refusing to start.')
+    if 'analysis_context_sha256' not in import_batch_columns:
+        raise RuntimeError('PowerSchool import schema migration did not complete; refusing to start.')
     if not required_phase2_tables.issubset(set(inspector.get_table_names())):
         raise RuntimeError('Phase 2 additive schema migration did not complete; refusing to start.')
 
@@ -4586,6 +4602,51 @@ def _import_metadata(batch):
         return {}
 
 
+def _powerschool_analysis_context_hash(profile, mapping, combined_file_sha256,
+                                       school_year, snapshot_type):
+    """Bind duplicate detection to every input that can change normalization."""
+    material = {
+        'source_type': 'powerschool',
+        'schema_version': profile.schema_version,
+        'mapping_profile_id': profile.id,
+        'mapping': mapping,
+        'normalizer_revision': NORMALIZER_REVISION,
+        'combined_file_sha256': combined_file_sha256,
+        'school_year': school_year,
+        'snapshot_type': snapshot_type,
+    }
+    canonical = json.dumps(
+        material, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _powerschool_preflight_failure(parsed):
+    """Return a safe blocking diagnosis, or None when staging may continue."""
+    preflight = parsed.get('preflight') or {}
+    valid_transport = int(preflight.get('valid_transport_rows') or 0)
+    errors = preflight.get('errors') or []
+    if valid_transport < 1:
+        return {
+            'code': 'no_valid_transportation_rows',
+            'message': (
+                'Transportation contains no valid bus assignments. '
+                'Re-export it from the approved district-wide PowerSchool '
+                'template and verify that busnumber is populated. No batch '
+                'was created.'),
+            'errors': errors or ['No valid transportation assignments were found.'],
+        }
+    if preflight.get('ok') is False:
+        return {
+            'code': 'powerschool_preflight_failed',
+            'message': (
+                'The PowerSchool exports failed preflight validation. '
+                'No batch was created.'),
+            'errors': errors,
+        }
+    return None
+
+
 def _subscriber_snapshot(subscriber):
     contacts = []
     for contact in sorted(subscriber.contacts, key=lambda item: item.id):
@@ -4840,6 +4901,10 @@ def _powerschool_batch_payload(batch, include_rows=True):
         'total': batch.total_rows, 'selected': batch.selected_rows,
         'excluded': batch.excluded_rows, 'rejected': batch.rejected_rows,
         'counts': metadata.get('counts', {}), 'issues': metadata.get('issues', []),
+        'metrics': metadata.get('metrics', {}),
+        'preflight': metadata.get('preflight', {}),
+        'normalizer_revision': metadata.get('normalizer_revision'),
+        'reanalyzed_from': metadata.get('reanalyzed_from'),
         'created_at': batch.created_at.isoformat() + 'Z',
         'applied_at': batch.applied_at.isoformat() + 'Z' if batch.applied_at else None,
         'rolled_back_at': metadata.get('rolled_back_at'),
@@ -4961,6 +5026,7 @@ def powerschool_import_preview():
     snapshot_type = request.form.get('snapshot_type', 'delta')
     if snapshot_type not in {'delta', 'full_district'}:
         return jsonify({'ok': False, 'message': 'Invalid snapshot policy.'}), 400
+    force_reanalyze = request.form.get('force_reanalyze') == '1'
     try:
         profile_id = int(request.form.get('mapping_profile_id', ''))
     except (TypeError, ValueError):
@@ -5004,18 +5070,46 @@ def powerschool_import_preview():
     except (ImportValidationError, json.JSONDecodeError) as exc:
         return jsonify({'ok': False, 'message': str(exc)}), 400
 
-    duplicate = ImportBatch.query.filter(
+    preflight_failure = _powerschool_preflight_failure(parsed)
+    if preflight_failure:
+        return jsonify({
+            'ok': False,
+            **preflight_failure,
+            'preflight': parsed.get('preflight') or {},
+            'metrics': parsed.get('metrics') or {},
+        }), 400
+
+    analysis_context_sha256 = _powerschool_analysis_context_hash(
+        profile, mapping, parsed['combined_sha256'], school_year, snapshot_type)
+    same_context = ImportBatch.query.filter(
         ImportBatch.source_type == 'powerschool',
-        ImportBatch.schema_version == profile.schema_version,
-        ImportBatch.file_sha256 == parsed['combined_sha256'],
-        ImportBatch.status.in_(['staged', 'selecting', 'applying', 'applied']),
+        ImportBatch.uploaded_by_id == current_user.id,
+        ImportBatch.analysis_context_sha256 == analysis_context_sha256,
+    )
+    busy_duplicate = same_context.filter(
+        ImportBatch.status.in_(['selecting', 'applying'])
+    ).order_by(ImportBatch.created_at.desc()).first()
+    duplicate = busy_duplicate or same_context.filter(
+        ImportBatch.status.in_(['staged', 'applied'])
     ).order_by(ImportBatch.created_at.desc()).first()
     if duplicate:
-        return jsonify({
-            'ok': False, 'message': 'These exact files were already analyzed.',
-            'existing_batch_id': duplicate.public_id,
-            'existing_status': duplicate.status,
-        }), 409
+        reanalyze_allowed = (
+            busy_duplicate is None
+            and duplicate.status in {'staged', 'applied'})
+        if not force_reanalyze or not reanalyze_allowed:
+            return jsonify({
+                'ok': False,
+                'message': (
+                    'A matching analysis is currently changing selection or '
+                    'being applied. Wait for it to finish before re-analyzing.'
+                    if busy_duplicate else
+                    'These files were already analyzed with the same year, '
+                    'policy, mapping and normalizer revision.'),
+                'existing_batch_id': duplicate.public_id,
+                'existing_status': duplicate.status,
+                'can_open': True,
+                'reanalyze_allowed': reanalyze_allowed,
+            }), 409
 
     now = _utcnow()
     batch = ImportBatch(
@@ -5024,6 +5118,7 @@ def powerschool_import_preview():
         snapshot_type=snapshot_type, school_year=school_year,
         uploaded_by_id=current_user.id,
         file_sha256=parsed['combined_sha256'], plan_hash='pending',
+        analysis_context_sha256=analysis_context_sha256,
         created_at=now,
         expires_at=now + timedelta(hours=app.config['IMPORT_STAGE_TTL_HOURS']))
     db.session.add(batch)
@@ -5041,7 +5136,7 @@ def powerschool_import_preview():
         uploaded_students = set()
         counts = {name: 0 for name in (
             'new', 'update', 'unchanged', 'duplicate', 'conflict',
-            'rejected', 'deactivate_candidate')}
+            'rejected', 'ignored', 'warning', 'deactivate_candidate')}
         for proposal in parsed['students']:
             uploaded_students.add(proposal['student_number'])
             if proposal.get('school_year') and proposal['school_year'] != school_year:
@@ -5115,9 +5210,15 @@ def powerschool_import_preview():
         metadata = {
             'mapping_profile_id': profile.id, 'mapping_profile_name': profile.name,
             'files': parsed['files'], 'issues': parsed['issues'], 'counts': counts,
+            'metrics': parsed.get('metrics') or {},
+            'preflight': parsed.get('preflight') or {},
+            'normalizer_revision': NORMALIZER_REVISION,
+            'analysis_context_sha256': analysis_context_sha256,
             'deactivation_policy': 'separate_explicit_approval',
             'snapshot_complete_for_deactivation': snapshot_complete_for_deactivation,
         }
+        if duplicate and force_reanalyze:
+            metadata['reanalyzed_from'] = duplicate.public_id
         batch.metadata_json = json.dumps(metadata, sort_keys=True)
         _refresh_import_counts_and_hash(batch)
         db.session.commit()
@@ -5130,6 +5231,10 @@ def powerschool_import_preview():
     _audit('powerschool_import_staged', 'notifications', batch.public_id,
            f'PowerSchool v{batch.schema_version}; {batch.total_rows} review rows; '
            f'sha256={batch.file_sha256[:12]}')
+    if duplicate and force_reanalyze:
+        _audit('powerschool_import_reanalyzed', 'notifications', batch.public_id,
+               f'New immutable analysis from {duplicate.public_id[:12]}; '
+               f'normalizer={NORMALIZER_REVISION}')
     return jsonify(_powerschool_batch_payload(batch))
 
 
@@ -5401,6 +5506,37 @@ def _restore_subscriber_snapshot(subscriber, snapshot):
             setattr(contact, field, item.get(field))
 
 
+def _detach_notification_history(*, subscriber_id=None, group_id=None):
+    """Preserve delivery history while a rollback removes imported targets.
+
+    PostgreSQL enforces the nullable notification/outbox foreign keys with
+    restrictive constraints in existing installations.  Clear only those
+    references before deleting the imported subscriber or group; the stored
+    recipient, group name, bus label and delivery result remain available for
+    auditing.
+    """
+    detached = {'notification_log': 0, 'email_outbox': 0}
+    if subscriber_id is not None:
+        detached['notification_log'] += NotificationLog.query.filter_by(
+            subscriber_id=subscriber_id).update(
+                {NotificationLog.subscriber_id: None},
+                synchronize_session=False)
+        detached['email_outbox'] += EmailOutbox.query.filter_by(
+            subscriber_id=subscriber_id).update(
+                {EmailOutbox.subscriber_id: None},
+                synchronize_session=False)
+    if group_id is not None:
+        detached['notification_log'] += NotificationLog.query.filter_by(
+            group_id=group_id).update(
+                {NotificationLog.group_id: None},
+                synchronize_session=False)
+        detached['email_outbox'] += EmailOutbox.query.filter_by(
+            group_id=group_id).update(
+                {EmailOutbox.group_id: None},
+                synchronize_session=False)
+    return detached
+
+
 @app.route('/admin/notifications/powerschool/batch/<public_id>/rollback',
            methods=['POST'])
 @login_required
@@ -5436,6 +5572,7 @@ def powerschool_import_rollback(public_id):
     if claimed != 1:
         return jsonify({'ok': False, 'message': 'Rollback is already running.'}), 409
     try:
+        detached_history = {'notification_log': 0, 'email_outbox': 0}
         for change in changes:
             if change.target_table == 'external_identity':
                 identity = db.session.get(ExternalIdentity, change.target_id)
@@ -5445,6 +5582,10 @@ def powerschool_import_rollback(public_id):
                 subscriber = db.session.get(NotificationSubscriber, change.target_id)
                 if change.operation == 'create':
                     if subscriber:
+                        detached = _detach_notification_history(
+                            subscriber_id=subscriber.id)
+                        for key, value in detached.items():
+                            detached_history[key] += value
                         db.session.delete(subscriber)
                 elif subscriber and change.before_json:
                     _restore_subscriber_snapshot(
@@ -5456,12 +5597,16 @@ def powerschool_import_rollback(public_id):
                     if NotificationSubscriber.query.filter_by(
                             group_id=group.id).count():
                         raise ValueError('A created group is now used by another enrollment.')
+                    detached = _detach_notification_history(group_id=group.id)
+                    for key, value in detached.items():
+                        detached_history[key] += value
                     db.session.delete(group)
         batch = db.session.get(ImportBatch, batch.id)
         batch.status = 'rolled_back'
         metadata = _import_metadata(batch)
         metadata['rolled_back_at'] = _utcnow().isoformat() + 'Z'
         metadata['rolled_back_by_id'] = current_user.id
+        metadata['detached_notification_history'] = detached_history
         batch.metadata_json = json.dumps(metadata, sort_keys=True)
         db.session.commit()
     except Exception:

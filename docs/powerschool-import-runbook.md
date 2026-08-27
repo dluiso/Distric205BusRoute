@@ -1,4 +1,4 @@
-# PowerSchool annual import runbook
+# PowerSchool roster export and import runbook
 
 PowerSchool Import v1 is an additive, feature-flagged workflow. It does not replace
 Legacy CSV v1 and it never treats absence from an upload as permission to delete or
@@ -39,24 +39,40 @@ Run Transportation before 6:00 PM because its PowerSchool source changes to the 
 service day after 6:00 PM. Never schedule these exports to email or an unsecured/shared
 folder. They contain protected student and guardian information.
 
+The source data is not assumed to be clean merely because the CSV header is valid.
+BrightArrow contact sources can return sentinel contact IDs, pseudo-contact rows and
+empty placeholders. Transportation can also return a header plus no usable assignments.
+Keep the three exports separate and let the importer apply source-specific rules; never
+invent IDs, delete rows, merge files, or repair PII by hand.
+
 ### Transportation
 
-Use the downloadable `powerschool-transportation-v1.csv` header as the preferred
-contract:
+The saved template and downloadable `powerschool-transportation-v1.csv` header use this
+exact 10-column contract, in order:
 
-| Canonical field | Required | Purpose |
-|---|---:|---|
-| `student_number` | yes | Stable student identity; never substitute name or email |
-| `student_id` | no | PowerSchool internal/DCID reference |
-| `household_id` | no | Stable source household identifier; defaults to student number |
-| `first_name`, `last_name` | no | Display and notification contact values, not identity |
-| `school`, `grade` | no | Preview filters and reconciliation |
-| `route` | yes | Bus identifier and number, such as `MCK1` or `MCK 01` |
-| `stop` | no | Review information |
-| `period` | no | `AM`, `MD`, `PM` or a configured alias; may be embedded in route |
-| `transport_status` | no | Source review information |
-| `school_year` | no | Source check; the operator-entered year governs the batch |
-| `source_id` | no | Stable transportation record identifier |
+1. `TRANSPORTATION.student_number`
+2. `TRANSPORTATION.student_dcid`
+3. `TRANSPORTATION.studentfname`
+4. `TRANSPORTATION.studentlname`
+5. `TRANSPORTATION.schoolid`
+6. `TRANSPORTATION.grade_level`
+7. `TRANSPORTATION.busnumber`
+8. `TRANSPORTATION.stopnumber`
+9. `TRANSPORTATION.fromto`
+10. `TRANSPORTATION.ride_on_enabledToday`
+
+`student_number` and a normalizable `busnumber` are required in every usable assignment.
+`fromto` should resolve to AM, MD or PM. A student may have multiple rows for multiple
+periods, but incompatible routes are classified as conflicts.
+
+### Blocking Transportation preflight
+
+Before a batch is staged, the application checks the Transportation population, usable
+student numbers, normalizable bus assignments and rejected-row counts. Zero usable
+Transportation assignments is a blocking failure, even if both contact files contain
+thousands of rows. Correct the PowerSchool/BrightArrow source export first; do not select
+Complete district snapshot and do not try to bypass the failure by renaming or editing a
+CSV.
 
 The supplied v1 profile also recognizes the district's verified `STUDENTS.*`,
 `TRANSPORTATION.*` and `BRIGHTARROW.*` header aliases. A student may have multiple
@@ -64,28 +80,48 @@ rows for multiple periods, but conflicting bus routes are classified as `conflic
 
 ### Student and guardian contacts
 
-Use `powerschool-contacts-v1.csv`:
+Both saved contact templates use the same exact 18 selected columns, in order:
 
-| Canonical field | Required | Purpose |
-|---|---:|---|
-| `student_number` | yes | Joins to Transportation |
-| `contact_id` | yes | Stable contact/DCID identity; PII is never used as identity |
-| `first_name`, `last_name` | no | Display values |
-| `relationship` | no | `student`/`self` creates or updates the student contact; others are guardians |
-| `email`, `phone` | no | Normalized notification destinations |
-| `notification_preference` | no | Retained in normalized review data |
-| `priority` | no | Retained in normalized review data |
+1. `BRIGHTARROW.003_student_number`
+2. `BRIGHTARROW.600_00_contact_id`
+3. `BRIGHTARROW.600_04_contact_std_detailid`
+4. `BRIGHTARROW.600_01_contact_firstname`
+5. `BRIGHTARROW.600_02_contact_lastname`
+6. `BRIGHTARROW.600_03_contact_relationship`
+7. `BRIGHTARROW.601_01_home_phone`
+8. `BRIGHTARROW.602_01_phone2`
+9. `BRIGHTARROW.603_01_phone3`
+10. `BRIGHTARROW.604_01_phone4`
+11. `BRIGHTARROW.605_01_phone5`
+12. `BRIGHTARROW.606_01_phone6`
+13. `BRIGHTARROW.607_01_phone7`
+14. `BRIGHTARROW.608_01_phone8`
+15. `BRIGHTARROW.609_01_phone9`
+16. `BRIGHTARROW.801_email1`
+17. `BRIGHTARROW.802_email2`
+18. `BRIGHTARROW.803_email3`
 
-PowerSchool separates student contact information from parent/guardian contacts. Upload
-both saved contact exports; the application combines them during normalization. Rows
-from `Students Combined` are assigned the student role. `Parents Combined` preserves its
-relationship and defaults a blank relationship to guardian. No manual CSV merge is
-required.
+The downloadable contracts are `powerschool-student-contacts-v1.csv` and
+`powerschool-guardian-contacts-v1.csv`. The older `powerschool-contacts-v1.csv` remains
+only for the legacy combined-file compatibility mode.
+
+Rows from `Students Combined` are assigned the student role. Its source may emit
+`contact_id=0`; the normalizer derives a deterministic direct-student identity from the
+file role and stable student number, never from email, phone or name. `Parents Combined`
+preserves the relationship, but reserves `contact_id=0` for overlapping student-self
+rows and never imports it as a guardian. A nonblank relationship on that reserved ID is
+reported as an anomaly. Placeholder rows containing only a student number are also
+ignored. These artifacts are reported in preflight metrics instead of becoming thousands
+of rejected or conflicting contacts. Other guardian rows still require a stable identifier;
+PII is never substituted as identity. No manual CSV merge is required.
+
+Ignored source artifacts are not review rows and therefore are not part of the
+`selected + excluded + rejected = total` reconciliation.
 
 The v1 mapping accepts the verified `BRIGHTARROW.600_*`, `601_*`–`609_*` and
-`801_*`–`803_* aliases. Repeated stable IDs with different values are conflicts. The
-downloadable `powerschool-contacts-v1.csv` remains available only as a backward-compatible
-combined-file contract.
+`801_*`–`803_* aliases. Repeated non-sentinel stable IDs with different values remain
+conflicts. Invalid email values are surfaced for review; they are never silently converted
+into a different destination.
 
 ## Annual workflow
 
@@ -97,9 +133,9 @@ combined-file contract.
 4. Select `Delta` for normal incremental work. Select `Complete district snapshot`
    only when the files are known to contain the entire district population.
 5. Keep `PowerSchool saved templates` selected and upload Transportation, Student
-   Contacts and Guardian Contacts. Analyze. The server validates UTF-8, MIME/type,
-   headers, cumulative column/row limits, stable identifiers, duplicate files, duplicate
-   rows, routes, periods and contacts.
+   Contacts and Guardian Contacts. Analyze. The server first runs blocking preflight,
+   then validates UTF-8, MIME/type, exact mapped headers, cumulative column/row limits,
+   stable identifiers, duplicate files, duplicate rows, routes, periods and contacts.
 6. Review `new`, `update`, `unchanged`, `duplicate`, `conflict`, `rejected` and any
    `deactivate_candidate` rows. Filter by classification, school, grade, group/route,
    or change/error type.
@@ -111,9 +147,27 @@ combined-file contract.
    selected changes in one transaction. A failure changes no operational records.
 10. Download the final CSV report and reconcile:
     `selected + excluded + rejected = total`.
-11. Reopening or resubmitting the same applied batch creates no duplicates. Exact file
-   sets already staged or applied are detected by SHA-256.
+11. Resubmitting the same files presents two explicit choices. **Open existing analysis**
+   loads the immutable earlier batch. **Re-analyze against current state** creates a new
+   linked batch with current mappings and operational data. Neither choice imports data,
+   changes the source CSVs or silently overwrites the prior analysis.
 12. Monitor audit logs and notifications before expanding a pilot to more schools.
+
+## Rapid go/no-go checklist
+
+Before applying any batch, all answers must be **yes**:
+
+- Were all three exports generated for the same district context, school year and date?
+- Was Transportation exported before its source-day cutoff?
+- Does Transportation contain a plausible row population and populated bus assignments?
+- Did the blocking preflight pass with at least one usable Transportation assignment?
+- Is the policy `Delta`, unless a separately reconciled full-district snapshot was approved?
+- Were sentinel and placeholder metrics reviewed without manually changing source IDs?
+- Do selected, excluded and rejected totals reconcile exactly?
+- Was the final plan reviewed by the authorized operator before Apply?
+
+Any **no** is a NO-GO. Generate a corrected export or investigate the source; do not
+transform the CSV to make it pass.
 
 ## Classification and preservation rules
 
@@ -137,6 +191,8 @@ batch changed a target, rollback fails closed without changing any record. Other
 
 - deletes identities, contacts, enrollments and groups created by the batch;
 - restores the exact prior values for updates and approved deactivations;
+- preserves notification/outbox history while detaching references to removed imported
+  subscribers and groups;
 - commits the reversal atomically; and
 - writes a rollback audit event.
 
