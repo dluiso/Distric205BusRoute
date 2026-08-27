@@ -159,11 +159,12 @@ def test_transportation_v2_blocks_unproven_complete_snapshot_before_staging(
     'PO Box Address',
     '7:16 AM',
 ])
-def test_suspicious_route_artifact_allows_delta_but_blocks_full_snapshot(
+def test_verified_route_artifact_is_quarantined_without_blocking_full_snapshot(
         logged_in_client, artifact):
     setup_route()
     transportation = (
         f'0001,Ada,Lovelace,5,Active,{artifact},TEST1 PM,205,SID-0001\n'
+        '0002,Grace,Hopper,6,Active,TEST1 AM,TEST1 PM,205,SID-0002\n'
     )
 
     delta = preview_with_options(
@@ -177,10 +178,12 @@ def test_suspicious_route_artifact_allows_delta_but_blocks_full_snapshot(
     assert delta.status_code == 200, delta.get_data(as_text=True)
     delta_payload = delta.get_json()
     delta_metrics = delta_payload['metrics']['transportation']
-    assert delta_metrics['period_am_rows'] == 0
-    assert delta_metrics['period_pm_rows'] == 1
-    assert delta_metrics['invalid_route_am_rows'] == 1
+    assert delta_metrics['period_am_rows'] == 1
+    assert delta_metrics['period_pm_rows'] == 2
+    assert delta_metrics['invalid_route_am_rows'] == 0
     assert delta_metrics['ignored_non_bus_route_rows'] == 0
+    assert delta_metrics['quarantined_source_artifact_route_rows'] == 1
+    assert delta_metrics['quarantined_route_am_rows'] == 1
     assert delta_metrics['warning_rows'] == 1
 
     full_snapshot = preview_with_options(
@@ -191,17 +194,39 @@ def test_suspicious_route_artifact_allows_delta_but_blocks_full_snapshot(
         transport_header=V2_TRANSPORT_HEADER,
     )
 
-    assert full_snapshot.status_code == 400
+    assert full_snapshot.status_code == 200
     full_payload = full_snapshot.get_json()
-    assert full_payload['code'] == (
-        'transportation_v2_full_snapshot_not_proven'
-    )
-    assert full_payload['metrics']['transportation'][
-        'invalid_route_am_rows'
-    ] == 1
-    assert 'Select Delta' in full_payload['message']
+    full_metrics = full_payload['metrics']['transportation']
+    assert full_metrics['invalid_route_am_rows'] == 0
+    assert full_metrics['quarantined_source_artifact_route_rows'] == 1
+    assert full_payload['preflight']['ok'] is True
     with application.app.app_context():
-        assert application.ImportBatch.query.count() == 1
+        assert application.ImportBatch.query.count() == 2
+
+
+@pytest.mark.parametrize('artifact', [
+    'Res verify address',
+    'PO Box',
+    '13:22 PM',
+    '7:99 AM',
+])
+def test_unverified_route_artifact_still_blocks_full_snapshot(
+        logged_in_client, artifact):
+    setup_route()
+    transportation = (
+        f'0001,Ada,Lovelace,5,Active,{artifact},TEST1 PM,205,SID-0001\n'
+    )
+    response = preview_with_options(
+        logged_in_client,
+        transportation,
+        contact_row(),
+        snapshot='full_district',
+        transport_header=V2_TRANSPORT_HEADER,
+    )
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload['code'] == 'transportation_v2_full_snapshot_not_proven'
+    assert payload['metrics']['transportation']['invalid_route_am_rows'] == 1
 
 
 def test_transportation_v2_clean_dual_route_snapshot_can_stage(

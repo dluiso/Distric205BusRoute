@@ -90,12 +90,19 @@ the following metrics:
   while a valid opposite-period leg is retained;
 - `invalid_route_am_rows` and `invalid_route_pm_rows`: a nonblank/non-bus value cannot
   be normalized as a route; and
+- `quarantined_source_artifact_route_rows` (with AM/PM subtotals): a value matches the
+  narrowly verified Students Combined artifacts `Res verify add`, `PO Box Address`, or
+  a valid 12-hour clock time. The affected leg is ignored, the opposite valid leg is
+  retained, and the occurrence remains visible as a row warning. A row with no valid
+  leg does not produce a bus subscriber and its contacts remain outside Transportation;
+  and
 - `different_am_pm_route_rows`: AM and PM legitimately differ. Both assignments are
   preserved; the count is informational and must be reconciled, not treated as a route
   conflict by itself.
 
 Period conflicts and invalid values are route-pair anomalies. They must be resolved, and
-the differing-route count must be reconciled, before Full Snapshot can be considered.
+the differing-route and quarantined-artifact counts must be reconciled, before Full
+Snapshot can be considered. A quarantined artifact is never converted into a bus route.
 
 The old downloadable `powerschool-transportation-v1.csv` 10-column header is retained
 only for historical comparison and diagnosis. Its old `BrightArrow Transportation

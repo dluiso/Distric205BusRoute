@@ -90,6 +90,9 @@ def test_import_ui_exposes_duplicate_recovery_and_preflight_without_unsafe_dom()
     assert "transportation.different_am_pm_route_rows" in source
     assert "transportation.invalid_route_am_rows" in source
     assert "transportation.invalid_route_pm_rows" in source
+    assert "transportation.quarantined_source_artifact_route_rows" in source
+    assert "transportation.quarantined_route_am_rows" in source
+    assert "transportation.quarantined_route_pm_rows" in source
     assert "transportation.ignored_blank_route_rows" in source
     assert "transportation.ignored_non_bus_route_rows" in source
     assert "contacts.ignored_no_transport_rows" in source

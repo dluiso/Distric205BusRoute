@@ -112,7 +112,7 @@ def test_brightarrow_transportation_v2_raw_headers_expand_am_and_pm():
 
     student = result["students"][0]
     assert result["normalizer_revision"] == NORMALIZER_REVISION
-    assert NORMALIZER_REVISION == "2026-08-27.6"
+    assert NORMALIZER_REVISION == "2026-08-27.7"
     assert result["preflight"]["transportation_contract"] == (
         TRANSPORTATION_V2_CONTRACT
     )
@@ -236,7 +236,7 @@ def test_v2_confirmed_non_bus_artifact_keeps_valid_opposite_leg(
     ("7 : 16   am", "AM"),
     ("03:22 pm", "PM"),
 ])
-def test_v2_address_incident_and_time_artifacts_warn_and_keep_opposite_leg(
+def test_v2_address_incident_and_time_artifacts_are_quarantined_and_keep_opposite_leg(
         artifact, artifact_period):
     route_am = artifact if artifact_period == "AM" else "BUS 42 AM"
     route_pm = artifact if artifact_period == "PM" else "BUS 42 PM"
@@ -250,9 +250,11 @@ def test_v2_address_incident_and_time_artifacts_warn_and_keep_opposite_leg(
     metrics = result["metrics"]["transportation"]
     assert result["preflight"]["ok"] is True
     assert metrics["accepted_rows"] == 1
-    assert metrics["ignored_rows"] == 0
+    assert metrics["ignored_rows"] == 1
     assert metrics["ignored_non_bus_route_rows"] == 0
-    assert metrics[f"invalid_route_{artifact_period.lower()}_rows"] == 1
+    assert metrics[f"invalid_route_{artifact_period.lower()}_rows"] == 0
+    assert metrics["quarantined_source_artifact_route_rows"] == 1
+    assert metrics[f"quarantined_route_{artifact_period.lower()}_rows"] == 1
     assert metrics["warning_rows"] == 1
     assert result["students"][0]["assignments"] == [{
         "route_prefix": "BUS", "route_number": "42",
@@ -263,8 +265,41 @@ def test_v2_address_incident_and_time_artifacts_warn_and_keep_opposite_leg(
         "row_number": 2,
         "classification": "warning",
         "errors": [
-            f"route_{artifact_period.lower()} is populated but cannot be "
-            "normalized"
+            f"route_{artifact_period.lower()} contains a quarantined source "
+            "artifact; the route leg was ignored"
+        ],
+    }]
+
+
+def test_v2_two_quarantined_legs_do_not_create_a_bus_subscriber():
+    result = _plan(
+        V2_HEADERS,
+        [
+            _v2_row("0001", "Res verify add", "3:25 PM"),
+            _v2_row("0002", "BUS 42 AM", "BUS 42 PM"),
+        ],
+        [
+            _contact_row("0001", "C-1"),
+            _contact_row("0002", "C-2"),
+        ],
+    )
+
+    metrics = result["metrics"]["transportation"]
+    assert result["preflight"]["ok"] is True
+    assert metrics["quarantined_source_artifact_route_rows"] == 2
+    assert metrics["quarantined_route_am_rows"] == 1
+    assert metrics["quarantined_route_pm_rows"] == 1
+    assert metrics["invalid_route_am_rows"] == 0
+    assert metrics["invalid_route_pm_rows"] == 0
+    assert [student["student_number"] for student in result["students"]] == ["0002"]
+    assert result["metrics"]["contacts"]["ignored_no_transport_rows"] == 1
+    assert result["issues"] == [{
+        "file": "transportation",
+        "row_number": 2,
+        "classification": "warning",
+        "errors": [
+            "route_am contains a quarantined source artifact; the route leg was ignored",
+            "route_pm contains a quarantined source artifact; the route leg was ignored",
         ],
     }]
 
@@ -272,11 +307,8 @@ def test_v2_address_incident_and_time_artifacts_warn_and_keep_opposite_leg(
 @pytest.mark.parametrize("unknown_value", [
     "WalkerWalker extra",
     "door-t0-door PM",
-    "Res verify add",
     "Res verify address",
-    "PO Box Address",
     "PO Box",
-    "7:16 AM",
     "13:22 PM",
     "7:99 AM",
 ])

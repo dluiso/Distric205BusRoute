@@ -18,7 +18,7 @@ from collections import defaultdict
 
 EMAIL_RE = re.compile(r"^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
-NORMALIZER_REVISION = "2026-08-27.6"
+NORMALIZER_REVISION = "2026-08-27.7"
 STUDENT_SELF_CONTACT_ID = "student-self"
 TRANSPORTATION_V2_CONTRACT = "students_combined_dual_route"
 ROUTE_RE = re.compile(
@@ -353,6 +353,25 @@ def _ignored_transport_route_reason(value):
     return None
 
 
+def _quarantined_transport_route_artifact(value):
+    """Identify verified Students Combined artifacts that are not bus routes.
+
+    These values originate in the district's legacy BrightArrow route fields.
+    They are deliberately kept separate from normal non-bus categories so the
+    preflight report remains explicit and operators can reconcile every
+    occurrence.  Near matches remain invalid instead of being guessed.
+    """
+    raw = normalize_text(value, 100).upper()
+    if not raw:
+        return None
+    normalized = normalize_text(raw.replace("\u2013", "-").replace("\u2014", "-"))
+    if normalized in {"RES VERIFY ADD", "PO BOX ADDRESS"}:
+        return "source_artifact"
+    if re.fullmatch(r"(?:0?[1-9]|1[0-2])\s*:\s*[0-5]\d\s*(?:AM|PM)", normalized):
+        return "source_artifact"
+    return None
+
+
 def _normalize_period(value, aliases):
     raw = normalize_text(value).upper()
     return aliases.get(raw)
@@ -469,6 +488,9 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
     transportation_metrics.update({
         "ignored_blank_route_rows": 0,
         "ignored_non_bus_route_rows": 0,
+        "quarantined_source_artifact_route_rows": 0,
+        "quarantined_route_am_rows": 0,
+        "quarantined_route_pm_rows": 0,
         "ignored_missing_period_rows": 0,
         "period_am_rows": 0,
         "period_md_rows": 0,
@@ -555,6 +577,17 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
                         else "ignored_non_bus_route_rows"
                     )
                     transportation_metrics[metric_key] += 1
+                    continue
+
+                if _quarantined_transport_route_artifact(route_raw):
+                    transportation_metrics["ignored_rows"] += 1
+                    transportation_metrics[
+                        "quarantined_source_artifact_route_rows"] += 1
+                    transportation_metrics[
+                        f"quarantined_route_{period.lower()}_rows"] += 1
+                    safe_warnings.append(
+                        f"{field_name} contains a quarantined source artifact; "
+                        "the route leg was ignored")
                     continue
 
                 route = normalize_route(route_raw)
@@ -893,11 +926,22 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             f'{transportation_metrics["rejected_rows"]} Transportation row(s) '
             "could not be normalized."
         )
-    if transportation_metrics["ignored_rows"]:
+    ordinary_ignored_routes = (
+        transportation_metrics["ignored_blank_route_rows"]
+        + transportation_metrics["ignored_non_bus_route_rows"]
+    )
+    if ordinary_ignored_routes:
         preflight["warnings"].append(
-            f'{transportation_metrics["ignored_rows"]} Transportation route '
+            f'{ordinary_ignored_routes} Transportation route '
             "field value(s) were blank or a known non-bus category and were "
             "safely ignored."
+        )
+    if transportation_metrics["quarantined_source_artifact_route_rows"]:
+        preflight["warnings"].append(
+            f'{transportation_metrics["quarantined_source_artifact_route_rows"]} '
+            "directional route field value(s) matched a verified Students "
+            "Combined source artifact and were quarantined; any valid "
+            "opposite-period assignment was retained."
         )
     if transportation_metrics["ignored_missing_period_rows"]:
         preflight["warnings"].append(
