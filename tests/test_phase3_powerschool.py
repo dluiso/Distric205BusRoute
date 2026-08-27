@@ -99,7 +99,7 @@ def seed_applied_legacy_subscriber(notes='Legacy roster subscriber'):
             notes=notes, active=True)
         application.db.session.add(subscriber)
         application.db.session.flush()
-        now = application._utcnow()
+        now = max(application._utcnow(), subscriber.created_at)
         batch = application.ImportBatch(
             public_id=application.secrets.token_urlsafe(24),
             source_type='legacy_csv', schema_version='1', status='applied',
@@ -123,6 +123,15 @@ def seed_applied_legacy_subscriber(notes='Legacy roster subscriber'):
             after_json=json.dumps({'subscriber_id': subscriber.id})))
         application.db.session.commit()
         return subscriber.id
+
+
+def seed_manual_preservation(subscriber_id):
+    with application.app.app_context():
+        owner = application.User.query.filter_by(username='admin').one()
+        subscriber = application.db.session.get(
+            application.NotificationSubscriber, subscriber_id)
+        application._record_manual_subscriber_provenance(subscriber, owner)
+        application.db.session.commit()
 
 
 def preview(client, transportation, contacts, snapshot='delta'):
@@ -335,6 +344,7 @@ def test_first_powerschool_batch_requires_atomic_legacy_cutover(logged_in_client
         application.db.session.add(manual)
         application.db.session.commit()
         manual_id = manual.id
+    seed_manual_preservation(manual_id)
 
     report = preview_v2(
         logged_in_client, transport_v2_row(), contact_row(),
@@ -344,6 +354,9 @@ def test_first_powerschool_batch_requires_atomic_legacy_cutover(logged_in_client
         'required': True,
         'candidate_count': 1,
         'incarnation_excluded_count': 0,
+        'baseline_required': False,
+        'baseline_available': False,
+        'unmanaged_count': 0,
         'approved': False,
         'blocked': False,
         'requires_reanalysis': False,
@@ -474,6 +487,7 @@ def test_legacy_cutover_preserves_manual_subscriber_that_reuses_deleted_id(
         application.db.session.commit()
         assert manual.id == deleted_legacy_id
         manual_id = manual.id
+    seed_manual_preservation(manual_id)
 
     report = preview_v2(
         logged_in_client, transport_v2_row(), contact_row(),

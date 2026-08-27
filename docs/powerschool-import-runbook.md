@@ -169,14 +169,86 @@ into a different destination.
 The first applicable PowerSchool batch detects legacy subscribers by import provenance:
 the application uses the applied Legacy CSV batch and change history that created them.
 It does not infer ownership from names, household labels, email addresses or phone
-numbers. Subscribers without that proven Legacy CSV provenance are manual and remain
-active.
+numbers. Subscribers with explicit manual provenance remain active. Any active subscriber
+without proven Legacy or manual provenance blocks selection and Apply until ownership is
+reconciled; the application never assumes that an unclassified row is manual.
 
 A large `new` count does **not** mean the notification database is empty. `new` means the
 student number has no PowerSchool `ExternalIdentity` yet. The same student or household
 can therefore already exist as a Legacy CSV subscriber and still appear as `new` in the
 first PowerSchool analysis. The cutover prevents those proven legacy records from
 remaining active beside the newly linked PowerSchool subscribers.
+
+### Historical pre-audit Legacy CSV provenance baseline
+
+Some production Legacy CSV rosters may predate the audit records that identify which
+subscriber, contact and group rows the importer created. The application fails closed
+when active subscribers lack explicit provenance: no PowerSchool cutover may be approved
+or applied until an authorized operator adopts a verified historical baseline. This is
+not permission to infer ownership from PII or to classify every existing subscriber as
+legacy.
+
+The ordinary cutover relies exclusively on recorded import provenance and never infers
+ownership from names, household labels, email addresses, phone numbers or other PII.
+Baseline adoption is a narrowly bounded, one-time recovery exception: it reconciles the
+exact known historical CSV to current records using full-record equality under the
+historical importer rules. It is not fuzzy identity matching. Any missing or ambiguous
+match blocks the entire adoption.
+
+Baseline adoption requires the **exact original Legacy combined CSV** used to create the
+active roster. Do not reconstruct it from the database, edit it, normalize it, resave it
+in Excel or substitute a later export. Keep the file private and run the following from
+the application environment. The initial command is always a dry run:
+
+```bash
+flask --app app adopt-legacy-baseline /absolute/path/to/original.csv
+```
+
+The dry run prints only aggregate candidate, contact, group and preserved counts plus a
+source SHA and manifest SHA. It must not print or log names, student identifiers, email
+addresses, phone numbers or other PII. Reconcile all aggregates independently. Then run
+the apply command against the exact same source, copying every reported value literally:
+
+```bash
+flask --app app adopt-legacy-baseline /absolute/path/to/original.csv \
+  --apply \
+  --source-sha SOURCE_SHA_FROM_DRY_RUN \
+  --manifest-sha MANIFEST_SHA_FROM_DRY_RUN \
+  --expected-candidates CANDIDATE_COUNT \
+  --expected-contacts CONTACT_COUNT \
+  --expected-groups GROUP_COUNT \
+  --expected-preserved PRESERVED_COUNT \
+  --approved-by ACTIVE_ADMIN_USERNAME
+```
+
+`ACTIVE_ADMIN_USERNAME` must identify an active administrator. The command rechecks the
+source SHA, manifest SHA and all four aggregate counts at apply time. A changed source,
+hash or count, missing match, ambiguous match or unauthorized approver blocks the entire
+adoption without partial changes. Do not weaken the match or fill gaps manually.
+
+For the known District 205 archived source, the independently recorded operational
+checkpoint is:
+
+| Evidence | Expected value |
+|---|---:|
+| Source SHA | `dafbffbfc40d6359ee6feb20e86c45982bab7efa8f64980cd8cab713e4a6ddd7` |
+| Candidates | `1852` |
+| Contacts | `4200` |
+| Groups | `68` |
+| Preserved | `1` |
+
+These values are documentation and operator evidence for that known source; they are not
+application defaults. Copying hashes and counts from the same dry run into its apply
+command pins the attempted operation, but does **not** independently prove that the
+source or classification is correct. Before approval, compare the dry-run source SHA and
+all four counts to this independent checkpoint and the source-custody record. Any
+difference is a NO-GO and must be investigated rather than overridden.
+
+An already staged Delta batch—including the current pre-baseline analysis—is invalid for
+the first cutover and must never be applied. After baseline adoption succeeds, upload the
+current Transportation v2, Student Contacts and Guardian Contacts exports again and run
+**Re-analyze against current state** as a new `full_district` (**Complete district
+snapshot**) batch. Only that fresh analysis can proceed to the remaining cutover gates.
 
 When the analysis reports that a Legacy CSV cutover is required, Apply remains blocked
 until all of these conditions are satisfied:
@@ -237,28 +309,35 @@ links, preview classifications, atomic apply and rollback protections remain int
    classification, school, grade, group/route, or change/error type.
 7. Remember that `new` means no PowerSchool `ExternalIdentity`; it does not mean the
    database is empty or prove that no Legacy CSV version of the subscriber exists.
-8. If the Legacy CSV cutover banner appears, require the approved Transportation v2
+8. If the importer reports a missing historical Legacy provenance baseline, stop. Use
+   the exact original Legacy combined CSV with the documented dry-run command. Reconcile
+   its PII-safe counts and hashes, then use the fully pinned apply command with an active
+   administrator as approver. Any missing or ambiguous match remains a blocker. After
+   success, upload all three current exports again and create a new Complete district
+   snapshot; the current or any staged Delta analysis is invalid for cutover.
+9. If the Legacy CSV cutover banner appears after any required baseline adoption succeeds,
+   require the approved Transportation v2
    dual-route export in a Complete district snapshot, current reanalysis, zero conflicts,
    zero rejected rows and reconciliation of its provenance-derived candidate count.
    Transportation v1 cannot authorize cutover even when marked Full.
    Keep all importable `new` and `update` rows selected: an empty or partial selection is
    blocked. Explicitly approve the atomic cutover; manual subscribers remain active.
-9. Without a cutover, include or exclude importable rows according to the reviewed plan.
+10. Without a cutover, include or exclude importable rows according to the reviewed plan.
    With a cutover, retain the complete importable selection. Save the selection to
    regenerate `plan_hash`; any stale browser plan is rejected.
-10. For a separately validated Complete district snapshot, deactivation candidates remain
+11. For a separately validated Complete district snapshot, deactivation candidates remain
    unselected and require explicit approval. Absence alone never selects them.
-11. Apply the exact plan. The batch first revalidates target state and then applies all
+12. Apply the exact plan. The batch first revalidates target state and then applies all
    selected changes and any approved provenance cutover in one transaction. A failure
    changes no operational records.
-12. Download the final CSV report and reconcile:
+13. Download the final CSV report and reconcile:
     `selected + excluded + rejected = total`.
-13. Resubmitting the same files presents two explicit choices. **Open existing analysis**
+14. Resubmitting the same files presents two explicit choices. **Open existing analysis**
    loads the immutable earlier batch. **Re-analyze against current state** creates a new
    linked batch with current mappings and operational data. Neither choice imports data,
    changes the source CSVs or silently overwrites the prior analysis.
-14. Monitor audit logs and notifications before expanding a pilot to more schools.
-15. After a PowerSchool roster becomes active, perform every later roster update through
+15. Monitor audit logs and notifications before expanding a pilot to more schools.
+16. After a PowerSchool roster becomes active, perform every later roster update through
     PowerSchool Import. Legacy CSV is no longer an allowed roster source.
 
 ## Rapid go/no-go checklist
@@ -276,6 +355,11 @@ Before applying any batch, all answers must be **yes**:
   reviewed without manually changing source IDs?
 - Is this a current analysis rather than an older staged batch that requires reanalysis?
 - Are both the `conflict` and `rejected` counts zero?
+- If historical Legacy provenance is missing, did the baseline dry run use the exact
+  original combined CSV, were its PII-safe source/manifest hashes and all four aggregate
+  counts reconciled, and did an active administrator approve the pinned apply? Any
+  missing or ambiguous match is a NO-GO. A staged Delta remains invalid after adoption;
+  create a new Complete district snapshot analysis.
 - If a Legacy CSV cutover is required, is the policy Complete district snapshot rather
   than Delta, is Transportation the approved v2 dual-route export, and is district-wide
   AM/PM coverage proven? A Transportation v1 Full batch remains a NO-GO.

@@ -4034,6 +4034,27 @@ def _save_contacts(subscriber_id, form):
                 role=rl,               sort_order=i,
             ))
 
+
+def _delete_contact_external_identities(contact_ids):
+    """Remove mappings for contacts that are about to lose their row identity."""
+    contact_ids = {contact_id for contact_id in contact_ids if contact_id}
+    if not contact_ids:
+        return
+    ExternalIdentity.query.filter(
+        ExternalIdentity.local_table == 'subscriber_contact',
+        ExternalIdentity.local_id.in_(contact_ids),
+    ).delete(synchronize_session=False)
+
+
+def _delete_subscriber_external_identities(subscriber):
+    """Remove non-FK identity mappings before a subscriber can be deleted."""
+    ExternalIdentity.query.filter(and_(
+        ExternalIdentity.local_table == 'notification_subscriber',
+        ExternalIdentity.local_id == subscriber.id,
+    )).delete(synchronize_session=False)
+    _delete_contact_external_identities(
+        contact.id for contact in subscriber.contacts)
+
 @app.route('/admin/notifications/add', methods=['POST'])
 @login_required
 @require_module('notifications', 'full')
@@ -4046,6 +4067,9 @@ def add_subscriber():
     db.session.add(s)
     db.session.flush()
     _save_contacts(s.id, request.form)
+    db.session.flush()
+    db.session.expire(s, ['contacts'])
+    _record_manual_subscriber_provenance(s, current_user)
     db.session.commit()
     _audit('add_subscriber', 'notifications', s.full_name)
     flash(f'Enrollment "{s.full_name}" added.', 'success')
@@ -4060,6 +4084,8 @@ def edit_subscriber(sid):
     s.notes    = request.form.get('notes', '').strip() or None
     s.active   = 'active' in request.form
     s.group_id = request.form.get('group_id', type=int) or None
+    _delete_contact_external_identities(
+        contact.id for contact in s.contacts)
     SubscriberContact.query.filter_by(subscriber_id=sid).delete()
     _save_contacts(sid, request.form)
     db.session.commit()
@@ -4074,6 +4100,7 @@ def edit_subscriber(sid):
 def delete_subscriber(sid):
     s = NotificationSubscriber.query.get_or_404(sid)
     name = s.full_name
+    _delete_subscriber_external_identities(s)
     db.session.delete(s)
     db.session.commit()
     _audit('delete_subscriber', 'notifications', name)
@@ -4092,6 +4119,7 @@ def bulk_delete_subscribers():
         try:
             s = NotificationSubscriber.query.get(int(sid))
             if s:
+                _delete_subscriber_external_identities(s)
                 db.session.delete(s)
                 count += 1
         except (ValueError, TypeError):
@@ -4317,6 +4345,7 @@ def _active_powerschool_roster_exists():
         ExternalIdentity.entity_type == 'student',
         ExternalIdentity.local_table == 'notification_subscriber',
         NotificationSubscriber.active.is_(True),
+        NotificationSubscriber.created_at <= ExternalIdentity.created_at,
     ).first() is not None
 
 
@@ -4987,6 +5016,19 @@ def _powerschool_identity(entity_type, external_key):
         external_key=external_key).first()
 
 
+def _powerschool_subscriber_identity_current(identity, subscriber):
+    """Prove that a student identity belongs to this row incarnation."""
+    return bool(
+        identity
+        and subscriber
+        and identity.local_table == 'notification_subscriber'
+        and identity.local_id == subscriber.id
+        and identity.created_at is not None
+        and subscriber.created_at is not None
+        and subscriber.created_at <= identity.created_at
+    )
+
+
 def _powerschool_bus_for_route(prefix, number, period=None):
     """Resolve a source route against the canonical identity of active buses.
 
@@ -5179,10 +5221,16 @@ def _powerschool_compare_proposal(proposal):
         if student_identity.local_table != 'notification_subscriber':
             conflicts.append('Student identity points to an unexpected local table.')
         else:
-            subscriber = db.session.get(NotificationSubscriber,
-                                        student_identity.local_id)
-            if not subscriber:
+            identity_subscriber = db.session.get(
+                NotificationSubscriber, student_identity.local_id)
+            if not identity_subscriber:
                 conflicts.append('Student identity points to a missing enrollment.')
+            elif not _powerschool_subscriber_identity_current(
+                    student_identity, identity_subscriber):
+                conflicts.append(
+                    'Student identity points to a stale enrollment incarnation.')
+            else:
+                subscriber = identity_subscriber
 
     specs = _powerschool_contact_specs(proposal)
     changes = []
@@ -5240,6 +5288,861 @@ def _powerschool_compare_proposal(proposal):
     return ('update', True, []) if changes else ('unchanged', False, [])
 
 
+LEGACY_BASELINE_SCHEMA_VERSION = 'baseline-1'
+LEGACY_BASELINE_KIND = 'legacy_roster_provenance_baseline'
+MANUAL_PROVENANCE_SOURCE_TYPE = 'manual'
+MANUAL_PROVENANCE_SCHEMA_VERSION = 'subscriber-1'
+MANUAL_PROVENANCE_KIND = 'manual_subscriber_provenance'
+
+
+def _legacy_baseline_integrity():
+    """Validate the one-time baseline without reopening its historical CSV."""
+    batches = _legacy_baseline_existing_batches()
+    if not batches:
+        return set(), False
+    if len(batches) != 1:
+        return set(), True
+    batch = batches[0]
+    metadata = _import_metadata(batch)
+    source_sha = str(metadata.get('source_sha256') or '')
+    manifest_sha = str(metadata.get('manifest_sha256') or '')
+    valid = (
+        batch.status == 'applied'
+        and batch.applied_at is not None
+        and metadata.get('kind') == LEGACY_BASELINE_KIND
+        and metadata.get('version') == LEGACY_BASELINE_SCHEMA_VERSION
+        and re.fullmatch(r'[0-9a-f]{64}', source_sha)
+        and re.fullmatch(r'[0-9a-f]{64}', manifest_sha)
+        and batch.file_sha256 == source_sha
+        and batch.analysis_context_sha256 == manifest_sha
+        and batch.plan_hash == manifest_sha
+        and batch.rejected_rows == 0
+        and batch.excluded_rows == 0
+        and ImportRow.query.filter_by(batch_id=batch.id).count() == 0
+        and ImportFile.query.filter_by(batch_id=batch.id).count() == 0
+    )
+    changes = ImportChange.query.filter_by(
+        batch_id=batch.id,
+        target_table='notification_subscriber',
+    ).order_by(ImportChange.target_id).all()
+    all_change_count = ImportChange.query.filter_by(batch_id=batch.id).count()
+    entries = []
+    target_ids = set()
+    operation_counts = {
+        'adopt_legacy_ownership': 0,
+        'preserve_manual': 0,
+    }
+    for change in changes:
+        try:
+            recorded = json.loads(change.after_json or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            valid = False
+            continue
+        if (change.operation not in operation_counts
+                or change.target_id is None
+                or change.target_id in target_ids
+                or not isinstance(recorded, dict)
+                or recorded.get('subscriber_id') != change.target_id
+                or recorded.get('baseline_version')
+                != LEGACY_BASELINE_SCHEMA_VERSION
+                or recorded.get('created_at') is None
+                or not re.fullmatch(
+                    r'[0-9a-f]{64}', str(recorded.get('state_hash') or ''))):
+            valid = False
+            continue
+        target_ids.add(change.target_id)
+        operation_counts[change.operation] += 1
+        entries.append({
+            'subscriber_id': change.target_id,
+            'created_at': recorded['created_at'],
+            'state_hash': recorded['state_hash'],
+            'operation': change.operation,
+        })
+    entries.sort(key=lambda item: item['subscriber_id'])
+    recalculated_manifest = hashlib.sha256(json.dumps({
+        'version': LEGACY_BASELINE_SCHEMA_VERSION,
+        'source_sha256': source_sha,
+        'entries': entries,
+    }, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    expected_total = operation_counts['adopt_legacy_ownership'] + operation_counts[
+        'preserve_manual']
+    valid = bool(
+        valid
+        and len(entries) == len(changes) == all_change_count == expected_total
+        and batch.total_rows == batch.selected_rows == expected_total
+        and metadata.get('candidate_count')
+        == operation_counts['adopt_legacy_ownership']
+        and metadata.get('preserved_count')
+        == operation_counts['preserve_manual']
+        and isinstance(metadata.get('contact_count'), int)
+        and metadata.get('contact_count') >= 0
+        and isinstance(metadata.get('group_count'), int)
+        and metadata.get('group_count') >= 0
+        and recalculated_manifest == manifest_sha
+    )
+    return ({batch.id} if valid else set()), not valid
+
+
+def _legacy_provenance_for_subscribers(subscribers):
+    """Classify current row incarnations from immutable audit provenance.
+
+    A target ID is not enough because SQLite may reuse deleted integer primary
+    keys.  Baseline records carry the exact creation timestamp; older Legacy
+    CSV ``create`` records retain the conservative created-before-change
+    compatibility boundary used by the original cutover guard.
+    """
+    by_id = {subscriber.id: subscriber for subscriber in subscribers}
+    result = {subscriber_id: set() for subscriber_id in by_id}
+    incarnation_excluded = set()
+    if not by_id:
+        _, invalid_baseline = _legacy_baseline_integrity()
+        return result, incarnation_excluded, invalid_baseline
+
+    valid_baseline_ids, invalid_baseline = _legacy_baseline_integrity()
+    records = db.session.query(ImportChange, ImportBatch).join(
+        ImportBatch, ImportBatch.id == ImportChange.batch_id,
+    ).filter(
+        ImportBatch.status == 'applied',
+        ImportChange.target_table == 'notification_subscriber',
+        ImportChange.target_id.in_(set(by_id)),
+        or_(
+            and_(
+                ImportBatch.source_type == 'legacy_csv',
+                ImportChange.operation == 'create',
+            ),
+            and_(
+                ImportBatch.source_type == 'legacy_csv',
+                ImportBatch.schema_version == LEGACY_BASELINE_SCHEMA_VERSION,
+                ImportChange.operation.in_([
+                    'adopt_legacy_ownership', 'preserve_manual',
+                ]),
+            ),
+            and_(
+                ImportBatch.source_type == MANUAL_PROVENANCE_SOURCE_TYPE,
+                ImportBatch.schema_version == MANUAL_PROVENANCE_SCHEMA_VERSION,
+                ImportChange.operation == 'preserve_manual',
+            ),
+        ),
+    ).order_by(ImportChange.id).all()
+    for change, batch in records:
+        subscriber = by_id.get(change.target_id)
+        if not subscriber:
+            continue
+        try:
+            recorded = json.loads(change.after_json or '{}')
+        except (TypeError, ValueError, json.JSONDecodeError):
+            recorded = {}
+        if not isinstance(recorded, dict):
+            recorded = {}
+        if batch.schema_version == LEGACY_BASELINE_SCHEMA_VERSION:
+            if batch.id not in valid_baseline_ids:
+                incarnation_excluded.add(subscriber.id)
+                continue
+            strict_record = (
+                change.operation in {
+                    'adopt_legacy_ownership', 'preserve_manual'}
+                and recorded.get('subscriber_id') == subscriber.id
+                and recorded.get('baseline_version')
+                == LEGACY_BASELINE_SCHEMA_VERSION
+                and recorded.get('created_at') is not None
+                and re.fullmatch(
+                    r'[0-9a-f]{64}', str(recorded.get('state_hash') or ''))
+            )
+            if not strict_record:
+                incarnation_excluded.add(subscriber.id)
+                continue
+        elif batch.source_type == MANUAL_PROVENANCE_SOURCE_TYPE:
+            if not _manual_provenance_record_valid(
+                    batch, change, subscriber):
+                incarnation_excluded.add(subscriber.id)
+                continue
+        if not _row_incarnation_matches(
+                subscriber.created_at, recorded, change.created_at):
+            incarnation_excluded.add(subscriber.id)
+            continue
+        disposition = (
+            'manual' if change.operation == 'preserve_manual' else 'legacy'
+        )
+        result[subscriber.id].add(disposition)
+    return result, incarnation_excluded, invalid_baseline
+
+
+def _active_non_powerschool_roster_state():
+    """Return PII-free ownership state for every active non-PowerSchool row."""
+    powerschool_ids = {
+        local_id for (local_id,) in db.session.query(
+            ExternalIdentity.local_id,
+        ).join(
+            NotificationSubscriber,
+            NotificationSubscriber.id == ExternalIdentity.local_id,
+        ).filter(
+            ExternalIdentity.source_type == 'powerschool',
+            ExternalIdentity.entity_type == 'student',
+            ExternalIdentity.local_table == 'notification_subscriber',
+            NotificationSubscriber.active.is_(True),
+            NotificationSubscriber.created_at <= ExternalIdentity.created_at,
+        ).distinct().all()
+    }
+    subscribers = NotificationSubscriber.query.options(
+        selectinload(NotificationSubscriber.contacts),
+        selectinload(NotificationSubscriber.group),
+    ).filter(
+        NotificationSubscriber.active.is_(True),
+        ~NotificationSubscriber.id.in_(powerschool_ids),
+    ).order_by(NotificationSubscriber.id).all()
+    provenance, incarnation_excluded, invalid_baseline = (
+        _legacy_provenance_for_subscribers(
+            subscribers)
+    )
+    legacy = []
+    manual = []
+    unmanaged = []
+    conflicts = []
+    for subscriber in subscribers:
+        dispositions = provenance.get(subscriber.id) or set()
+        if invalid_baseline:
+            conflicts.append(subscriber)
+        elif subscriber.id in incarnation_excluded and not dispositions:
+            unmanaged.append(subscriber)
+        elif dispositions == {'legacy'}:
+            legacy.append(subscriber)
+        elif dispositions == {'manual'}:
+            manual.append(subscriber)
+        elif not dispositions:
+            unmanaged.append(subscriber)
+        else:
+            conflicts.append(subscriber)
+    return {
+        'subscribers': subscribers,
+        'legacy': legacy,
+        'manual': manual,
+        'unmanaged': unmanaged,
+        'conflicts': conflicts,
+        'incarnation_excluded_count': len(incarnation_excluded),
+        'powerschool_active_count': len(powerschool_ids),
+    }
+
+
+def _legacy_baseline_source_plan(source_path):
+    """Reconstruct exactly what the pre-audit Legacy CSV importer created.
+
+    This intentionally does not call the modern normalizers.  The August 5
+    importer stripped text fields, lower-cased only ``role``, resolved groups
+    case-insensitively, and kept contact order.  Any row that importer would
+    have skipped makes the baseline unverifiable and therefore unusable.
+    """
+    from collections import OrderedDict
+
+    try:
+        with open(source_path, 'rb') as handle:
+            payload = handle.read(app.config['MAX_CONTENT_LENGTH'] + 1)
+    except OSError as exc:
+        raise ValueError('The Legacy source CSV could not be read.') from exc
+    if len(payload) > app.config['MAX_CONTENT_LENGTH']:
+        raise ValueError('The Legacy source CSV exceeds the configured size limit.')
+    try:
+        content = payload.decode('utf-8-sig')
+    except UnicodeDecodeError as exc:
+        raise ValueError('The Legacy source CSV must be UTF-8 encoded.') from exc
+
+    reader = csv.DictReader(io.StringIO(content))
+    headers = reader.fieldnames or []
+    expected_headers = [
+        'subscriber_id', 'household_label', 'group', 'active', 'role',
+        'first_name', 'last_name', 'email', 'phone',
+    ]
+    if headers != expected_headers:
+        raise ValueError('The Legacy source CSV headers do not match the original contract.')
+
+    groups = {}
+    duplicate_group_keys = set()
+    for group in SubscriberGroup.query.order_by(SubscriberGroup.id).all():
+        key = group.name.strip().lower()
+        if key in groups:
+            duplicate_group_keys.add(key)
+        groups[key] = group
+    if duplicate_group_keys:
+        raise ValueError('Subscriber groups are ambiguous under Legacy case-insensitive matching.')
+
+    households = OrderedDict()
+    row_count = 0
+    for row_number, row in enumerate(reader, 2):
+        row_count += 1
+        if row_count > app.config['IMPORT_MAX_ROWS']:
+            raise ValueError('The Legacy source CSV exceeds the configured row limit.')
+        group_name = (row.get('group') or '').strip()
+        household = (row.get('household_label') or '').strip()
+        first_name = (row.get('first_name') or '').strip()
+        last_name = (row.get('last_name') or '').strip()
+        email = (row.get('email') or '').strip()
+        phone = (row.get('phone') or '').strip()
+        role_raw = (row.get('role') or 'parent').strip().lower()
+        role = role_raw if role_raw in {'parent', 'student'} else 'parent'
+        if not first_name and not email:
+            raise ValueError(
+                'The Legacy source contains a row the historical importer would skip.')
+        group = groups.get(group_name.lower()) if group_name else None
+        if group_name and not group:
+            raise ValueError(
+                'The Legacy source references a group that cannot be resolved exactly.')
+        group_id = group.id if group else None
+        key = (group_id, household if household else f'__row_{row_number}__')
+        households.setdefault(key, {
+            'group_id': group_id,
+            'notes': household or None,
+            'contacts': [],
+        })['contacts'].append({
+            'first_name': first_name or None,
+            'last_name': last_name or None,
+            'email': email or None,
+            'phone': phone or None,
+            'role': role,
+        })
+    if not households:
+        raise ValueError('The Legacy source CSV contains no importable households.')
+    return {
+        'source_sha256': hashlib.sha256(payload).hexdigest(),
+        'households': list(households.values()),
+        'candidate_count': len(households),
+        'contact_count': sum(
+            len(household['contacts']) for household in households.values()),
+        'group_count': len({
+            household['group_id'] for household in households.values()
+            if household['group_id'] is not None
+        }),
+    }
+
+
+def _legacy_baseline_household_signature(group_id, notes, contacts):
+    material = {
+        'group_id': group_id,
+        'notes': notes,
+        'contacts': [{
+            'sort_order': index,
+            'first_name': contact.get('first_name') or None,
+            'last_name': contact.get('last_name') or None,
+            'email': contact.get('email') or None,
+            'phone': contact.get('phone') or None,
+            'role': contact.get('role') or 'parent',
+        } for index, contact in enumerate(contacts)],
+    }
+    return json.dumps(
+        material, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+def _legacy_baseline_subscriber_signature(subscriber):
+    contacts = sorted(
+        subscriber.contacts,
+        key=lambda contact: (contact.sort_order, contact.id),
+    )
+    if any(contact.sort_order != index
+           for index, contact in enumerate(contacts)):
+        return None
+    return _legacy_baseline_household_signature(
+        subscriber.group_id,
+        subscriber.notes,
+        [{
+            'first_name': contact.first_name,
+            'last_name': contact.last_name,
+            'email': contact.email,
+            'phone': contact.phone,
+            'role': contact.role,
+        } for contact in contacts],
+    )
+
+
+def _legacy_baseline_state_hash(snapshot):
+    """Key the audit fingerprint so stored hashes do not expose PII oracles."""
+    canonical = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return hmac.new(
+        app.config['SECRET_KEY'].encode('utf-8'),
+        b'legacy-roster-baseline-state-v1\x00' + canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _manual_provenance_manifest(entry):
+    material = {
+        'version': MANUAL_PROVENANCE_SCHEMA_VERSION,
+        'entry': entry,
+    }
+    return hashlib.sha256(json.dumps(
+        material, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')).hexdigest()
+
+
+def _manual_provenance_record_valid(batch, change, subscriber):
+    metadata = _import_metadata(batch)
+    try:
+        recorded = json.loads(change.after_json or '{}')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(recorded, dict):
+        return False
+    entry = {
+        'subscriber_id': recorded.get('subscriber_id'),
+        'created_at': recorded.get('created_at'),
+        'state_hash': recorded.get('state_hash'),
+        'operation': 'preserve_manual',
+    }
+    manifest_sha = _manual_provenance_manifest(entry)
+    return bool(
+        batch.status == 'applied'
+        and batch.applied_at is not None
+        and metadata.get('kind') == MANUAL_PROVENANCE_KIND
+        and metadata.get('version') == MANUAL_PROVENANCE_SCHEMA_VERSION
+        and metadata.get('manifest_sha256') == manifest_sha
+        and batch.file_sha256 == manifest_sha
+        and batch.analysis_context_sha256 == manifest_sha
+        and batch.plan_hash == manifest_sha
+        and batch.total_rows == batch.selected_rows == 1
+        and batch.rejected_rows == batch.excluded_rows == 0
+        and ImportChange.query.filter_by(batch_id=batch.id).count() == 1
+        and ImportRow.query.filter_by(batch_id=batch.id).count() == 0
+        and ImportFile.query.filter_by(batch_id=batch.id).count() == 0
+        and change.operation == 'preserve_manual'
+        and change.target_table == 'notification_subscriber'
+        and change.target_id == subscriber.id
+        and entry['subscriber_id'] == subscriber.id
+        and recorded.get('provenance_version')
+        == MANUAL_PROVENANCE_SCHEMA_VERSION
+        and entry['created_at'] == _snapshot_datetime(subscriber.created_at)
+        and re.fullmatch(r'[0-9a-f]{64}', str(entry['state_hash'] or ''))
+    )
+
+
+def _record_manual_subscriber_provenance(subscriber, operator):
+    """Create PII-free ownership evidence in the subscriber transaction."""
+    if not subscriber.id or subscriber.created_at is None:
+        raise ValueError('A manual subscriber needs a stable row before audit.')
+    contact_identities = _contact_identity_map([subscriber])
+    entry = {
+        'subscriber_id': subscriber.id,
+        'created_at': _snapshot_datetime(subscriber.created_at),
+        'state_hash': _legacy_baseline_state_hash(
+            _subscriber_snapshot(subscriber, contact_identities)),
+        'operation': 'preserve_manual',
+    }
+    manifest_sha = _manual_provenance_manifest(entry)
+    now = max(_utcnow(), subscriber.created_at)
+    metadata = {
+        'kind': MANUAL_PROVENANCE_KIND,
+        'version': MANUAL_PROVENANCE_SCHEMA_VERSION,
+        'manifest_sha256': manifest_sha,
+        'approved_by_id': operator.id,
+        'applied_at': now.isoformat() + 'Z',
+    }
+    batch = ImportBatch(
+        public_id=secrets.token_urlsafe(32),
+        source_type=MANUAL_PROVENANCE_SOURCE_TYPE,
+        schema_version=MANUAL_PROVENANCE_SCHEMA_VERSION,
+        status='applied', snapshot_type='delta', school_year=None,
+        uploaded_by_id=operator.id,
+        file_sha256=manifest_sha,
+        analysis_context_sha256=manifest_sha,
+        plan_hash=manifest_sha,
+        total_rows=1, selected_rows=1, rejected_rows=0, excluded_rows=0,
+        metadata_json=json.dumps(metadata, sort_keys=True),
+        created_at=now, applied_at=now,
+        expires_at=now + timedelta(
+            hours=app.config['IMPORT_STAGE_TTL_HOURS']),
+    )
+    db.session.add(batch)
+    db.session.flush()
+    db.session.add(ImportChange(
+        batch_id=batch.id,
+        operation='preserve_manual',
+        target_table='notification_subscriber',
+        target_id=subscriber.id,
+        after_json=json.dumps({
+            'subscriber_id': entry['subscriber_id'],
+            'created_at': entry['created_at'],
+            'state_hash': entry['state_hash'],
+            'provenance_version': MANUAL_PROVENANCE_SCHEMA_VERSION,
+        }, sort_keys=True),
+        created_at=now,
+    ))
+    return batch
+
+
+def _legacy_baseline_existing_batches():
+    return ImportBatch.query.filter_by(
+        source_type='legacy_csv',
+        schema_version=LEGACY_BASELINE_SCHEMA_VERSION,
+    ).order_by(ImportBatch.id).all()
+
+
+def _legacy_baseline_build_manifest(source_path, existing_batch=None):
+    source = _legacy_baseline_source_plan(source_path)
+    state = _active_non_powerschool_roster_state()
+    if state['powerschool_active_count']:
+        raise ValueError(
+            'A PowerSchool roster is already active; baseline adoption is no longer safe.')
+    applied_powerschool = ImportBatch.query.filter(
+        ImportBatch.source_type == 'powerschool',
+        ImportBatch.status.in_([
+            'applied', 'rollback_failed', 'retention_closed',
+        ]),
+    ).first()
+    if applied_powerschool:
+        raise ValueError(
+            'A PowerSchool batch has already been applied; baseline adoption is no longer safe.')
+    if state['conflicts'] or state['incarnation_excluded_count']:
+        raise ValueError('Existing roster provenance is conflicting or unverifiable.')
+
+    subscribers = state['subscribers']
+    if existing_batch is None:
+        if state['legacy'] or state['manual']:
+            raise ValueError(
+                'The active roster already has partial explicit provenance; '
+                'baseline adoption is blocked.')
+    else:
+        metadata = _import_metadata(existing_batch)
+        if (metadata.get('kind') != LEGACY_BASELINE_KIND
+                or metadata.get('version') != LEGACY_BASELINE_SCHEMA_VERSION
+                or existing_batch.file_sha256 != source['source_sha256']
+                or metadata.get('source_sha256') != source['source_sha256']
+                or existing_batch.analysis_context_sha256
+                != metadata.get('manifest_sha256')
+                or existing_batch.plan_hash != metadata.get('manifest_sha256')):
+            raise ValueError('The existing baseline metadata is incomplete or inconsistent.')
+        baseline_changes = ImportChange.query.filter_by(
+            batch_id=existing_batch.id,
+            target_table='notification_subscriber',
+        ).order_by(ImportChange.id).all()
+        recorded = {}
+        for change in baseline_changes:
+            if (change.operation not in {
+                    'adopt_legacy_ownership', 'preserve_manual'}
+                    or change.target_id is None
+                    or change.target_id in recorded):
+                raise ValueError('The existing baseline audit is incomplete or duplicated.')
+            try:
+                change_record = json.loads(change.after_json or '{}')
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    'The existing baseline audit record is malformed.') from exc
+            if (not isinstance(change_record, dict)
+                    or change_record.get('subscriber_id') != change.target_id
+                    or change_record.get('baseline_version')
+                    != LEGACY_BASELINE_SCHEMA_VERSION
+                    or change_record.get('created_at') is None
+                    or not re.fullmatch(
+                        r'[0-9a-f]{64}',
+                        str(change_record.get('state_hash') or ''))):
+                raise ValueError('The existing baseline audit record is incomplete.')
+            recorded[change.target_id] = change.operation
+        if set(recorded) != {subscriber.id for subscriber in subscribers}:
+            raise ValueError('The active roster no longer matches the applied baseline.')
+
+    source_signatures = []
+    for household in source['households']:
+        source_signatures.append(_legacy_baseline_household_signature(
+            household['group_id'], household['notes'], household['contacts']))
+    if len(source_signatures) != len(set(source_signatures)):
+        raise ValueError(
+            'The Legacy source contains duplicate household signatures and '
+            'cannot be matched one-to-one.')
+
+    database_matches = {}
+    for subscriber in subscribers:
+        signature = _legacy_baseline_subscriber_signature(subscriber)
+        if signature is None:
+            raise ValueError('A roster contact order is not historically reproducible.')
+        database_matches.setdefault(signature, []).append(subscriber)
+    matched = []
+    matched_ids = set()
+    for signature in source_signatures:
+        candidates = database_matches.get(signature, [])
+        if len(candidates) != 1 or candidates[0].id in matched_ids:
+            raise ValueError(
+                'The Legacy source does not have an exact one-to-one active roster match.')
+        matched.append(candidates[0])
+        matched_ids.add(candidates[0].id)
+    preserved = [
+        subscriber for subscriber in subscribers
+        if subscriber.id not in matched_ids
+    ]
+    if existing_batch is not None:
+        actual_operations = {
+            subscriber.id: 'adopt_legacy_ownership' for subscriber in matched
+        }
+        actual_operations.update({
+            subscriber.id: 'preserve_manual' for subscriber in preserved
+        })
+        recorded_operations = {
+            change.target_id: change.operation
+            for change in ImportChange.query.filter_by(
+                batch_id=existing_batch.id,
+                target_table='notification_subscriber',
+            ).all()
+        }
+        if actual_operations != recorded_operations:
+            raise ValueError('The source disposition no longer matches the applied baseline.')
+
+    contact_identities = _contact_identity_map(subscribers)
+    entries = []
+    for operation, collection in (
+            ('adopt_legacy_ownership', matched),
+            ('preserve_manual', preserved)):
+        for subscriber in collection:
+            if subscriber.created_at is None:
+                raise ValueError('A roster row has no verifiable creation timestamp.')
+            snapshot = _subscriber_snapshot(subscriber, contact_identities)
+            entries.append({
+                'subscriber_id': subscriber.id,
+                'created_at': _snapshot_datetime(subscriber.created_at),
+                'state_hash': _legacy_baseline_state_hash(snapshot),
+                'operation': operation,
+            })
+    entries.sort(key=lambda item: item['subscriber_id'])
+    manifest = {
+        'version': LEGACY_BASELINE_SCHEMA_VERSION,
+        'source_sha256': source['source_sha256'],
+        'entries': entries,
+    }
+    manifest_sha256 = hashlib.sha256(json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')).hexdigest()
+    if existing_batch is not None:
+        metadata = _import_metadata(existing_batch)
+        expected_counts = {
+            'candidate_count': len(matched),
+            'contact_count': source['contact_count'],
+            'group_count': source['group_count'],
+            'preserved_count': len(preserved),
+        }
+        if (manifest_sha256 != metadata.get('manifest_sha256')
+                or existing_batch.total_rows != len(entries)
+                or existing_batch.selected_rows != len(entries)
+                or existing_batch.rejected_rows != 0
+                or existing_batch.excluded_rows != 0
+                or any(metadata.get(key) != value
+                       for key, value in expected_counts.items())):
+            raise ValueError('The applied baseline no longer matches its manifest.')
+        recorded_by_id = {}
+        for change in ImportChange.query.filter_by(
+                batch_id=existing_batch.id,
+                target_table='notification_subscriber').all():
+            recorded_by_id[change.target_id] = json.loads(change.after_json)
+        for entry in entries:
+            recorded_entry = recorded_by_id.get(entry['subscriber_id']) or {}
+            if (recorded_entry.get('created_at') != entry['created_at']
+                    or recorded_entry.get('state_hash') != entry['state_hash']):
+                raise ValueError(
+                    'The active roster state changed after baseline adoption.')
+    return {
+        'source_sha256': source['source_sha256'],
+        'manifest_sha256': manifest_sha256,
+        'candidate_count': len(matched),
+        'contact_count': source['contact_count'],
+        'group_count': source['group_count'],
+        'preserved_count': len(preserved),
+        'entries': entries,
+    }
+
+
+def _legacy_baseline_public_summary(plan, mode, already_applied=False):
+    return {
+        'ok': True,
+        'mode': mode,
+        'already_applied': bool(already_applied),
+        'candidate_count': plan['candidate_count'],
+        'contact_count': plan['contact_count'],
+        'group_count': plan['group_count'],
+        'preserved_count': plan['preserved_count'],
+        'source_sha256': plan['source_sha256'],
+        'manifest_sha256': plan['manifest_sha256'],
+    }
+
+
+@app.cli.command('adopt-legacy-baseline')
+@click.argument('source_csv', type=click.Path(
+    exists=True, dir_okay=False, readable=True, path_type=str))
+@click.option('--apply', 'apply_changes', is_flag=True,
+              help='Persist the exactly approved baseline manifest.')
+@click.option('--source-sha', default=None,
+              help='Expected SHA-256 of the original Legacy combined CSV.')
+@click.option('--manifest-sha', default=None,
+              help='Exact manifest SHA-256 printed by the dry-run.')
+@click.option('--expected-candidates', type=click.IntRange(min=0), default=None)
+@click.option('--expected-contacts', type=click.IntRange(min=0), default=None)
+@click.option('--expected-groups', type=click.IntRange(min=0), default=None)
+@click.option('--expected-preserved', type=click.IntRange(min=0), default=None)
+@click.option('--approved-by', default=None,
+              help='Username of the active administrator approving adoption.')
+def adopt_legacy_baseline_command(
+        source_csv, apply_changes, source_sha, manifest_sha,
+        expected_candidates, expected_contacts, expected_groups,
+        expected_preserved, approved_by):
+    """Dry-run or adopt provenance for one historical Legacy CSV roster."""
+    with _roster_import_lock() as acquired:
+        if not acquired:
+            raise click.ClickException(
+                'Another roster mutation is in progress; try again later.')
+        try:
+            # Lock all relevant rows before deriving or applying a manifest.
+            active = NotificationSubscriber.query.options(
+                selectinload(NotificationSubscriber.contacts),
+                selectinload(NotificationSubscriber.group),
+            ).filter(NotificationSubscriber.active.is_(True)).with_for_update().all()
+            active_ids = {subscriber.id for subscriber in active}
+            if active_ids:
+                SubscriberContact.query.filter(
+                    SubscriberContact.subscriber_id.in_(active_ids),
+                ).with_for_update().all()
+            ExternalIdentity.query.with_for_update().all()
+            ImportBatch.query.filter(
+                or_(
+                    ImportBatch.source_type == 'powerschool',
+                    and_(
+                        ImportBatch.source_type == 'legacy_csv',
+                        ImportBatch.schema_version == LEGACY_BASELINE_SCHEMA_VERSION,
+                    ),
+                ),
+            ).with_for_update().all()
+            existing_batches = _legacy_baseline_existing_batches()
+            if len(existing_batches) > 1:
+                raise ValueError('Multiple provenance baselines exist; manual review is required.')
+            existing = existing_batches[0] if existing_batches else None
+            if existing and existing.status != 'applied':
+                raise ValueError('A partial provenance baseline exists; manual review is required.')
+            plan = _legacy_baseline_build_manifest(source_csv, existing)
+
+            if not apply_changes:
+                db.session.rollback()
+                click.echo(json.dumps(_legacy_baseline_public_summary(
+                    plan, 'dry-run', already_applied=bool(existing)), sort_keys=True))
+                return
+
+            required_options = {
+                '--source-sha': source_sha,
+                '--manifest-sha': manifest_sha,
+                '--expected-candidates': expected_candidates,
+                '--expected-contacts': expected_contacts,
+                '--expected-groups': expected_groups,
+                '--expected-preserved': expected_preserved,
+                '--approved-by': approved_by,
+            }
+            missing = [name for name, value in required_options.items()
+                       if value is None or value == '']
+            if missing:
+                raise ValueError(
+                    'Apply requires every dry-run checksum, aggregate, and approver option.')
+            if not re.fullmatch(r'[0-9a-fA-F]{64}', str(source_sha)):
+                raise ValueError('The expected source SHA-256 is invalid.')
+            if not re.fullmatch(r'[0-9a-fA-F]{64}', str(manifest_sha)):
+                raise ValueError('The expected manifest SHA-256 is invalid.')
+            expected = {
+                'candidate_count': expected_candidates,
+                'contact_count': expected_contacts,
+                'group_count': expected_groups,
+                'preserved_count': expected_preserved,
+            }
+            if not hmac.compare_digest(
+                    plan['source_sha256'], str(source_sha).lower()):
+                raise ValueError('The Legacy source checksum does not match approval.')
+            if not hmac.compare_digest(
+                    plan['manifest_sha256'], str(manifest_sha).lower()):
+                raise ValueError('The current roster manifest does not match approval.')
+            if any(plan[key] != value for key, value in expected.items()):
+                raise ValueError('One or more approved aggregate counts changed.')
+            approver = User.query.filter_by(
+                username=str(approved_by), active=True,
+            ).with_for_update().first()
+            approver_group = None
+            if approver and approver.group_id:
+                approver_group = UserGroup.query.filter_by(
+                    id=approver.group_id, is_admin=True,
+                ).with_for_update().first()
+            if not approver or not approver_group:
+                raise ValueError('The approving username is not an active administrator.')
+            if existing:
+                db.session.rollback()
+                click.echo(json.dumps(_legacy_baseline_public_summary(
+                    plan, 'apply', already_applied=True), sort_keys=True))
+                return
+
+            now = _utcnow()
+            metadata = {
+                'kind': LEGACY_BASELINE_KIND,
+                'version': LEGACY_BASELINE_SCHEMA_VERSION,
+                'source_sha256': plan['source_sha256'],
+                'manifest_sha256': plan['manifest_sha256'],
+                'candidate_count': plan['candidate_count'],
+                'contact_count': plan['contact_count'],
+                'group_count': plan['group_count'],
+                'preserved_count': plan['preserved_count'],
+                'approved_by_id': approver.id,
+                'applied_at': now.isoformat() + 'Z',
+            }
+            batch = ImportBatch(
+                public_id=secrets.token_urlsafe(32),
+                source_type='legacy_csv',
+                schema_version=LEGACY_BASELINE_SCHEMA_VERSION,
+                status='applied', snapshot_type='delta', school_year=None,
+                uploaded_by_id=approver.id,
+                file_sha256=plan['source_sha256'],
+                analysis_context_sha256=plan['manifest_sha256'],
+                plan_hash=plan['manifest_sha256'],
+                total_rows=len(plan['entries']),
+                selected_rows=len(plan['entries']),
+                rejected_rows=0, excluded_rows=0,
+                metadata_json=json.dumps(metadata, sort_keys=True),
+                created_at=now, applied_at=now,
+                expires_at=now + timedelta(
+                    hours=app.config['IMPORT_STAGE_TTL_HOURS']),
+            )
+            db.session.add(batch)
+            db.session.flush()
+            for entry in plan['entries']:
+                db.session.add(ImportChange(
+                    batch_id=batch.id,
+                    operation=entry['operation'],
+                    target_table='notification_subscriber',
+                    target_id=entry['subscriber_id'],
+                    after_json=json.dumps({
+                        'subscriber_id': entry['subscriber_id'],
+                        'created_at': entry['created_at'],
+                        'state_hash': entry['state_hash'],
+                        'baseline_version': LEGACY_BASELINE_SCHEMA_VERSION,
+                    }, sort_keys=True),
+                    created_at=now,
+                ))
+            db.session.add(AuditLog(
+                user_id=approver.id,
+                username=approver.username,
+                action='legacy_baseline_adopted',
+                module='notifications',
+                target=batch.public_id,
+                details=(
+                    f'candidates={plan["candidate_count"]}; '
+                    f'contacts={plan["contact_count"]}; '
+                    f'groups={plan["group_count"]}; '
+                    f'preserved={plan["preserved_count"]}; '
+                    f'source_sha256={plan["source_sha256"]}; '
+                    f'manifest_sha256={plan["manifest_sha256"]}'
+                ),
+                ip_address='cli',
+                created_at=now,
+            ))
+            db.session.commit()
+            click.echo(json.dumps(_legacy_baseline_public_summary(
+                plan, 'apply'), sort_keys=True))
+        except ValueError as exc:
+            db.session.rollback()
+            raise click.ClickException(str(exc)) from exc
+        except Exception:
+            db.session.rollback()
+            raise
+
+
 def _legacy_cutover_inventory():
     """Return provenance-bound legacy candidates and reincarnation exclusions.
 
@@ -5249,59 +6152,39 @@ def _legacy_cutover_inventory():
     PowerSchool cutover.  The creation timestamps also bind the audit target
     to the same row incarnation because SQLite may reuse a deleted integer PK.
     """
-    provenance = {
-        target_id: created_at
-        for target_id, created_at in db.session.query(
-            ImportChange.target_id,
-            func.max(ImportChange.created_at),
-        ).join(
-            ImportBatch, ImportBatch.id == ImportChange.batch_id
-        ).filter(
-            ImportBatch.source_type == 'legacy_csv',
-            ImportBatch.status == 'applied',
-            ImportChange.operation == 'create',
-            ImportChange.target_table == 'notification_subscriber',
-            ImportChange.target_id.isnot(None),
-        ).group_by(ImportChange.target_id).all()
-    }
-    imported_ids = set(provenance)
-    if not imported_ids:
-        return [], 0
-    powerschool_ids = {
-        local_id for (local_id,) in db.session.query(
-            ExternalIdentity.local_id
-        ).filter(
-            ExternalIdentity.source_type == 'powerschool',
-            ExternalIdentity.entity_type == 'student',
-            ExternalIdentity.local_table == 'notification_subscriber',
-            ExternalIdentity.local_id.in_(imported_ids),
-        ).distinct().all()
-    }
-    candidates = imported_ids - powerschool_ids
-    if not candidates:
-        return [], 0
-    loaded = NotificationSubscriber.query.options(
-        selectinload(NotificationSubscriber.contacts),
-        selectinload(NotificationSubscriber.group),
-    ).filter(
-        NotificationSubscriber.id.in_(candidates),
-        NotificationSubscriber.active.is_(True),
-    ).order_by(NotificationSubscriber.id).all()
-    verified = []
-    incarnation_excluded = 0
-    for subscriber in loaded:
-        imported_at = provenance.get(subscriber.id)
-        if (not subscriber.created_at or not imported_at
-                or subscriber.created_at > imported_at):
-            incarnation_excluded += 1
-            continue
-        verified.append(subscriber)
-    return verified, incarnation_excluded
+    state = _active_non_powerschool_roster_state()
+    return state['legacy'], (
+        state['incarnation_excluded_count'] + len(state['conflicts'])
+    )
 
 
 def _active_legacy_cutover_subscribers():
     subscribers, _ = _legacy_cutover_inventory()
     return subscribers
+
+
+def _currently_applied_powerschool_batch_exists():
+    return ImportBatch.query.filter(
+        ImportBatch.source_type == 'powerschool',
+        ImportBatch.status.in_([
+            'applied', 'rollback_failed', 'retention_closed',
+        ]),
+    ).first() is not None
+
+
+def _unmanaged_roster_block_message(baseline_available):
+    if baseline_available:
+        return (
+            'Active subscribers have no explicit Legacy or manual '
+            'provenance. Reconcile the exact original Legacy CSV with the '
+            'one-time baseline command, then analyze all three PowerSchool '
+            'files again.')
+    return (
+        'Active subscribers have no explicit roster provenance while '
+        'PowerSchool ownership or an applied PowerSchool roster is already '
+        'present. Automatic baseline adoption is unavailable; keep Apply '
+        'blocked and perform manual provenance review before creating a new '
+        'analysis.')
 
 
 def _legacy_cutover_rows(batch):
@@ -5323,6 +6206,9 @@ def _legacy_cutover_payload(batch, metadata):
         'required': False,
         'candidate_count': 0,
         'incarnation_excluded_count': 0,
+        'baseline_required': False,
+        'baseline_available': False,
+        'unmanaged_count': 0,
         'approved': False,
         'blocked': False,
         'requires_reanalysis': False,
@@ -5331,6 +6217,27 @@ def _legacy_cutover_payload(batch, metadata):
     result = {**defaults, **stored}
     if batch.status != 'staged':
         return result
+
+    roster_state = _active_non_powerschool_roster_state()
+    unmanaged_count = (
+        len(roster_state['unmanaged']) + len(roster_state['conflicts'])
+    )
+    if unmanaged_count:
+        baseline_available = bool(
+            not roster_state['powerschool_active_count']
+            and not _currently_applied_powerschool_batch_exists())
+        return {
+            **defaults,
+            'required': True,
+            'baseline_required': True,
+            'baseline_available': baseline_available,
+            'unmanaged_count': unmanaged_count,
+            'incarnation_excluded_count': roster_state[
+                'incarnation_excluded_count'],
+            'blocked': True,
+            'requires_reanalysis': True,
+            'message': _unmanaged_roster_block_message(baseline_available),
+        }
 
     live_ids = {
         subscriber.id for subscriber in _active_legacy_cutover_subscribers()
@@ -5372,6 +6279,14 @@ def _legacy_cutover_payload(batch, metadata):
 
 
 def _legacy_cutover_apply_error(batch):
+    roster_state = _active_non_powerschool_roster_state()
+    unmanaged_count = (
+        len(roster_state['unmanaged']) + len(roster_state['conflicts'])
+    )
+    if unmanaged_count:
+        return _unmanaged_roster_block_message(bool(
+            not roster_state['powerschool_active_count']
+            and not _currently_applied_powerschool_batch_exists()))
     regular_rows = ImportRow.query.filter(
         ImportRow.batch_id == batch.id,
         ImportRow.classification.in_(['new', 'update']),
@@ -5731,11 +6646,25 @@ def powerschool_import_preview():
                 row_hash=hashlib.sha256(normalized_json.encode()).hexdigest()))
             row_number += 1
 
-        legacy_subscribers, legacy_incarnation_excluded = (
-            _legacy_cutover_inventory())
+        roster_state = _active_non_powerschool_roster_state()
+        legacy_subscribers = roster_state['legacy']
+        legacy_incarnation_excluded = (
+            roster_state['incarnation_excluded_count']
+            + len(roster_state['conflicts'])
+        )
+        unmanaged_count = (
+            len(roster_state['unmanaged']) + len(roster_state['conflicts'])
+        )
+        baseline_required = bool(
+            unmanaged_count and parsed['students']
+        )
+        baseline_available = bool(
+            baseline_required
+            and not roster_state['powerschool_active_count']
+            and not _currently_applied_powerschool_batch_exists())
         legacy_contact_identities = _contact_identity_map(legacy_subscribers)
         legacy_cutover_required = bool(
-            legacy_subscribers and parsed['students'])
+            (legacy_subscribers or baseline_required) and parsed['students'])
         legacy_cutover_contract_blocked = bool(
             legacy_cutover_required
             and (parsed.get('preflight') or {}).get(
@@ -5746,7 +6675,7 @@ def powerschool_import_preview():
                  or legacy_cutover_contract_blocked))
         legacy_cutover_blocked = bool(
             legacy_cutover_required
-            and (legacy_cutover_scope_blocked
+            and (baseline_required or legacy_cutover_scope_blocked
                  or counts['conflict'] or counts['rejected']))
         if legacy_cutover_required and not legacy_cutover_blocked:
             for subscriber in legacy_subscribers:
@@ -5784,6 +6713,11 @@ def powerschool_import_preview():
                 local_table='notification_subscriber').all()
             by_subscriber = {}
             for identity in identities:
+                identity_subscriber = db.session.get(
+                    NotificationSubscriber, identity.local_id)
+                if not _powerschool_subscriber_identity_current(
+                        identity, identity_subscriber):
+                    continue
                 by_subscriber.setdefault(identity.local_id, set()).add(identity.external_key)
             for subscriber_id, student_numbers in sorted(by_subscriber.items()):
                 if student_numbers & uploaded_students:
@@ -5824,10 +6758,15 @@ def powerschool_import_preview():
                 'required': legacy_cutover_required,
                 'candidate_count': len(legacy_subscribers),
                 'incarnation_excluded_count': legacy_incarnation_excluded,
+                'baseline_required': baseline_required,
+                'baseline_available': baseline_available,
+                'unmanaged_count': unmanaged_count if baseline_required else 0,
                 'approved': False,
                 'blocked': legacy_cutover_blocked,
                 'requires_reanalysis': legacy_cutover_blocked,
                 'message': (
+                    _unmanaged_roster_block_message(baseline_available)
+                    if baseline_required else
                     'Legacy CSV cutover requires the approved Transportation '
                     'v2 export and a district-wide Full Snapshot. Select Full '
                     'Snapshot and analyze the three files again before '
@@ -5918,6 +6857,10 @@ def powerschool_import_selection(public_id):
     metadata = _import_metadata(batch)
     cutover = _legacy_cutover_payload(batch, metadata)
     legacy_cutover_approved = payload.get('legacy_cutover_approved') is True
+    if cutover.get('baseline_required') or cutover.get('requires_reanalysis'):
+        return jsonify({'ok': False, 'message':
+                        cutover.get('message') or
+                        'This roster state requires a new analysis.'}), 409
     claimed = ImportBatch.query.filter_by(
         id=batch.id, status='staged', plan_hash=expected_plan_hash).update(
             {'status': 'selecting'}, synchronize_session=False)
@@ -5930,6 +6873,13 @@ def powerschool_import_selection(public_id):
         return jsonify({'ok': False, 'status': 'expired', 'message':
                         'This staged analysis expired during selection. '
                         'Analyze the three files again.'}), 410
+    cutover = _legacy_cutover_payload(batch, _import_metadata(batch))
+    if cutover.get('baseline_required') or cutover.get('requires_reanalysis'):
+        batch.status = 'staged'
+        db.session.commit()
+        return jsonify({'ok': False, 'message':
+                        cutover.get('message') or
+                        'This roster state requires a new analysis.'}), 409
     rows = ImportRow.query.filter_by(batch_id=batch.id).all()
     legacy_rows = _legacy_cutover_rows(batch)
     legacy_ids = {row.id for row, _ in legacy_rows}
@@ -6028,6 +6978,12 @@ def _ensure_external_identity(batch, row, entity_type, external_key,
     if identity:
         if identity.local_table != local_table or identity.local_id != local_id:
             raise ValueError('An external identity changed after preview.')
+        if local_table == 'notification_subscriber':
+            subscriber = db.session.get(NotificationSubscriber, local_id)
+            if not _powerschool_subscriber_identity_current(
+                    identity, subscriber):
+                raise ValueError(
+                    'An external identity belongs to a stale enrollment incarnation.')
         return identity
     identity = ExternalIdentity(
         source_type='powerschool', entity_type=entity_type,
@@ -6044,8 +7000,15 @@ def _ensure_external_identity(batch, row, entity_type, external_key,
 
 def _apply_powerschool_proposal(batch, row, proposal, created_groups):
     identity = _powerschool_identity('student', proposal['student_number'])
-    subscriber = (db.session.get(NotificationSubscriber, identity.local_id)
-                  if identity else None)
+    subscriber = None
+    if identity:
+        identity_subscriber = db.session.get(
+            NotificationSubscriber, identity.local_id)
+        if not _powerschool_subscriber_identity_current(
+                identity, identity_subscriber):
+            raise ValueError(
+                'A student identity belongs to a stale enrollment incarnation.')
+        subscriber = identity_subscriber
     current_snapshot = _subscriber_snapshot(subscriber) if subscriber else None
     if _snapshot_hash(current_snapshot) != proposal.get('expected_state_hash'):
         raise ValueError('An enrollment changed after preview; analyze the files again.')

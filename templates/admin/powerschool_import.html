@@ -166,6 +166,14 @@
           <p id="legacy-cutover-message" class="text-sm text-amber-900 mt-1"></p>
           <p id="legacy-cutover-count" class="text-xs font-semibold text-amber-800 mt-2"></p>
           <p class="mt-2 text-xs font-semibold text-amber-900">Safety gate: Legacy CSV cutover is prohibited in Delta and requires the approved Transportation v2 dual-route export as a Complete district snapshot, with zero conflicts and zero rejected rows. Transportation v1 remains blocked even when marked Full. ALL importable new/update rows must remain selected; an empty or partial selection is blocked.</p>
+          <div id="legacy-baseline-warning" class="hidden mt-3 rounded-xl border border-red-300 bg-red-50 p-3 text-xs text-red-900">
+            <p class="font-semibold"><i class="fas fa-lock mr-1"></i>Historical Legacy CSV provenance baseline required</p>
+            <p id="legacy-baseline-count" class="mt-1"></p>
+            <p class="mt-1">STOP: do not Apply this PowerSchool batch. A server operator must first adopt the exact original Legacy combined CSV using the fail-closed baseline command. Do not reconstruct, edit or re-export that file. Any missing or ambiguous match blocks adoption.</p>
+            <p class="mt-1">The ordinary cutover never infers ownership from names, email, phone or other PII. This exceptional one-time recovery compares the exact known historical CSV to current records using full-record equality; it is not fuzzy identity matching.</p>
+            <p class="mt-1">An already staged Delta analysis cannot authorize the first cutover. After baseline adoption succeeds, upload the current three PowerSchool files again and create a new <strong>Complete district snapshot</strong> analysis.</p>
+            <a href="{{ url_for('powerschool_import_guide') }}#legacy-baseline-adoption" class="mt-2 inline-flex items-center gap-1 font-semibold text-red-800 underline hover:text-red-950"><i class="fas fa-book-open"></i>Open the baseline adoption procedure</a>
+          </div>
           <p id="legacy-cutover-blocked-message" class="hidden mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-800"></p>
           <label id="legacy-cutover-approval-wrap" class="hidden mt-3 items-start gap-2 rounded-xl border border-amber-300 bg-white p-3 text-xs text-amber-950">
             <input id="approve-legacy-cutover" type="checkbox" class="mt-0.5">
@@ -437,6 +445,7 @@
 
   function legacyCutoverBlocksApply() {
     const cutover = currentLegacyCutover();
+    if (cutover.baseline_required === true) return true;
     return cutover.required === true && (
       cutover.approved !== true || cutover.blocked === true || cutover.requires_reanalysis === true
     );
@@ -449,12 +458,18 @@
 
   function renderLegacyCutover() {
     const cutover = currentLegacyCutover();
-    const required = cutover.required === true;
+    const baselineRequired = cutover.baseline_required === true;
+    const baselineAvailable = cutover.baseline_available === true;
+    const required = cutover.required === true || baselineRequired;
     const banner = byId('legacy-cutover-banner');
     const approvalWrap = byId('legacy-cutover-approval-wrap');
     const approval = byId('approve-legacy-cutover');
     const blockedMessage = byId('legacy-cutover-blocked-message');
+    const baselineWarning = byId('legacy-baseline-warning');
+    const cutoverCount = byId('legacy-cutover-count');
     banner.classList.toggle('hidden', !required);
+    baselineWarning.classList.toggle('hidden', !baselineRequired);
+    cutoverCount.classList.toggle('hidden', baselineRequired);
     if (!required) {
       approval.checked = false;
       approval.disabled = true;
@@ -468,22 +483,31 @@
       ? Number(cutover.candidate_count) : 0;
     const incarnationExcluded = Number.isFinite(Number(cutover.incarnation_excluded_count))
       ? Number(cutover.incarnation_excluded_count) : 0;
+    const unmanagedCount = Number.isFinite(Number(cutover.unmanaged_count))
+      ? Number(cutover.unmanaged_count) : 0;
+    byId('legacy-baseline-count').textContent = unmanagedCount
+      ? `${unmanagedCount} active subscriber record${unmanagedCount === 1 ? '' : 's'} lack explicit import provenance; only an aggregate count is shown.`
+      : 'Active subscriber records lack explicit import provenance; no personal data is shown.';
     byId('legacy-cutover-message').textContent = cutover.message ||
       'This PowerSchool batch overlaps subscribers previously created by applied Legacy CSV batches.';
-    byId('legacy-cutover-count').textContent =
+    cutoverCount.textContent =
       `${candidateCount} legacy subscriber${candidateCount === 1 ? '' : 's'} will be included in the atomic cutover.` +
       (incarnationExcluded
         ? ` ${incarnationExcluded} reused or unverifiable record ID${incarnationExcluded === 1 ? '' : 's'} will be preserved.`
         : '');
 
-    const unavailable = cutover.blocked === true || cutover.requires_reanalysis === true;
+    const unavailable = baselineRequired || cutover.blocked === true || cutover.requires_reanalysis === true;
     approval.checked = cutover.approved === true;
     approval.disabled = unavailable || batch.status !== 'staged';
     approvalWrap.classList.toggle('hidden', unavailable);
     approvalWrap.classList.toggle('flex', !unavailable);
     blockedMessage.classList.toggle('hidden', !unavailable);
     if (unavailable) {
-      blockedMessage.textContent = cutover.requires_reanalysis === true
+      blockedMessage.textContent = baselineRequired
+        ? baselineAvailable
+          ? 'Apply is blocked until the historical Legacy CSV baseline is adopted and the three PowerSchool files are re-analyzed as a Complete district snapshot.'
+          : 'Apply is blocked pending manual provenance review; automatic baseline adoption is unavailable while PowerSchool ownership or an applied roster is present.'
+        : cutover.requires_reanalysis === true
         ? 'Apply is blocked because this stored analysis must be re-analyzed with the current legacy cutover plan.'
         : 'Apply is blocked because the legacy cutover cannot be approved for this batch.';
     }
