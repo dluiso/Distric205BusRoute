@@ -16,6 +16,12 @@ from test_phase3_powerschool import (
 )
 
 
+V2_TRANSPORT_HEADER = (
+    'student_number,first_name,last_name,grade,transport_status,route_am,route_pm,'
+    'school,student_id\n'
+)
+
+
 @pytest.fixture(autouse=True)
 def enable_powerschool():
     previous = application.app.config['POWERSCHOOL_IMPORT_ENABLED']
@@ -58,6 +64,7 @@ def test_zero_valid_transportation_fails_preflight_without_persisting_batch(
     assert response.status_code == 400
     payload = response.get_json()
     assert payload['code'] == 'no_valid_transportation_rows'
+    assert 'D205 BusRoute - Transportation v2' in payload['message']
     assert payload['preflight']['valid_transport_rows'] == 0
     assert payload['metrics']['contacts']['not_processed_rows'] == 1
     with application.app.app_context():
@@ -106,6 +113,158 @@ def test_snapshot_policy_is_part_of_analysis_context(logged_in_client):
     assert delta.status_code == 200
     assert complete.status_code == 200
     assert delta.get_json()['batch_id'] != complete.get_json()['batch_id']
+
+
+def test_transportation_v2_blocks_unproven_complete_snapshot_before_staging(
+        logged_in_client):
+    response = logged_in_client.post(
+        '/admin/notifications/powerschool/preview',
+        data={
+            '_csrf': csrf_token(logged_in_client),
+            'school_year': '2026-27',
+            'snapshot_type': 'full_district',
+            'mapping_profile_id': str(profile_id()),
+            'transportation_file': (
+                io.BytesIO((
+                    V2_TRANSPORT_HEADER
+                    + '0001,Ada,Lovelace,5,Active,TEST1 AM,,205,SID-0001\n'
+                ).encode()),
+                'D205_BusRoute_Transportation_v2.csv',
+                'text/csv',
+            ),
+            'contacts_file': (
+                io.BytesIO((CONTACT_HEADER + contact_row()).encode()),
+                'contacts.csv',
+                'text/csv',
+            ),
+        },
+        content_type='multipart/form-data',
+    )
+
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload['code'] == 'transportation_v2_full_snapshot_not_proven'
+    assert 'Select Delta' in payload['message']
+    assert payload['preflight']['dual_route'] is True
+    with application.app.app_context():
+        assert application.ImportBatch.query.count() == 0
+
+
+def test_transportation_v2_clean_dual_route_snapshot_can_stage(
+        logged_in_client):
+    setup_route()
+    response = logged_in_client.post(
+        '/admin/notifications/powerschool/preview',
+        data={
+            '_csrf': csrf_token(logged_in_client),
+            'school_year': '2026-27',
+            'snapshot_type': 'full_district',
+            'mapping_profile_id': str(profile_id()),
+            'transportation_file': (
+                io.BytesIO((
+                    V2_TRANSPORT_HEADER
+                    + '0001,Ada,Lovelace,5,Active,TEST1 AM,TEST1 PM,205,SID-0001\n'
+                ).encode()),
+                'D205_BusRoute_Transportation_v2.csv',
+                'text/csv',
+            ),
+            'contacts_file': (
+                io.BytesIO((CONTACT_HEADER + contact_row()).encode()),
+                'contacts.csv',
+                'text/csv',
+            ),
+        },
+        content_type='multipart/form-data',
+    )
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    payload = response.get_json()
+    assert payload['preflight']['dual_route'] is True
+    assert payload['metrics']['transportation']['period_am_rows'] == 1
+    assert payload['metrics']['transportation']['period_pm_rows'] == 1
+
+
+def test_transportation_v2_can_apply_different_am_and_pm_buses(
+        logged_in_client):
+    setup_route()
+    with application.app.app_context():
+        morning = application.BusScheduleType.query.filter_by(
+            name='Morning').one()
+        afternoon = application.BusScheduleType.query.filter_by(
+            name='Afternoon').one()
+        second_bus = application.Bus(
+            identifier='TR', name='ALG1', route='Compound Test Route',
+            active=True)
+        application.db.session.add(second_bus)
+        application.db.session.flush()
+        application.db.session.add_all([
+            application.BusScheduleAssignment(
+                bus_id=second_bus.id, schedule_type_id=morning.id),
+            application.BusScheduleAssignment(
+                bus_id=second_bus.id, schedule_type_id=afternoon.id),
+        ])
+        application.db.session.commit()
+
+    response = logged_in_client.post(
+        '/admin/notifications/powerschool/preview',
+        data={
+            '_csrf': csrf_token(logged_in_client),
+            'school_year': '2026-27',
+            'snapshot_type': 'delta',
+            'mapping_profile_id': str(profile_id()),
+            'transportation_file': (
+                io.BytesIO((
+                    V2_TRANSPORT_HEADER
+                    + '0001,Ada,Lovelace,5,Active,TEST1 AM,TR ALG1 PM,205,SID-0001\n'
+                ).encode()),
+                'D205_BusRoute_Transportation_v2.csv',
+                'text/csv',
+            ),
+            'contacts_file': (
+                io.BytesIO((CONTACT_HEADER + contact_row()).encode()),
+                'contacts.csv',
+                'text/csv',
+            ),
+        },
+        content_type='multipart/form-data',
+    )
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    report = response.get_json()
+    row = next(item for item in report['rows']
+               if item['classification'] == 'new')
+    assert row['data']['group_name'] == 'TEST1 AM / TRALG1 PM'
+    assert apply_batch(logged_in_client, report).status_code == 200
+    with application.app.app_context():
+        group = application.NotificationSubscriber.query.one().group
+        assert {
+            (assignment.bus.name, assignment.schedule_type.name)
+            for assignment in group.bus_assignments
+        } == {('1', 'Morning'), ('ALG1', 'Afternoon')}
+
+
+def test_canonical_bus_lookup_handles_schedule_token_stored_as_bus_name(client):
+    with application.app.test_request_context():
+        morning = application.BusScheduleType.query.filter_by(
+            name='Morning').one()
+        afternoon = application.BusScheduleType.query.filter_by(
+            name='Afternoon').one()
+        bus = application.Bus(
+            identifier='MCK1', name='AM', route='McKinley', active=True)
+        application.db.session.add(bus)
+        application.db.session.flush()
+        application.db.session.add_all([
+            application.BusScheduleAssignment(
+                bus_id=bus.id, schedule_type_id=morning.id),
+            application.BusScheduleAssignment(
+                bus_id=bus.id, schedule_type_id=afternoon.id),
+        ])
+        application.db.session.commit()
+
+        resolved = application._powerschool_bus_for_route('MCK', '1', 'PM')
+
+        assert resolved is not None
+        assert resolved.id == bus.id
 
 
 def test_mapping_content_change_allows_fresh_analysis(logged_in_client):

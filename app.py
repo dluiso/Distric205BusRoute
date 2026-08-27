@@ -4,7 +4,8 @@
 # ============================================================
 
 from flask import (Flask, render_template, request, redirect, url_for,
-                   jsonify, flash, make_response, send_file, session, g, abort)
+                   jsonify, flash, make_response, send_file, session, g, abort,
+                   has_request_context)
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -19,8 +20,9 @@ from urllib.parse import urlsplit
 import click
 import hashlib, hmac, os, json, csv, io, pytz, re, time, secrets, html, math, tempfile, unicodedata
 from powerschool_import import (
-    DEFAULT_MAPPING_V1, NORMALIZER_REVISION, ImportValidationError,
-    build_normalized_plan,
+    DEFAULT_MAPPING_V1, NORMALIZER_REVISION, TRANSPORTATION_V2_CONTRACT,
+    ImportValidationError,
+    build_normalized_plan, normalize_route,
     canonical_plan_hash, safe_csv_cell,
 )
 from email_service import EmailTransportError, SMTPSettings, send_email, verify_connection
@@ -4621,7 +4623,7 @@ def _powerschool_analysis_context_hash(profile, mapping, combined_file_sha256,
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _powerschool_preflight_failure(parsed):
+def _powerschool_preflight_failure(parsed, snapshot_type='delta'):
     """Return a safe blocking diagnosis, or None when staging may continue."""
     preflight = parsed.get('preflight') or {}
     valid_transport = int(preflight.get('valid_transport_rows') or 0)
@@ -4631,8 +4633,8 @@ def _powerschool_preflight_failure(parsed):
             'code': 'no_valid_transportation_rows',
             'message': (
                 'Transportation contains no valid bus assignments. '
-                'Re-export it from the approved district-wide PowerSchool '
-                'template and verify that busnumber is populated. No batch '
+                'Re-export D205 BusRoute - Transportation v2 from PowerSchool '
+                'and verify that route contains usable bus routes. No batch '
                 'was created.'),
             'errors': errors or ['No valid transportation assignments were found.'],
         }
@@ -4644,6 +4646,39 @@ def _powerschool_preflight_failure(parsed):
                 'No batch was created.'),
             'errors': errors,
         }
+    if (snapshot_type == 'full_district'
+            and preflight.get('transportation_contract')
+            == TRANSPORTATION_V2_CONTRACT):
+        transport = (parsed.get('metrics') or {}).get('transportation') or {}
+        missing_periods = [
+            period for period, key in (
+                ('AM', 'period_am_rows'), ('PM', 'period_pm_rows'))
+            if int(transport.get(key) or 0) < 1
+        ]
+        anomaly_count = sum(int(transport.get(key) or 0) for key in (
+            'invalid_route_am_rows', 'invalid_route_pm_rows',
+            'route_am_period_conflict_rows',
+            'route_pm_period_conflict_rows',
+        ))
+        if missing_periods or anomaly_count:
+            details = []
+            if missing_periods:
+                details.append(
+                    'The export contains no usable '
+                    + '/'.join(missing_periods)
+                    + ' route assignments.')
+            if anomaly_count:
+                details.append(
+                    f'{anomaly_count} directional route value(s) are invalid '
+                    'or contradict their AM/PM column.')
+            return {
+                'code': 'transportation_v2_full_snapshot_not_proven',
+                'message': (
+                    'Transportation v2 did not prove a clean AM and PM '
+                    'district snapshot. Select Delta or correct the reported '
+                    'route anomalies and analyze again; no batch was created.'),
+                'errors': details,
+            }
     return None
 
 
@@ -4683,57 +4718,128 @@ def _powerschool_identity(entity_type, external_key):
         external_key=external_key).first()
 
 
-def _powerschool_bus(proposal):
-    assignments = proposal.get('assignments') or []
-    routes = {(item.get('route_prefix'), item.get('route_number'))
-              for item in assignments}
-    if len(routes) != 1:
+def _powerschool_bus_for_route(prefix, number, period=None):
+    """Resolve a source route against the canonical identity of active buses.
+
+    Numeric buses commonly store ``identifier=TT, name=55``. Some district
+    buses instead store compound names such as ``identifier=TR, name=ALG1`` or
+    encode a schedule token in the name (``identifier=MCK1, name=AM``). Parsing
+    the combined local identity prevents those valid routes from being missed
+    without introducing district-specific aliases.
+    """
+    desired = normalize_route(f'{prefix or ""} {number or ""}')
+    if not desired:
         return None
-    prefix, number = next(iter(routes))
-    number = str(number or '')
-    bus = Bus.query.filter(
-        func.lower(Bus.identifier) == str(prefix or '').lower(),
-        func.lower(Bus.name) == number.lower(), Bus.active.is_(True)).first()
-    if not bus:
-        stripped = number.lstrip('0') or '0'
-        bus = Bus.query.filter(
-            func.lower(Bus.identifier) == str(prefix or '').lower(),
-            func.lower(Bus.name) == stripped.lower(), Bus.active.is_(True)).first()
-    return bus
+    desired_key = (desired['prefix'], desired['number'])
+    cache_key = '_powerschool_active_bus_index'
+    index = getattr(g, cache_key, None) if has_request_context() else None
+    if index is None:
+        index = {}
+        for bus in Bus.query.filter(Bus.active.is_(True)).order_by(Bus.id).all():
+            parsed = normalize_route(f'{bus.identifier or ""} {bus.name or ""}')
+            if not parsed:
+                continue
+            key = (parsed['prefix'], parsed['number'])
+            index.setdefault(key, []).append(bus)
+        if has_request_context():
+            setattr(g, cache_key, index)
+    matches = index.get(desired_key, [])
+    if len(matches) == 1:
+        return matches[0]
+    if period and matches:
+        period_matches = [
+            bus for bus in matches
+            if str(bus.name or '').strip().upper() == period
+        ]
+        if len(period_matches) == 1:
+            return period_matches[0]
+    return None
 
 
 def _powerschool_group(proposal, create=False):
-    bus = _powerschool_bus(proposal)
-    if not bus:
-        return None, False, 'The normalized route does not match an active bus.'
+    assignments = proposal.get('assignments') or []
+    if not assignments:
+        return None, False, 'The proposal contains no bus assignments.'
     period_map = {'AM': 'Morning', 'MD': 'Midday', 'PM': 'Afternoon'}
-    raw_periods = {item.get('period') for item in proposal.get('assignments', [])}
-    if 'ALL' in raw_periods:
-        desired_ids = {None}
-        period_tokens = []
-    else:
-        desired_names = {period_map[item] for item in raw_periods if item in period_map}
-        types = BusScheduleType.query.filter(BusScheduleType.name.in_(desired_names)).all()
-        if len(types) != len(desired_names):
-            return None, False, 'One or more normalized periods are not configured.'
-        bus_period_ids = {item.schedule_type_id for item in bus.schedule_assignments}
-        if any(item.id not in bus_period_ids for item in types):
-            return None, False, 'The bus is not configured for every proposed period.'
-        desired_ids = {item.id for item in types}
-        period_tokens = [item for item in ('AM', 'MD', 'PM') if item in raw_periods]
+    raw_periods = {item.get('period') for item in assignments}
+    unknown_periods = raw_periods - {'AM', 'MD', 'PM', 'ALL'}
+    if unknown_periods:
+        return None, False, 'One or more normalized periods are not configured.'
+    desired_names = {period_map[item] for item in raw_periods if item in period_map}
+    types = BusScheduleType.query.filter(
+        BusScheduleType.name.in_(desired_names)).all() if desired_names else []
+    types_by_name = {item.name: item for item in types}
+    if len(types_by_name) != len(desired_names):
+        return None, False, 'One or more normalized periods are not configured.'
+
+    desired_assignments = set()
+    resolved = []
+    for item in assignments:
+        period = item.get('period')
+        bus = _powerschool_bus_for_route(
+            item.get('route_prefix'), item.get('route_number'), period)
+        if not bus:
+            return None, False, (
+                f'The normalized {period or "unknown"} route does not match '
+                'an active bus.')
+        schedule_type_id = None
+        if period != 'ALL':
+            schedule_type = types_by_name[period_map[period]]
+            bus_period_ids = {
+                configured.schedule_type_id
+                for configured in bus.schedule_assignments
+            }
+            if schedule_type.id not in bus_period_ids:
+                return None, False, (
+                    f'The matched bus is not configured for the proposed '
+                    f'{period} period.')
+            schedule_type_id = schedule_type.id
+        desired_assignments.add((bus.id, schedule_type_id))
+        resolved.append((period, bus))
+
+    all_period_bus_ids = {
+        bus_id for bus_id, schedule_type_id in desired_assignments
+        if schedule_type_id is None
+    }
+    if all_period_bus_ids:
+        desired_assignments = {
+            (bus_id, schedule_type_id)
+            for bus_id, schedule_type_id in desired_assignments
+            if schedule_type_id is None or bus_id not in all_period_bus_ids
+        }
 
     for group in SubscriberGroup.query.order_by(SubscriberGroup.id).all():
-        assignments = group.bus_assignments
-        if assignments and {item.bus_id for item in assignments} == {bus.id}:
-            group_periods = {item.schedule_type_id for item in assignments}
-            if group_periods == desired_ids:
-                return group, False, None
-    if not create:
-        compact_bus = f'{bus.identifier}{bus.name}'
-        return SimpleNamespace(id=None, name=' '.join(
-            [compact_bus] + period_tokens)), False, None
+        group_assignments = {
+            (item.bus_id, item.schedule_type_id)
+            for item in group.bus_assignments
+        }
+        if group_assignments and group_assignments == desired_assignments:
+            return group, False, None
 
-    base_name = ' '.join([f'{bus.identifier}{bus.name}'] + period_tokens)
+    buses = {bus.id: bus for _, bus in resolved}
+    if len(buses) == 1:
+        bus = next(iter(buses.values()))
+        compact_bus = f'{bus.identifier}{bus.name}'
+        period_tokens = ([] if 'ALL' in raw_periods else [
+            item for item in ('AM', 'MD', 'PM') if item in raw_periods
+        ])
+        base_name = ' '.join([compact_bus] + period_tokens)
+    else:
+        order = {'AM': 0, 'MD': 1, 'PM': 2, 'ALL': 3}
+        tokens = []
+        for period, bus in sorted(
+                resolved,
+                key=lambda pair: (order.get(pair[0], 9),
+                                  pair[1].identifier, pair[1].name)):
+            token = f'{bus.identifier}{bus.name}'
+            if period != 'ALL':
+                token += f' {period}'
+            if token not in tokens:
+                tokens.append(token)
+        base_name = ' / '.join(tokens)
+    if not create:
+        return SimpleNamespace(id=None, name=base_name[:100]), False, None
+
     name = base_name[:100]
     existing = SubscriberGroup.query.filter(func.lower(
         SubscriberGroup.name) == name.lower()).first()
@@ -4743,9 +4849,11 @@ def _powerschool_group(proposal, create=False):
         name=name, description='Created by PowerSchool Import v1', color='blue')
     db.session.add(group)
     db.session.flush()
-    for schedule_type_id in sorted(desired_ids, key=lambda value: value or 0):
+    for bus_id, schedule_type_id in sorted(
+            desired_assignments,
+            key=lambda value: (value[0], value[1] or 0)):
         db.session.add(GroupBusAssignment(
-            group_id=group.id, bus_id=bus.id,
+            group_id=group.id, bus_id=bus_id,
             schedule_type_id=schedule_type_id))
     db.session.flush()
     return group, True, None
@@ -5070,7 +5178,7 @@ def powerschool_import_preview():
     except (ImportValidationError, json.JSONDecodeError) as exc:
         return jsonify({'ok': False, 'message': str(exc)}), 400
 
-    preflight_failure = _powerschool_preflight_failure(parsed)
+    preflight_failure = _powerschool_preflight_failure(parsed, snapshot_type)
     if preflight_failure:
         return jsonify({
             'ok': False,

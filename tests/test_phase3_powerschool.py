@@ -184,6 +184,10 @@ def test_managed_header_aliases_merge_without_overwriting_custom_profile():
         assert 'custom_route' in route_aliases
         assert 'busnumber' in route_aliases
         assert 'TRANSPORTATION.busnumber' in route_aliases
+        assert merged['files']['transportation']['columns']['route_am'] == [
+            'route_am', 'BRIGHTARROW.013_bus_route']
+        assert merged['files']['transportation']['columns']['route_pm'] == [
+            'route_pm', 'BRIGHTARROW.014_bus_stop']
 
 
 def test_split_contact_sources_share_one_cumulative_row_limit():

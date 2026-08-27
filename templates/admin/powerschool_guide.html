@@ -10,7 +10,7 @@
         <i class="fas fa-chevron-right text-[9px]"></i><span>PowerSchool Annual Guide</span>
       </div>
       <h1 class="text-2xl font-bold text-slate-900">Annual PowerSchool export and import guide</h1>
-      <p class="text-sm text-slate-500 mt-1">A repeatable, privacy-conscious checklist for preparing the district roster.</p>
+      <p class="text-sm text-slate-500 mt-1">A privacy-conscious checklist for the verified dual-route AM/PM export contract.</p>
     </div>
     {% if powerschool_enabled and can_powerschool_import %}
     <a href="{{ url_for('powerschool_import_page') }}"
@@ -26,12 +26,12 @@
 
   <section class="bg-blue-50 border border-blue-200 rounded-2xl p-5">
     <h2 class="font-semibold text-blue-900"><i class="fas fa-circle-info mr-2"></i>Why there are three files</h2>
-    <p class="text-sm text-blue-800 mt-2">Transportation determines which students can be assigned to buses. The other two exports identify direct-student and guardian notification destinations. BrightArrow sources can contain sentinel contact IDs, duplicate pseudo-contact rows and empty placeholders; keep the files separated so the application can interpret each row by its source role. Never merge or repair them manually.</p>
+    <p class="text-sm text-blue-800 mt-2">Transportation v2 provides two independently normalized route legs per student: source <code>BRIGHTARROW.013_bus_route</code> is AM and source <code>BRIGHTARROW.014_bus_stop</code> is PM. The canonical CSV renames them <code>route_am</code> and <code>route_pm</code> so the misleading upstream <em>bus_stop</em> label is never treated as a physical stop. The other two exports remain the unchanged Student and Guardian contact files.</p>
   </section>
 
   <section class="bg-red-50 border border-red-200 rounded-2xl p-5">
     <h2 class="font-semibold text-red-900"><i class="fas fa-ban mr-2"></i>Blocking gate: verify Transportation first</h2>
-    <p class="text-sm text-red-800 mt-2">Do not proceed when Transportation is header-only, contains no valid bus assignments, or has blank <code>busnumber</code> values. The importer will stop before staging thousands of secondary contact errors. A large contacts export cannot compensate for an incomplete Transportation export.</p>
+    <p class="text-sm text-red-800 mt-2">Use <strong>D205 BusRoute - Transportation v2</strong> (template ID <code>941</code>) and verify both AM and PM metrics. Each route leg may be blank or a non-bus value such as <code>Walker</code>, <code>Door-to-Door</code> or <code>NTW</code>; those legs are ignored safely and route-pair anomalies remain visible. Keep <strong>Delta</strong> as the default. Complete district snapshot is a GO only after independently validating AM/PM coverage and reconciling every anomaly.</p>
   </section>
 
   <section class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5 space-y-4">
@@ -42,11 +42,12 @@
     </div>
     <div class="overflow-x-auto">
       <table class="w-full text-sm border-separate border-spacing-0">
-        <thead><tr class="text-left text-xs uppercase text-slate-500"><th class="p-3 border-b">Saved template</th><th class="p-3 border-b">PowerSchool source</th><th class="p-3 border-b">Expected filename</th></tr></thead>
+        <thead><tr class="text-left text-xs uppercase text-slate-500"><th class="p-3 border-b">Saved template</th><th class="p-3 border-b">PowerSchool source</th><th class="p-3 border-b">Recommended filename</th></tr></thead>
         <tbody class="divide-y divide-slate-100">
-          <tr><td class="p-3 font-semibold text-slate-800">D205 BusRoute - Transportation v1</td><td class="p-3 text-slate-600">BrightArrow Transportation Current Day Bussing<br><span class="text-xs text-slate-400">10-column contract</span></td><td class="p-3 font-mono text-xs">D205_BusRoute_Transportation_v1.csv</td></tr>
+          <tr class="bg-emerald-50/60"><td class="p-3 font-semibold text-emerald-900">D205 BusRoute - Transportation v2<br><span class="text-xs font-medium text-emerald-700">AM/PM route pair · Delta default · template ID 941</span></td><td class="p-3 text-slate-600">BrightArrow - Basic - Students Combined<br><span class="text-xs text-slate-400">9-column canonical contract</span></td><td class="p-3 font-mono text-xs">D205_BusRoute_Transportation_v2.csv</td></tr>
           <tr><td class="p-3 font-semibold text-slate-800">D205 BusRoute - Student Contacts v1</td><td class="p-3 text-slate-600">BrightArrow - Basic - Students Combined<br><span class="text-xs text-slate-400">18-column contract</span></td><td class="p-3 font-mono text-xs">D205_BusRoute_Student_Contacts_v1.csv</td></tr>
           <tr><td class="p-3 font-semibold text-slate-800">D205 BusRoute - Guardian Contacts v1</td><td class="p-3 text-slate-600">BrightArrow - Basic - Parents Combined<br><span class="text-xs text-slate-400">18-column contract</span></td><td class="p-3 font-mono text-xs">D205_BusRoute_Guardian_Contacts_v1.csv</td></tr>
+          <tr class="bg-amber-50/50"><td class="p-3 font-semibold text-amber-900">D205 BusRoute - Transportation v1<br><span class="text-xs font-medium text-amber-700">Legacy diagnostic only</span></td><td class="p-3 text-slate-600">BrightArrow Transportation Current Day Bussing<br><span class="text-xs text-slate-400">Retained for historical comparison</span></td><td class="p-3 font-mono text-xs">D205_BusRoute_Transportation_v1.csv</td></tr>
         </tbody>
       </table>
     </div>
@@ -56,11 +57,12 @@
     <div class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
       <h2 class="text-lg font-semibold text-slate-800">2. Run each export</h2>
       <ol class="mt-3 space-y-2 text-sm text-slate-600 list-decimal pl-5">
-        <li>Open the saved template and confirm its name and data source match this guide.</li>
+        <li>Open <strong>D205 BusRoute - Transportation v2</strong> and confirm template ID <code>941</code> and source <strong>BrightArrow - Basic - Students Combined</strong>.</li>
         <li>Confirm the PowerSchool context, school year and <strong>Export All Rows</strong> before every export.</li>
         <li>Keep the saved format: comma delimiter, CR/LF line endings, UTF-8, headers included and values quoted.</li>
-        <li>Run the Transportation template <strong>before 6:00 PM</strong>; its PowerSchool source changes to the next service day after 6:00 PM.</li>
-        <li>Save with the expected filename. Do not open and resave the CSV in Excel because stable IDs and leading zeroes can change.</li>
+        <li>Confirm the template exports <code>.013_bus_route</code> as <code>route_am</code> and <code>.014_bus_stop</code> as <code>route_pm</code>. Do not add a <code>stop</code> column.</li>
+        <li>Do not use Transportation v1 for an operational import; it is retained only to diagnose historical exports.</li>
+        <li>PowerSchool may restore a source-generated filename when the template reopens. The importer accepts it; optionally rename the downloaded file in Finder, but do not open and resave the CSV because stable IDs and leading zeroes can change.</li>
       </ol>
     </div>
     <div class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
@@ -70,9 +72,10 @@
         <li>Do not email, schedule, or place exports in a shared or public folder.</li>
         <li>Confirm all three files were created on the same date and belong to the intended school year.</li>
         <li>Open each file only with a plain-text/CSV viewer and compare the header to the downloadable contract; do not save it.</li>
-        <li>Transportation must contain a plausible population and populated student and bus values before upload.</li>
+        <li>Transportation v2 must contain plausible AM and PM assignment populations after non-bus route values are excluded.</li>
+        <li>Review the AM and PM counters plus every route-pair anomaly before approving a plan.</li>
         <li>Do not rename columns, delete identifiers, combine sheets, or edit individual records in the CSV.</li>
-        <li>If counts or scope are uncertain, stop and obtain a corrected export before selecting a complete district snapshot.</li>
+        <li>Keep Delta unless AM and PM coverage has been independently validated and every route-pair anomaly has been reconciled.</li>
       </ul>
     </div>
   </section>
@@ -84,10 +87,11 @@
     </div>
     <div class="grid grid-cols-1 xl:grid-cols-3 gap-4">
       <div class="rounded-xl border border-slate-200 p-4">
-        <h3 class="text-sm font-semibold text-slate-800">Transportation — 10 columns</h3>
+        <h3 class="text-sm font-semibold text-slate-800">Transportation v2 — 9 columns</h3>
         <ol class="mt-2 text-xs text-slate-600 space-y-1 list-decimal pl-5 font-mono break-all">
-          <li>TRANSPORTATION.student_number</li><li>TRANSPORTATION.student_dcid</li><li>TRANSPORTATION.studentfname</li><li>TRANSPORTATION.studentlname</li><li>TRANSPORTATION.schoolid</li><li>TRANSPORTATION.grade_level</li><li>TRANSPORTATION.busnumber</li><li>TRANSPORTATION.stopnumber</li><li>TRANSPORTATION.fromto</li><li>TRANSPORTATION.ride_on_enabledToday</li>
+          <li>student_number</li><li>first_name</li><li>last_name</li><li>grade</li><li>transport_status</li><li>route_am</li><li>route_pm</li><li>school</li><li>student_id</li>
         </ol>
+        <p class="mt-3 text-xs text-slate-500"><code>route_am</code> comes from <code>.013_bus_route</code>; <code>route_pm</code> comes from <code>.014_bus_stop</code>. There is intentionally no <code>stop</code> column. The downloadable v1 header remains available only for legacy diagnosis.</p>
       </div>
       <div class="rounded-xl border border-slate-200 p-4 xl:col-span-2">
         <h3 class="text-sm font-semibold text-slate-800">Student and Guardian Contacts — same 18 selected columns</h3>
@@ -104,15 +108,18 @@
     <div class="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
       <strong>Do not replace source sentinel values.</strong> A Student Contacts row may legitimately use contact ID <code>0</code>; the importer derives a non-PII student identity from its file role and student number. Guardian contact ID <code>0</code> is reserved for overlapping student-self rows and is never imported as a guardian; a nonblank relationship on that ID is reported as an anomaly. Rows containing only a student number are empty placeholders and are also ignored.
     </div>
+    <div class="rounded-xl border border-sky-200 bg-sky-50 p-4 text-sm text-sky-800">
+      <strong>Route legs are normalized independently.</strong> A blank, <code>Walker</code>, <code>Door-to-Door</code> or <code>NTW</code> value is ignored only for that AM or PM leg. Invalid values and AM/PM suffix conflicts are reported as aggregate anomalies; a contradictory leg is ignored while a valid opposite-period leg is retained. Different valid AM and PM routes are both preserved and counted for reconciliation; the difference is not a conflict by itself. Student or Guardian contacts whose student has no usable route leg are counted as <em>Contacts outside Transportation</em> and ignored without creating thousands of review rows.
+    </div>
   </section>
 
   <section class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
     <h2 class="text-lg font-semibold text-slate-800">5. Analyze before importing</h2>
     <ol class="mt-3 space-y-2 text-sm text-slate-600 list-decimal pl-5">
       <li>Open the importer and enter the school year in <code>YYYY-YY</code> format.</li>
-      <li>Use <strong>Delta</strong> for normal incremental work. Use <strong>Complete district snapshot</strong> only after proving the exports contain the full district population.</li>
+      <li>Use <strong>Delta</strong> by default. Select <strong>Complete district snapshot</strong> only after independently proving both AM and PM coverage and resolving every route-pair anomaly.</li>
       <li>Select <strong>PowerSchool saved templates</strong>, then upload Transportation, Student Contacts and Guardian Contacts in their labeled fields.</li>
-      <li>Choose <strong>Analyze and normalize</strong>. Nothing is imported during analysis. A blocking preflight first verifies that Transportation contains usable assignments.</li>
+      <li>Choose <strong>Analyze and normalize</strong>. Nothing is imported during analysis. Reconcile AM assignments, PM assignments, source exclusions and route-pair anomalies before selecting anything.</li>
       <li>Review every <code>new</code>, <code>update</code>, <code>unchanged</code>, <code>duplicate</code>, <code>conflict</code> and <code>rejected</code> classification. Filter and exclude any record that should not proceed.</li>
       <li>Save the exact selection, download the review report and reconcile: <code>selected + excluded + rejected = total</code>.</li>
       <li>Apply only after the responsible reviewer approves the plan. Absence from a file never authorizes deletion; deactivation candidates require separate explicit approval.</li>

@@ -32,9 +32,9 @@
         <p class="text-xs text-slate-500 mt-1">Files remain private; every analysis is immutable and raw uploads are purged after apply or expiry.</p>
       </div>
       <div class="flex flex-wrap gap-2">
-        <a href="{{ url_for('static', filename='templates/powerschool-transportation-v1.csv') }}" download
+        <a href="{{ url_for('static', filename='templates/powerschool-transportation-v2.csv') }}" download
            class="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:text-blue-700">
-          <i class="fas fa-download mr-1"></i>Transportation contract
+          <i class="fas fa-download mr-1"></i>Transportation v2 AM/PM contract
         </a>
         <a href="{{ url_for('static', filename='templates/powerschool-student-contacts-v1.csv') }}" download
            class="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:text-blue-700">
@@ -48,16 +48,16 @@
     </div>
     <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-5" aria-label="Required preflight checks">
       <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
-        <div class="text-xs font-semibold text-slate-700"><i class="fas fa-bus mr-1 text-blue-600"></i>Transportation is authoritative</div>
-        <p class="text-[11px] text-slate-500 mt-1">It must contain valid student, bus and route assignments. A header-only or route-empty export is blocked.</p>
+        <div class="text-xs font-semibold text-slate-700"><i class="fas fa-bus mr-1 text-blue-600"></i>Transportation v2 maps both route legs</div>
+        <p class="text-[11px] text-slate-500 mt-1">Template 941 maps source <code>.013_bus_route</code> to AM and <code>.014_bus_stop</code> to PM. The canonical export names them <code>route_am</code> and <code>route_pm</code>.</p>
       </div>
       <div class="rounded-xl border border-slate-200 bg-slate-50 p-3">
         <div class="text-xs font-semibold text-slate-700"><i class="fas fa-address-book mr-1 text-indigo-600"></i>Keep contacts separated</div>
-        <p class="text-[11px] text-slate-500 mt-1">Upload Student and Guardian exports in their labeled fields. Source sentinel IDs such as <code>0</code> are handled by file role.</p>
+        <p class="text-[11px] text-slate-500 mt-1">Upload Student and Guardian v1 exports in their labeled fields. Contacts outside the valid Transportation population are ignored in aggregate.</p>
       </div>
       <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3">
         <div class="text-xs font-semibold text-emerald-800"><i class="fas fa-shield-halved mr-1"></i>Delta is the safe default</div>
-        <p class="text-[11px] text-emerald-700 mt-1">Analysis never imports data. Use a complete snapshot only after independently proving full-district scope.</p>
+        <p class="text-[11px] text-emerald-700 mt-1">Use Full Snapshot only after validating AM and PM coverage and reconciling every route-pair anomaly.</p>
       </div>
     </div>
     <form id="upload-form" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
@@ -71,9 +71,9 @@
         <span class="block text-xs font-semibold text-slate-600 mb-1.5">Import policy</span>
         <select id="snapshot-type" name="snapshot_type" class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm bg-white">
           <option value="delta">Delta — never propose deactivation</option>
-          <option value="full_district">Complete district snapshot</option>
+          <option value="full_district">Complete district snapshot — requires AM/PM reconciliation</option>
         </select>
-        <span id="full-snapshot-warning" class="hidden mt-1 text-[11px] font-medium text-amber-700">Use only after reconciling a complete district export. Missing students can become deactivation candidates.</span>
+        <span id="full-snapshot-warning" class="hidden mt-1 text-[11px] font-medium text-amber-700">Proceed only after independently validating both AM and PM coverage and reconciling all route-pair anomalies. Missing students can become deactivation candidates.</span>
       </label>
       <label class="block">
         <span class="block text-xs font-semibold text-slate-600 mb-1.5">Mapping profile</span>
@@ -82,9 +82,10 @@
         </select>
       </label>
       <label class="block">
-        <span class="block text-xs font-semibold text-slate-600 mb-1.5">Transportation CSV</span>
+        <span class="block text-xs font-semibold text-slate-600 mb-1.5">Transportation CSV — v2 AM/PM routes</span>
         <input name="transportation_file" type="file" accept=".csv,text/csv" required
                class="w-full text-xs file:mr-2 file:px-3 file:py-2 file:border-0 file:rounded-lg file:bg-blue-50 file:text-blue-700">
+        <span class="block mt-1 text-[11px] text-slate-500">Template 941 · recommended name: D205_BusRoute_Transportation_v2.csv</span>
       </label>
       <label class="block">
         <span class="block text-xs font-semibold text-slate-600 mb-1.5">Contact file format</span>
@@ -296,9 +297,20 @@
       ['Transportation rows', preflight && preflight.transport_rows !== undefined ? preflight.transport_rows : transportation.input_rows],
       ['Valid assignments', preflight && preflight.valid_transport_rows !== undefined ? preflight.valid_transport_rows : transportation.accepted_rows],
       ['Valid students', preflight && preflight.valid_students !== undefined ? preflight.valid_students : transportation.valid_students],
+      ['AM assignments', transportation.period_am_rows],
+      ['PM assignments', transportation.period_pm_rows],
+      ['AM period conflicts', transportation.route_am_period_conflict_rows],
+      ['PM period conflicts', transportation.route_pm_period_conflict_rows],
+      ['Different AM/PM routes', transportation.different_am_pm_route_rows],
+      ['Invalid AM routes', transportation.invalid_route_am_rows],
+      ['Invalid PM routes', transportation.invalid_route_pm_rows],
+      ['Transport source ignored', transportation.ignored_rows],
+      ['Blank route legs ignored', transportation.ignored_blank_route_rows],
+      ['Non-bus route legs ignored', transportation.ignored_non_bus_route_rows],
       ['Transport rejected', transportation.rejected_rows],
       ['Contact rows', contacts.input_rows],
       ['Contacts not processed', contacts.not_processed_rows],
+      ['Contacts outside Transportation', contacts.ignored_no_transport_rows],
       ['Contacts accepted', contacts.accepted_rows],
       ['Placeholders ignored', contacts.ignored_placeholder_rows],
       ['Student overlaps ignored', contacts.ignored_guardian_student_overlap_rows],

@@ -223,8 +223,9 @@ def test_zero_valid_transport_rows_return_blocking_preflight_without_contact_noi
     assert result["preflight"]["errors"]
     assert result["metrics"]["contacts"]["not_processed_rows"] == 1
     assert result["metrics"]["contacts"]["rejected_rows"] == 0
-    assert len(result["issues"]) == 1
-    assert result["issues"][0]["file"] == "transportation"
+    assert result["metrics"]["transportation"]["ignored_rows"] == 1
+    assert result["metrics"]["transportation"]["ignored_blank_route_rows"] == 1
+    assert result["issues"] == []
 
 
 def test_metrics_and_preflight_are_pii_safe_and_revisioned():

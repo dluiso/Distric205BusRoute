@@ -18,8 +18,9 @@ from collections import defaultdict
 
 EMAIL_RE = re.compile(r"^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
-NORMALIZER_REVISION = "2026-08-27.1"
+NORMALIZER_REVISION = "2026-08-27.4"
 STUDENT_SELF_CONTACT_ID = "student-self"
+TRANSPORTATION_V2_CONTRACT = "students_combined_dual_route"
 ROUTE_RE = re.compile(
     r"^([A-Z]+(?:\s+[A-Z]+)*)\s*0*([0-9]+)\s*(AM|MD|PM|A|P)?$",
     re.IGNORECASE,
@@ -30,7 +31,7 @@ DEFAULT_MAPPING_V1 = {
     "identity": "student_number",
     "files": {
         "transportation": {
-            "required": ["student_number", "route"],
+            "required": ["student_number"],
             "columns": {
                 "student_number": [
                     "student_number", "STUDENTS.Student_Number",
@@ -41,6 +42,7 @@ DEFAULT_MAPPING_V1 = {
                     "student_id", "STUDENTS.ID", "STUDENTS.dcid",
                     "student_dcid", "TRANSPORTATION.StudentID",
                     "TRANSPORTATION.student_dcid",
+                    "BRIGHTARROW.300_studentid",
                 ],
                 "household_id": [
                     "household_id", "family_id", "source_identifier",
@@ -64,15 +66,24 @@ DEFAULT_MAPPING_V1 = {
                 "grade": [
                     "grade", "grade_level", "STUDENTS.Grade_Level",
                     "TRANSPORTATION.grade_level",
+                    "BRIGHTARROW.008_grade_level",
                 ],
                 "route": [
                     "route", "bus_route", "busnumber", "STUDENTS.Bus_Route",
-                    "BRIGHTARROW.013_bus_route", "TRANSPORTATION.BusNumber",
+                    "routenumber", "TRANSPORTATION.RouteNumber",
+                    "TRANSPORTATION.routenumber",
+                    "TRANSPORTATION.BusNumber",
                     "TRANSPORTATION.busnumber",
                 ],
+                "route_am": [
+                    "route_am", "BRIGHTARROW.013_bus_route",
+                ],
+                "route_pm": [
+                    "route_pm", "BRIGHTARROW.014_bus_stop",
+                ],
                 "stop": [
-                    "stop", "bus_stop", "stopnumber", "STUDENTS.Bus_Stop",
-                    "BRIGHTARROW.014_bus_stop", "TRANSPORTATION.StopNumber",
+                    "stop", "bus_stop", "stopnumber",
+                    "TRANSPORTATION.StopNumber",
                     "TRANSPORTATION.stopnumber",
                 ],
                 "period": [
@@ -83,6 +94,7 @@ DEFAULT_MAPPING_V1 = {
                 "transport_status": [
                     "transport_status", "active", "ride_on_enabledToday",
                     "TRANSPORTATION.ride_on_enabledToday",
+                    "BRIGHTARROW.010_enroll_status",
                 ],
                 "school_year": ["school_year", "year"],
                 "source_id": [
@@ -216,6 +228,36 @@ def resolve_mapping(headers, file_mapping):
     return resolved
 
 
+def _transportation_contract(headers):
+    """Identify the district's Students Combined fallback by its field contract.
+
+    The v2 saved template deliberately renames the BrightArrow source columns,
+    but diagnostic exports may retain the original ``BRIGHTARROW.*`` labels.
+    Both signatures omit a separate period column and therefore cannot prove a
+    complete district-wide AM/PM snapshot when both directional fields exist.
+    """
+    keys = {normalize_text(header).casefold() for header in headers}
+    old_canonical = {
+        "student_number", "student_id", "transport_status", "route", "stop",
+    }
+    canonical = {"student_number", "route_am", "route_pm"}
+    brightarrow = {
+        "brightarrow.003_student_number",
+        "brightarrow.013_bus_route",
+        "brightarrow.014_bus_stop",
+    }
+    has_explicit_period = bool({"period", "direction", "fromto"} & keys)
+    if old_canonical.issubset(keys) and not has_explicit_period:
+        raise ImportValidationError(
+            "This is the obsolete single-route Transportation v2 contract. "
+            "Re-export PowerSchool template 941 with canonical route_am and "
+            "route_pm columns."
+        )
+    if canonical.issubset(keys) or brightarrow.issubset(keys):
+        return TRANSPORTATION_V2_CONTRACT
+    return "legacy"
+
+
 def _values(row, resolved, canonical):
     return [row.get(header, "") for header in resolved.get(canonical, [])]
 
@@ -282,6 +324,29 @@ def normalize_route(value):
     }
 
 
+def _ignored_transport_route_reason(value):
+    """Classify rows that explicitly do not represent a bus assignment.
+
+    BrightArrow Students Combined is district-wide and emits blank routes plus
+    a small set of categorical non-bus values. These rows are expected source
+    scope, not malformed assignments, so they belong in aggregate metrics and
+    not in per-row review issues. Unknown non-empty values remain rejectable.
+    """
+    raw = normalize_text(value, 100).upper()
+    if not raw:
+        return "blank"
+
+    normalized = raw.replace("\u2013", "-").replace("\u2014", "-")
+    if re.fullmatch(r"WALKER(?:\b.*)?", normalized):
+        return "known_non_bus"
+    if re.fullmatch(
+            r"DOOR\s*[- ]*\s*TO\s*[- ]*\s*DOOR(?:\b.*)?", normalized):
+        return "known_non_bus"
+    if re.fullmatch(r"NTW(?:\s*-\s*.*)?", normalized):
+        return "known_non_bus"
+    return None
+
+
 def _normalize_period(value, aliases):
     raw = normalize_text(value).upper()
     return aliases.get(raw)
@@ -325,7 +390,28 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
 
     transport_headers, transport_rows = read_csv_payload(
         transport_payload, max_rows, max_columns)
-    transport_map = resolve_mapping(transport_headers, files["transportation"])
+    transport_contract = _transportation_contract(transport_headers)
+    is_transportation_v2 = transport_contract == TRANSPORTATION_V2_CONTRACT
+    transport_file_mapping = dict(files["transportation"])
+    # Profiles are upgraded additively in production, so an older persisted
+    # profile can still list the obsolete canonical ``route`` as required.
+    # Route requirements are contract-specific and enforced immediately below.
+    transport_file_mapping["required"] = [
+        name for name in transport_file_mapping.get("required", [])
+        if name not in {"route", "route_am", "route_pm"}
+    ]
+    transport_map = resolve_mapping(transport_headers, transport_file_mapping)
+    required_route_columns = (
+        ("route_am", "route_pm") if is_transportation_v2 else ("route",)
+    )
+    missing_route_columns = [
+        name for name in required_route_columns if not transport_map.get(name)
+    ]
+    if missing_route_columns:
+        raise ImportValidationError(
+            "Missing required mapped column(s): "
+            + ", ".join(sorted(missing_route_columns))
+        )
     if contact_sources is None:
         if contacts_payload is None:
             raise ImportValidationError("A contacts export is required.")
@@ -374,41 +460,23 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
     row_issues = []
     seen_transport = set()
     transportation_metrics = _new_row_metrics(len(transport_rows))
-    for row_number, row in transport_rows:
-        student_number = normalize_identifier(_first(row, transport_map, "student_number"))
-        route = normalize_route(_first(row, transport_map, "route"))
-        period_raw = _first(row, transport_map, "period")
-        period = _normalize_period(period_raw, aliases) if period_raw else None
-        if route and not period:
-            period = route.get("period")
-        errors = []
-        if not student_number:
-            errors.append("student_number is required")
-        elif not IDENTIFIER_RE.fullmatch(student_number):
-            errors.append("student_number contains unsupported characters")
-        if not route:
-            errors.append("route is blank or cannot be normalized")
-        if period_raw and not period:
-            errors.append("period is not a configured AM/MD/PM alias")
-        if errors:
-            transportation_metrics["rejected_rows"] += 1
-            row_issues.append({
-                "file": "transportation", "row_number": row_number,
-                "classification": "rejected", "errors": errors,
-            })
-            continue
-        route_key = f"{route['prefix']}|{route['number']}"
-        duplicate_key = (student_number, route_key, period or "ALL")
-        if duplicate_key in seen_transport:
-            transportation_metrics["duplicate_rows"] += 1
-            row_issues.append({
-                "file": "transportation", "row_number": row_number,
-                "classification": "duplicate",
-                "errors": ["duplicate transportation assignment"],
-            })
-            continue
-        seen_transport.add(duplicate_key)
-        transportation_metrics["accepted_rows"] += 1
+    transportation_metrics.update({
+        "ignored_blank_route_rows": 0,
+        "ignored_non_bus_route_rows": 0,
+        "ignored_missing_period_rows": 0,
+        "period_am_rows": 0,
+        "period_md_rows": 0,
+        "period_pm_rows": 0,
+        "route_am_period_conflict_rows": 0,
+        "route_pm_period_conflict_rows": 0,
+        "invalid_route_am_rows": 0,
+        "invalid_route_pm_rows": 0,
+        "different_am_pm_route_rows": 0,
+        "dual_route": is_transportation_v2,
+        "contract": transport_contract,
+    })
+
+    def proposal_for(row, student_number):
         proposal = students.setdefault(student_number, {
             "student_number": student_number,
             "student_id": normalize_identifier(_first(row, transport_map, "student_id")),
@@ -424,11 +492,6 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             "school_year": normalize_text(_first(row, transport_map, "school_year"), 20),
             "assignments": [], "contacts": [], "source_rows": [],
         })
-        proposal["assignments"].append({
-            "route_prefix": route["prefix"], "route_number": route["number"],
-            "period": period or "ALL",
-        })
-        proposal["source_rows"].append(row_number)
         for field in ("first_name", "last_name", "school", "grade", "stop"):
             incoming = normalize_text(_first(row, transport_map, field))
             if incoming and proposal.get(field) and proposal[field] != incoming:
@@ -436,6 +499,138 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
                     f"transportation rows disagree on {field}")
             elif incoming:
                 proposal[field] = incoming
+        return proposal
+
+    def accept_assignment(row_number, row, student_number, route, period):
+        route_key = f"{route['prefix']}|{route['number']}"
+        duplicate_key = (student_number, route_key, period or "ALL")
+        if duplicate_key in seen_transport:
+            transportation_metrics["duplicate_rows"] += 1
+            row_issues.append({
+                "file": "transportation", "row_number": row_number,
+                "classification": "duplicate",
+                "errors": ["duplicate transportation assignment"],
+            })
+            return False
+        seen_transport.add(duplicate_key)
+        transportation_metrics["accepted_rows"] += 1
+        if period in {"AM", "MD", "PM"}:
+            transportation_metrics[f"period_{period.lower()}_rows"] += 1
+        proposal = proposal_for(row, student_number)
+        proposal["assignments"].append({
+            "route_prefix": route["prefix"], "route_number": route["number"],
+            "period": period or "ALL",
+        })
+        if row_number not in proposal["source_rows"]:
+            proposal["source_rows"].append(row_number)
+        return True
+
+    for row_number, row in transport_rows:
+        student_number = normalize_identifier(
+            _first(row, transport_map, "student_number"))
+        student_errors = []
+        if not student_number:
+            student_errors.append("student_number is required")
+        elif not IDENTIFIER_RE.fullmatch(student_number):
+            student_errors.append(
+                "student_number contains unsupported characters")
+
+        if is_transportation_v2:
+            directional_routes = {}
+            safe_warnings = []
+            for period, field_name in (("AM", "route_am"), ("PM", "route_pm")):
+                route_raw = _first(row, transport_map, field_name)
+                ignored_route_reason = _ignored_transport_route_reason(route_raw)
+                if ignored_route_reason:
+                    transportation_metrics["ignored_rows"] += 1
+                    metric_key = (
+                        "ignored_blank_route_rows"
+                        if ignored_route_reason == "blank"
+                        else "ignored_non_bus_route_rows"
+                    )
+                    transportation_metrics[metric_key] += 1
+                    continue
+
+                route = normalize_route(route_raw)
+                if not route:
+                    transportation_metrics[f"invalid_{field_name}_rows"] += 1
+                    safe_warnings.append(
+                        f"{field_name} is populated but cannot be normalized")
+                    continue
+
+                explicit_period = route.get("period")
+                if explicit_period and explicit_period != period:
+                    transportation_metrics[
+                        f"{field_name}_period_conflict_rows"] += 1
+                    safe_warnings.append(
+                        f"{field_name} suffix conflicts with {period} column "
+                        "semantics; the contradictory route leg was ignored")
+                    continue
+                directional_routes[period] = route
+
+            if not directional_routes and not safe_warnings:
+                continue
+
+            if student_errors:
+                transportation_metrics["rejected_rows"] += 1
+                row_issues.append({
+                    "file": "transportation", "row_number": row_number,
+                    "classification": "rejected", "errors": student_errors,
+                })
+                continue
+
+            if {"AM", "PM"}.issubset(directional_routes):
+                am_route = directional_routes["AM"]
+                pm_route = directional_routes["PM"]
+                if ((am_route["prefix"], am_route["number"])
+                        != (pm_route["prefix"], pm_route["number"])):
+                    transportation_metrics["different_am_pm_route_rows"] += 1
+
+            for period in ("AM", "PM"):
+                route = directional_routes.get(period)
+                if route:
+                    accept_assignment(
+                        row_number, row, student_number, route, period)
+
+            if safe_warnings:
+                transportation_metrics["warning_rows"] += 1
+                row_issues.append({
+                    "file": "transportation", "row_number": row_number,
+                    "classification": "warning", "errors": safe_warnings,
+                })
+            continue
+
+        route_raw = _first(row, transport_map, "route")
+        ignored_route_reason = _ignored_transport_route_reason(route_raw)
+        if ignored_route_reason:
+            transportation_metrics["ignored_rows"] += 1
+            metric_key = (
+                "ignored_blank_route_rows"
+                if ignored_route_reason == "blank"
+                else "ignored_non_bus_route_rows"
+            )
+            transportation_metrics[metric_key] += 1
+            continue
+
+        route = normalize_route(route_raw)
+        period_raw = _first(row, transport_map, "period")
+        period = _normalize_period(period_raw, aliases) if period_raw else None
+        if route and not period:
+            period = route.get("period")
+        errors = list(student_errors)
+        if not route:
+            errors.append("route is blank or cannot be normalized")
+        if period_raw and not period:
+            errors.append("period is not a configured AM/MD/PM alias")
+        if errors:
+            transportation_metrics["rejected_rows"] += 1
+            row_issues.append({
+                "file": "transportation", "row_number": row_number,
+                "classification": "rejected", "errors": errors,
+            })
+            continue
+        accept_assignment(
+            row_number, row, student_number, route, period)
 
     transportation_metrics.update({
         "valid_assignments": len(seen_transport),
@@ -447,12 +642,15 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
         "errors": [] if valid_transport_rows else [
             "No valid bus assignments were found. Verify that the PowerSchool "
             "Transportation export contains populated student_number and "
-            "busnumber values before processing contacts."
+            f"{'route_am/route_pm' if is_transportation_v2 else 'route/busnumber'} "
+            "values before processing contacts."
         ],
         "warnings": [],
         "transport_rows": len(transport_rows),
         "valid_transport_rows": valid_transport_rows,
         "valid_students": len(students),
+        "transportation_contract": transport_contract,
+        "dual_route": is_transportation_v2,
         "transportation": dict(transportation_metrics),
     }
 
@@ -465,6 +663,7 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
         "ignored_guardian_student_overlap_rows": 0,
         "ignored_guardian_zero_anomaly_rows": 0,
         "student_self_identity_rows": 0,
+        "ignored_no_transport_rows": 0,
     })
     source_metrics = {
         source["key"]: {
@@ -475,6 +674,7 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             "ignored_guardian_student_overlap_rows": 0,
             "ignored_guardian_zero_anomaly_rows": 0,
             "student_self_identity_rows": 0,
+            "ignored_no_transport_rows": 0,
             "not_processed_rows": len(source["rows"]) if not students else 0,
         }
         for source in parsed_contact_sources
@@ -486,6 +686,28 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
         for row_number, row in source["rows"]:
             student_number = normalize_identifier(
                 _first(row, contact_map, "student_number"))
+            student_number_errors = []
+            if not student_number:
+                student_number_errors.append("student_number is required")
+            elif not IDENTIFIER_RE.fullmatch(student_number):
+                student_number_errors.append(
+                    "student_number contains unsupported characters")
+            if student_number_errors:
+                current_metrics["rejected_rows"] += 1
+                contact_metrics["rejected_rows"] += 1
+                row_issues.append({
+                    "file": source["key"], "row_number": row_number,
+                    "classification": "rejected",
+                    "errors": student_number_errors,
+                })
+                continue
+            if student_number not in students:
+                current_metrics["ignored_rows"] += 1
+                current_metrics["ignored_no_transport_rows"] += 1
+                contact_metrics["ignored_rows"] += 1
+                contact_metrics["ignored_no_transport_rows"] += 1
+                continue
+
             contact_ids = []
             for value in _values(row, contact_map, "contact_id"):
                 normalized_contact_id = normalize_identifier(value)
@@ -573,10 +795,6 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
                 contact_metrics["invalid_email_rows"] += 1
                 contact_metrics["invalid_email_values"] += len(invalid_emails)
             errors = []
-            if not student_number:
-                errors.append("student_number is required")
-            elif student_number not in students:
-                errors.append("student_number has no valid transportation row")
             if not contact_id:
                 errors.append("contact_id is required; PII cannot be used as identity")
             elif not IDENTIFIER_RE.fullmatch(contact_id):
@@ -629,7 +847,7 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             (item["route_prefix"], item["route_number"])
             for item in proposal["assignments"]
         }
-        if len(distinct_routes) != 1:
+        if not is_transportation_v2 and len(distinct_routes) != 1:
             proposal.setdefault("conflicts", []).append(
                 "student has assignments for more than one bus route")
         proposal["assignments"] = sorted(
@@ -654,7 +872,11 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             + hashlib.sha256(contacts_payload).digest()
         ).hexdigest()
     file_metadata = {
-        "transportation": {"headers": transport_headers, "rows": len(transport_rows)},
+        "transportation": {
+            "headers": transport_headers,
+            "rows": len(transport_rows),
+            "contract": transport_contract,
+        },
     }
     for source in parsed_contact_sources:
         file_metadata[source["key"]] = {
@@ -664,6 +886,51 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
         preflight["warnings"].append(
             f'{transportation_metrics["rejected_rows"]} Transportation row(s) '
             "could not be normalized."
+        )
+    if transportation_metrics["ignored_rows"]:
+        preflight["warnings"].append(
+            f'{transportation_metrics["ignored_rows"]} Transportation route '
+            "field value(s) were blank or a known non-bus category and were "
+            "safely ignored."
+        )
+    if transportation_metrics["ignored_missing_period_rows"]:
+        preflight["warnings"].append(
+            f'{transportation_metrics["ignored_missing_period_rows"]} routed '
+            "Transportation row(s) had no explicit AM/MD/PM period and were "
+            "safely ignored instead of being assigned to every period."
+        )
+    invalid_directional_routes = (
+        transportation_metrics["invalid_route_am_rows"]
+        + transportation_metrics["invalid_route_pm_rows"]
+    )
+    if invalid_directional_routes:
+        preflight["warnings"].append(
+            f"{invalid_directional_routes} populated directional route field "
+            "value(s) could not be normalized; any valid opposite-period "
+            "assignment was retained."
+        )
+    directional_period_conflicts = (
+        transportation_metrics["route_am_period_conflict_rows"]
+        + transportation_metrics["route_pm_period_conflict_rows"]
+    )
+    if directional_period_conflicts:
+        preflight["warnings"].append(
+            f"{directional_period_conflicts} directional route field value(s) "
+            "had a contradictory suffix and were safely ignored; any valid "
+            "opposite-period assignment was retained."
+        )
+    if transportation_metrics["different_am_pm_route_rows"]:
+        preflight["warnings"].append(
+            f'{transportation_metrics["different_am_pm_route_rows"]} student '
+            "row(s) use different AM and PM buses; both assignments were "
+            "preserved."
+        )
+    if is_transportation_v2:
+        preflight["warnings"].append(
+            "Transportation v2 uses the district Students Combined dual-route "
+            "contract. Delta is the safe default; Full Snapshot requires both "
+            "AM and PM assignments and zero invalid-route or directional-period "
+            "conflict rows."
         )
     if students and not contact_metrics["accepted_rows"]:
         preflight["warnings"].append(
@@ -685,6 +952,11 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             f'{contact_metrics["ignored_guardian_zero_anomaly_rows"]} Guardian '
             "Contacts row(s) used reserved contact_id 0 with a relationship; "
             "they were ignored and should be reviewed in PowerSchool."
+        )
+    if contact_metrics["ignored_no_transport_rows"]:
+        preflight["warnings"].append(
+            f'{contact_metrics["ignored_no_transport_rows"]} contact row(s) '
+            "were outside the valid Transportation scope and were safely ignored."
         )
     if contact_metrics["invalid_email_rows"]:
         preflight["warnings"].append(
