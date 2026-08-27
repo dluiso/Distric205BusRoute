@@ -16,6 +16,7 @@ FROM base
 
 WORKDIR /app
 COPY --chown=1000:1000 app.py ./app.py
+COPY --chown=1000:1000 email_service.py ./email_service.py
 COPY --chown=1000:1000 powerschool_import.py ./powerschool_import.py
 COPY --chown=1000:1000 templates ./templates
 COPY --chown=1000:1000 static/js ./static/js

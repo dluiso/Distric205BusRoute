@@ -561,13 +561,13 @@
           <div class="grid grid-cols-3 gap-3">
             <div class="col-span-2">
               <label class="block text-xs font-semibold text-slate-600 mb-1.5">SMTP Server</label>
-              <input type="text" name="mail_server" id="mail_server" value="{{ cfg.mail_server }}"
+              <input type="text" name="mail_server" id="mail_server" value="{{ smtp_current.server }}"
                      placeholder="smtp.example.com"
                      class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
             </div>
             <div>
               <label class="block text-xs font-semibold text-slate-600 mb-1.5">Port</label>
-              <input type="number" name="mail_port" id="mail_port" value="{{ cfg.mail_port }}"
+              <input type="number" name="mail_port" id="mail_port" value="{{ smtp_current.port }}"
                      placeholder="587" min="1" max="65535"
                      class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
             </div>
@@ -579,14 +579,14 @@
             <div class="flex flex-wrap gap-3">
               <label class="flex items-center space-x-2 cursor-pointer">
                 <input type="checkbox" name="mail_use_tls" id="mail_use_tls"
-                       {% if cfg.mail_use_tls %}checked{% endif %}
+                       {% if smtp_current.use_tls %}checked{% endif %}
                        onchange="onSecurityChange('tls', this.checked)"
                        class="w-4 h-4 rounded border-slate-300 text-blue-600">
                 <span class="text-sm text-slate-700">STARTTLS <span class="text-xs text-slate-400">(port 587)</span></span>
               </label>
               <label class="flex items-center space-x-2 cursor-pointer">
                 <input type="checkbox" name="mail_use_ssl" id="mail_use_ssl"
-                       {% if cfg.mail_use_ssl %}checked{% endif %}
+                       {% if smtp_current.use_ssl %}checked{% endif %}
                        onchange="onSecurityChange('ssl', this.checked)"
                        class="w-4 h-4 rounded border-slate-300 text-blue-600">
                 <span class="text-sm text-slate-700">SSL/TLS <span class="text-xs text-slate-400">(port 465)</span></span>
@@ -605,7 +605,11 @@
             <div>
               <label class="block text-xs font-semibold text-slate-600 mb-1.5">
                 Password
-                {% if cfg.mail_password %}<span class="ml-1 text-emerald-600 font-normal text-xs">(saved)</span>{% endif %}
+                {% if cfg.mail_password %}
+                  <span class="ml-1 text-emerald-600 font-normal text-xs">
+                    ({% if mail_status.encrypted %}saved and encrypted{% else %}saved; encryption pending{% endif %})
+                  </span>
+                {% endif %}
               </label>
               <div class="relative">
                 <input type="password" name="mail_password" id="mail_password"
@@ -656,8 +660,8 @@
             <i class="fas fa-plug text-blue-500"></i><span>Check Connection</span>
           </h3>
           <p class="text-xs text-slate-500 mb-3">
-            Tests TCP, SMTP handshake, STARTTLS/SSL and authentication step by step
-            — without sending any email. Uses the values currently in the form.
+            Tests the SMTP handshake, STARTTLS/SSL and authentication without sending email.
+            A blank password reuses the saved credential only when all connection fields match.
           </p>
           <button type="button" id="btn-check" onclick="checkSmtp()"
                   class="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium">
@@ -675,7 +679,7 @@
           </h3>
           <p class="text-xs text-slate-500 mb-3">
             Sends a real email using the form values.
-            If the password field is blank, the saved password is used.
+            A blank password reuses the saved credential only when all connection fields match.
           </p>
           <div class="flex items-center space-x-2">
             <input type="email" id="test_email_to" placeholder="recipient@example.com"
@@ -699,25 +703,32 @@
       <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-4">
         <h4 class="font-semibold text-slate-600 text-xs uppercase tracking-wider mb-3">Configuration Status</h4>
         <div class="space-y-2 text-sm">
-          {% set has_server = cfg.mail_server or cfg.mail_provider != 'custom' %}
-          {% set has_creds = cfg.mail_username and cfg.mail_password %}
-          {% set has_from = cfg.mail_from_email %}
           <div class="flex items-center space-x-2">
-            <i class="fas {% if has_server %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <i class="fas {% if mail_status.has_server %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
             <span class="text-slate-600">SMTP Server</span>
           </div>
           <div class="flex items-center space-x-2">
-            <i class="fas {% if has_creds %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <i class="fas {% if mail_status.has_credentials %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
             <span class="text-slate-600">Credentials</span>
           </div>
           <div class="flex items-center space-x-2">
-            <i class="fas {% if has_from %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
+            <i class="fas {% if mail_status.has_from %}fa-check-circle text-emerald-500{% else %}fa-times-circle text-red-400{% endif %} w-4"></i>
             <span class="text-slate-600">From Address</span>
           </div>
-          {% if has_server and has_creds and has_from %}
-          <p class="mt-2 text-xs text-emerald-600 font-medium"><i class="fas fa-check mr-1"></i>Ready to send</p>
+          {% if mail_status.verified %}
+          <p class="mt-2 text-xs text-emerald-600 font-medium"><i class="fas fa-check mr-1"></i>Delivery verified</p>
+          {% elif mail_status.connection_verified %}
+          <p class="mt-2 text-xs text-blue-600 font-medium"><i class="fas fa-plug mr-1"></i>Connection verified; send a test email</p>
+          {% elif mail_status.valid %}
+          <p class="mt-2 text-xs text-amber-600 font-medium"><i class="fas fa-exclamation-triangle mr-1"></i>Saved; verification required</p>
           {% else %}
           <p class="mt-2 text-xs text-amber-600 font-medium"><i class="fas fa-exclamation-triangle mr-1"></i>Setup incomplete</p>
+          {% endif %}
+          {% if mail_status.last_verified_at %}
+          <p class="text-[11px] text-slate-400">Last check: {{ mail_status.last_verified_at.strftime('%Y-%m-%d %H:%M UTC') }}</p>
+          {% endif %}
+          {% if mail_status.last_error_code %}
+          <p class="text-[11px] text-red-500">Last result: {{ mail_status.last_error_code }}</p>
           {% endif %}
         </div>
       </div>
@@ -769,9 +780,11 @@
             <ol class="list-decimal ml-3 space-y-1">
               <li>SMTP AUTH must be enabled in your Microsoft 365 admin center</li>
               <li>Use your full email address as username</li>
-              <li>Use your Microsoft 365 password (or App Password if MFA is on)</li>
+              <li>Use mailbox credentials only while SMTP Basic authentication remains allowed by your tenant</li>
+              <li>If From Email differs from the mailbox, grant that mailbox Send As permission</li>
             </ol>
           </div>
+          <p class="text-slate-400">Plan migration to OAuth before Microsoft retires SMTP Basic authentication.</p>
         </div>
       </div>
     </div>
@@ -1264,14 +1277,15 @@ document.querySelectorAll('input[type=color]').forEach(picker => {
 });
 
 // ── EMAIL TAB ─────────────────────────────────────────────────────────────────
-const SMTP_PRESETS = {
-  google:    { server: 'smtp.gmail.com',     port: 587, tls: true,  ssl: false,
-               banner: 'Server: smtp.gmail.com — Port: 587 — STARTTLS',
-               note:   'Requires a Google App Password (not your regular password).' },
-  office365: { server: 'smtp.office365.com', port: 587, tls: true,  ssl: false,
-               banner: 'Server: smtp.office365.com — Port: 587 — STARTTLS',
-               note:   'Enable SMTP AUTH in Microsoft 365 admin center first.' },
-};
+const SMTP_PRESETS = {{ smtp_presets|tojson }};
+const CURRENT_SMTP = {{ smtp_current|tojson }};
+
+function updatePresetBanner(preset, port, useTls, useSsl) {
+  const security = useSsl ? 'SSL/TLS' : (useTls ? 'STARTTLS' : 'No encryption');
+  document.getElementById('preset-server-line').textContent =
+    `Server: ${preset.server} — Port: ${port} — ${security}`;
+  document.getElementById('preset-note-line').textContent = preset.note || '';
+}
 
 function onProviderChange(val) {
   // Update card styles
@@ -1300,16 +1314,15 @@ function onProviderChange(val) {
     // Auto-fill fields
     document.getElementById('mail_server').value = preset.server;
     document.getElementById('mail_port').value   = preset.port;
-    document.getElementById('mail_use_tls').checked = preset.tls;
-    document.getElementById('mail_use_ssl').checked  = preset.ssl;
+    document.getElementById('mail_use_tls').checked = preset.use_tls;
+    document.getElementById('mail_use_ssl').checked  = preset.use_ssl;
     // Make server/port read-only
     document.getElementById('mail_server').readOnly = true;
     document.getElementById('mail_port').readOnly   = true;
     document.getElementById('mail_server').classList.add('bg-slate-50', 'text-slate-500');
     document.getElementById('mail_port').classList.add('bg-slate-50', 'text-slate-500');
     // Show banner
-    document.getElementById('preset-server-line').textContent = preset.banner;
-    document.getElementById('preset-note-line').textContent   = preset.note;
+    updatePresetBanner(preset, preset.port, preset.use_tls, preset.use_ssl);
     banner.classList.remove('hidden');
   } else {
     document.getElementById('mail_server').readOnly = false;
@@ -1331,22 +1344,10 @@ function setGmailPort(port) {
   document.getElementById('mail_port').readOnly = false;
   document.getElementById('mail_port').value = port;
   document.getElementById('mail_port').readOnly = true;
-  if (port === 465) {
-    document.getElementById('mail_use_tls').checked = false;
-    document.getElementById('mail_use_ssl').checked = true;
-    SMTP_PRESETS.google.port = 465;
-    SMTP_PRESETS.google.tls  = false;
-    SMTP_PRESETS.google.ssl  = true;
-    SMTP_PRESETS.google.banner = 'Server: smtp.gmail.com — Port: 465 — SSL/TLS';
-  } else {
-    document.getElementById('mail_use_tls').checked = true;
-    document.getElementById('mail_use_ssl').checked = false;
-    SMTP_PRESETS.google.port = 587;
-    SMTP_PRESETS.google.tls  = true;
-    SMTP_PRESETS.google.ssl  = false;
-    SMTP_PRESETS.google.banner = 'Server: smtp.gmail.com — Port: 587 — STARTTLS';
-  }
-  document.getElementById('preset-server-line').textContent = SMTP_PRESETS.google.banner;
+  const useSsl = port === 465;
+  document.getElementById('mail_use_tls').checked = !useSsl;
+  document.getElementById('mail_use_ssl').checked = useSsl;
+  updatePresetBanner(SMTP_PRESETS.google, port, !useSsl, useSsl);
 }
 
 function onSecurityChange(type, checked) {
@@ -1486,8 +1487,12 @@ async function testEmailLive() {
       document.getElementById('mail_port').readOnly   = true;
       document.getElementById('mail_server').classList.add('bg-slate-50', 'text-slate-500');
       document.getElementById('mail_port').classList.add('bg-slate-50', 'text-slate-500');
-      document.getElementById('preset-server-line').textContent = preset.banner;
-      document.getElementById('preset-note-line').textContent   = preset.note;
+      document.getElementById('mail_server').value = CURRENT_SMTP.server;
+      document.getElementById('mail_port').value = CURRENT_SMTP.port;
+      document.getElementById('mail_use_tls').checked = CURRENT_SMTP.use_tls;
+      document.getElementById('mail_use_ssl').checked = CURRENT_SMTP.use_ssl;
+      updatePresetBanner(
+        preset, CURRENT_SMTP.port, CURRENT_SMTP.use_tls, CURRENT_SMTP.use_ssl);
     }
   }
 })();

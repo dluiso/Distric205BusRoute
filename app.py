@@ -1,13 +1,12 @@
 # ============================================================
 #  School Bus Tracker — D205 School District
-#  Flask + SQLAlchemy + APScheduler + Flask-Mail
+#  Flask + SQLAlchemy + APScheduler
 # ============================================================
 
 from flask import (Flask, render_template, request, redirect, url_for,
                    jsonify, flash, make_response, send_file, session, g, abort)
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
-from flask_mail import Mail, Message
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime, date, timedelta, timezone
@@ -17,11 +16,13 @@ from types import SimpleNamespace
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from urllib.parse import urlsplit
-import hashlib, hmac, os, json, csv, io, pytz, re, threading, time, secrets, html, math, tempfile, unicodedata
+import click
+import hashlib, hmac, os, json, csv, io, pytz, re, time, secrets, html, math, tempfile, unicodedata
 from powerschool_import import (
     DEFAULT_MAPPING_V1, ImportValidationError, build_normalized_plan,
     canonical_plan_hash, safe_csv_cell,
 )
+from email_service import EmailTransportError, SMTPSettings, send_email, verify_connection
 
 
 def _utcnow():
@@ -116,6 +117,14 @@ app.config['RESTORE_SNAPSHOT_RETENTION_DAYS'] = _env_int(
     'RESTORE_SNAPSHOT_RETENTION_DAYS', 30, 1, 3650)
 app.config['BROADCAST_JOB_TTL_SECONDS'] = _env_int(
     'BROADCAST_JOB_TTL_SECONDS', 86400, 300, 604800)
+app.config['EMAIL_OUTBOX_MAX_ATTEMPTS'] = _env_int(
+    'EMAIL_OUTBOX_MAX_ATTEMPTS', 5, 1, 20)
+app.config['EMAIL_OUTBOX_RETRY_BASE_SECONDS'] = _env_int(
+    'EMAIL_OUTBOX_RETRY_BASE_SECONDS', 60, 5, 3600)
+app.config['EMAIL_OUTBOX_RETRY_MAX_SECONDS'] = _env_int(
+    'EMAIL_OUTBOX_RETRY_MAX_SECONDS', 3600, 60, 86400)
+app.config['EMAIL_OUTBOX_BATCH_SIZE'] = _env_int(
+    'EMAIL_OUTBOX_BATCH_SIZE', 50, 1, 500)
 app.config['IMPORT_MAX_ROWS'] = _env_int('IMPORT_MAX_ROWS', 25000, 1, 250000)
 app.config['IMPORT_MAX_COLUMNS'] = _env_int('IMPORT_MAX_COLUMNS', 64, 1, 512)
 app.config['IMPORT_STAGE_TTL_HOURS'] = _env_int('IMPORT_STAGE_TTL_HOURS', 24, 1, 720)
@@ -138,7 +147,6 @@ os.chmod(IMPORT_STAGE_DIR, 0o700)
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
-mail = Mail(app)
 
 # ── INSTALLATION LOCK ─────────────────────────────────────────────────────────
 INSTALLED_FILE = os.path.join(INSTANCE_DIR, '.installed')
@@ -250,10 +258,14 @@ class Configuration(db.Model):
     mail_port           = db.Column(db.Integer, default=587)
     mail_use_tls        = db.Column(db.Boolean, default=True)
     mail_use_ssl        = db.Column(db.Boolean, default=False)
-    mail_username       = db.Column(db.String(100), default='')
-    mail_password       = db.Column(db.String(200), default='')
-    mail_from_email     = db.Column(db.String(100), default='')
+    mail_username       = db.Column(db.String(320), default='')
+    mail_password       = db.Column(db.String(1000), default='')
+    mail_from_email     = db.Column(db.String(320), default='')
     mail_from_name      = db.Column(db.String(100), default='Bus Tracker')
+    mail_last_verified_at = db.Column(db.DateTime)
+    mail_last_verification_status = db.Column(db.String(20), default='unverified')
+    mail_last_error_code = db.Column(db.String(80), default='')
+    mail_last_verified_identity = db.Column(db.String(64), default='')
     # SMS / Twilio
     twilio_enabled          = db.Column(db.Boolean, default=False)
     twilio_account_sid      = db.Column(db.String(60), default='')
@@ -617,7 +629,7 @@ class NotificationLog(db.Model):
     sent_at            = db.Column(db.DateTime, default=_utcnow, index=True)
     channel            = db.Column(db.String(10), nullable=False)   # 'email' | 'sms'
     recipient_name     = db.Column(db.String(160))
-    recipient_address  = db.Column(db.String(160))                  # email or phone
+    recipient_address  = db.Column(db.String(500))                  # email or phone
     subscriber_id      = db.Column(db.Integer, db.ForeignKey('notification_subscriber.id'), nullable=True)
     group_id           = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'), nullable=True)
     group_name         = db.Column(db.String(100))
@@ -654,6 +666,33 @@ class BroadcastJob(db.Model):
             return value if isinstance(value, list) else []
         except (TypeError, ValueError):
             return []
+
+
+class EmailOutbox(db.Model):
+    __tablename__ = 'email_outbox'
+    id                 = db.Column(db.Integer, primary_key=True)
+    dedupe_key         = db.Column(db.String(128), unique=True, nullable=False, index=True)
+    kind               = db.Column(db.String(30), nullable=False, index=True)
+    recipient_name     = db.Column(db.String(160), default='')
+    recipient_address  = db.Column(db.String(320), nullable=False)
+    subject            = db.Column(db.String(300), nullable=False)
+    body               = db.Column(db.Text, nullable=False)
+    status             = db.Column(db.String(20), nullable=False, default='pending', index=True)
+    attempts           = db.Column(db.Integer, nullable=False, default=0)
+    max_attempts       = db.Column(db.Integer, nullable=False, default=5)
+    available_at       = db.Column(db.DateTime, nullable=False, default=_utcnow, index=True)
+    locked_at          = db.Column(db.DateTime)
+    sent_at            = db.Column(db.DateTime)
+    last_error_code    = db.Column(db.String(80), default='')
+    incident_record_id = db.Column(db.Integer, db.ForeignKey('bus_incident_record.id'), index=True)
+    subscriber_id      = db.Column(db.Integer, db.ForeignKey('notification_subscriber.id'))
+    group_id           = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'))
+    group_name         = db.Column(db.String(100), default='')
+    bus_id             = db.Column(db.Integer, db.ForeignKey('bus.id'))
+    bus_label          = db.Column(db.String(80), default='')
+    broadcast_job_id   = db.Column(db.String(64), db.ForeignKey('broadcast_job.public_id'), index=True)
+    created_at         = db.Column(db.DateTime, nullable=False, default=_utcnow)
+    updated_at         = db.Column(db.DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
 
 
 class ImportMappingProfile(db.Model):
@@ -878,6 +917,10 @@ def _migrate_add_columns():
         ('bus_incident_record',     'delay_reason_id', 'INTEGER'),
         ('bus_incident_record',     'delay_reason_text', 'VARCHAR(200)'),
         ('configuration',           'mail_use_ssl',    'BOOLEAN DEFAULT 0'),
+        ('configuration',           'mail_last_verified_at', 'TIMESTAMP'),
+        ('configuration',           'mail_last_verification_status', "VARCHAR(20) DEFAULT 'unverified'"),
+        ('configuration',           'mail_last_error_code', "VARCHAR(80) DEFAULT ''"),
+        ('configuration',           'mail_last_verified_identity', "VARCHAR(64) DEFAULT ''"),
         ('configuration',           'time_format',     "VARCHAR(4) DEFAULT '12h'"),
         ('notification_subscriber', 'group_id',        'INTEGER'),
         ('notification_subscriber', 'notes',           'VARCHAR(200)'),
@@ -904,17 +947,25 @@ def _migrate_add_columns():
 
 
 def _migrate_email_column():
-    """Widen subscriber_contact.email to VARCHAR(500) on PostgreSQL."""
+    """Widen email and encrypted-secret columns on PostgreSQL."""
     db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
     if not db_url.startswith('postgresql'):
         return  # SQLite doesn't enforce VARCHAR length — no action needed
     from sqlalchemy import text
-    try:
-        with db.engine.connect() as conn:
-            conn.execute(text('ALTER TABLE subscriber_contact ALTER COLUMN email TYPE VARCHAR(500)'))
-            conn.commit()
-    except Exception:
-        pass  # already wide enough or column doesn't exist yet
+    statements = (
+        'ALTER TABLE subscriber_contact ALTER COLUMN email TYPE VARCHAR(500)',
+        'ALTER TABLE configuration ALTER COLUMN mail_password TYPE VARCHAR(1000)',
+        'ALTER TABLE configuration ALTER COLUMN mail_username TYPE VARCHAR(320)',
+        'ALTER TABLE configuration ALTER COLUMN mail_from_email TYPE VARCHAR(320)',
+        'ALTER TABLE notification_log ALTER COLUMN recipient_address TYPE VARCHAR(500)',
+    )
+    for statement in statements:
+        try:
+            with db.engine.connect() as conn:
+                conn.execute(text(statement))
+                conn.commit()
+        except Exception:
+            pass  # already wide enough or column doesn't exist yet
 
 
 def _migrate_group_bus_period():
@@ -1184,7 +1235,7 @@ def _initialize_database_unlocked():
     required_phase2_tables = {
         'group_capability', 'broadcast_job', 'import_mapping_profile',
         'import_batch', 'import_file', 'import_row', 'external_identity',
-        'import_change',
+        'import_change', 'email_outbox',
     }
     if 'session_version' not in user_columns or not {
             'throttle_key', 'failed_count', 'window_started_at', 'locked_until'
@@ -1314,10 +1365,31 @@ def bus_list_today(period=None, admin=False):
                        'current_period': current_period})
     return result
 
-SMTP_PRESET_SERVERS = {
-    'office365': 'smtp.office365.com',
-    'google': 'smtp.gmail.com',
+SMTP_PROVIDER_PRESETS = {
+    'office365': {
+        'server': 'smtp.office365.com',
+        'port': 587,
+        'use_tls': True,
+        'use_ssl': False,
+        'allowed_transports': [(587, True, False)],
+        'banner': 'Server: smtp.office365.com — Port: 587 — STARTTLS',
+        'note': 'SMTP AUTH must be enabled for the mailbox. OAuth migration is recommended.',
+    },
+    'google': {
+        'server': 'smtp.gmail.com',
+        'port': 587,
+        'use_tls': True,
+        'use_ssl': False,
+        'allowed_transports': [(587, True, False), (465, False, True)],
+        'banner': 'Server: smtp.gmail.com — Port: 587 — STARTTLS',
+        'note': 'Requires a Google App Password when password authentication is used.',
+    },
 }
+SMTP_PRESET_SERVERS = {
+    provider: preset['server'] for provider, preset in SMTP_PROVIDER_PRESETS.items()
+}
+_ENCRYPTED_SECRET_PREFIX = 'enc:v1:'
+_EMAIL_RE = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
 
 
 def _smtp_allowed_hosts():
@@ -1347,50 +1419,276 @@ def _validated_smtp_port(value):
     return port
 
 
-def configure_mail(cfg, override=None):
-    """Apply SMTP settings to Flask-Mail. Pass override dict to use custom values without DB save.
+def _credential_fernet():
+    """Return the credential cipher without embedding key material in the database."""
+    from cryptography.fernet import Fernet
+    raw_key = (os.environ.get('EMAIL_CREDENTIAL_ENCRYPTION_KEY', '').strip() or
+               os.environ.get('BACKUP_ENCRYPTION_KEY', '').strip())
+    if not raw_key:
+        raise RuntimeError(
+            'EMAIL_CREDENTIAL_ENCRYPTION_KEY or BACKUP_ENCRYPTION_KEY is required.')
+    try:
+        return Fernet(raw_key.encode('ascii', 'strict'))
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise RuntimeError('The configured email credential encryption key is invalid.') from exc
 
-    Flask-Mail caches its state in app.extensions['mail'] at startup, so we must call
-    mail.init_app(app) after every app.config.update() to force it to reload.
-    """
-    o = override or {}
-    provider = o.get('provider', cfg.mail_provider)
 
-    if override:
-        # Live test: use form values; derive server from preset if applicable
-        srv  = _validated_smtp_host(provider, o.get('server', cfg.mail_server))
-        port = _validated_smtp_port(o.get('port', None) or cfg.mail_port or 587)
-        tls  = bool(o.get('use_tls', cfg.mail_use_tls))
-        ssl  = bool(o.get('use_ssl', getattr(cfg, 'mail_use_ssl', False)))
-        username   = o.get('username',   cfg.mail_username) or ''
-        password   = o.get('password', '') or ''
-        from_email = o.get('from_email', cfg.mail_from_email) or ''
-        from_name  = o.get('from_name',  cfg.mail_from_name)  or 'Bus Tracker'
-    else:
-        # Normal send: use DB values; derive server from preset if applicable
-        srv  = _validated_smtp_host(cfg.mail_provider, cfg.mail_server)
-        port = _validated_smtp_port(cfg.mail_port or 587)
-        tls  = bool(cfg.mail_use_tls)
-        ssl  = bool(getattr(cfg, 'mail_use_ssl', False))
-        username   = cfg.mail_username   or ''
-        password   = cfg.mail_password   or ''
-        from_email = cfg.mail_from_email or ''
-        from_name  = cfg.mail_from_name  or 'Bus Tracker'
+def _encrypt_mail_password(password):
+    if not password:
+        return ''
+    if password.startswith(_ENCRYPTED_SECRET_PREFIX):
+        _decrypt_mail_password(password)
+        return password
+    token = _credential_fernet().encrypt(password.encode('utf-8')).decode('ascii')
+    return _ENCRYPTED_SECRET_PREFIX + token
 
-    app.config.update(
-        MAIL_SERVER=srv,
-        MAIL_PORT=port,
-        MAIL_USE_TLS=tls,
-        MAIL_USE_SSL=ssl,
-        MAIL_USERNAME=username,
-        MAIL_PASSWORD=password,
-        MAIL_DEFAULT_SENDER=(from_name, from_email),
-        MAIL_SUPPRESS_SEND=False,
+
+def _decrypt_mail_password(stored):
+    if not stored:
+        return ''
+    if not stored.startswith(_ENCRYPTED_SECRET_PREFIX):
+        return stored  # Backward-compatible legacy plaintext until first save/migration.
+    from cryptography.fernet import InvalidToken
+    token = stored[len(_ENCRYPTED_SECRET_PREFIX):]
+    try:
+        return _credential_fernet().decrypt(token.encode('ascii')).decode('utf-8')
+    except (InvalidToken, ValueError, TypeError, UnicodeError) as exc:
+        raise RuntimeError('The saved email credential cannot be decrypted.') from exc
+
+
+def _mail_password_is_encrypted(cfg):
+    return bool((cfg.mail_password or '').startswith(_ENCRYPTED_SECRET_PREFIX))
+
+
+def _canonical_smtp_transport(provider, server, port, use_tls, use_ssl):
+    validated_server = _validated_smtp_host(provider, server)
+    validated_port = _validated_smtp_port(port)
+    tls = bool(use_tls)
+    ssl_enabled = bool(use_ssl)
+    if tls and ssl_enabled:
+        raise ValueError('STARTTLS and SSL/TLS cannot both be enabled.')
+
+    preset = SMTP_PROVIDER_PRESETS.get(provider)
+    if preset:
+        allowed = {tuple(item) for item in preset['allowed_transports']}
+        requested = (validated_port, tls, ssl_enabled)
+        if provider == 'office365':
+            requested = next(iter(allowed))
+        elif requested not in allowed:
+            raise ValueError('The selected provider does not support this port/security combination.')
+        validated_port, tls, ssl_enabled = requested
+    return validated_server, validated_port, tls, ssl_enabled
+
+
+def _smtp_identity(provider, server, port, use_tls, use_ssl, username):
+    material = json.dumps({
+        'provider': provider,
+        'server': server,
+        'port': int(port),
+        'use_tls': bool(use_tls),
+        'use_ssl': bool(use_ssl),
+        'username': (username or '').strip().lower(),
+    }, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(material).hexdigest()
+
+
+def _current_smtp_identity(cfg):
+    server, port, tls, ssl_enabled = _canonical_smtp_transport(
+        cfg.mail_provider, cfg.mail_server, cfg.mail_port or 587,
+        cfg.mail_use_tls, getattr(cfg, 'mail_use_ssl', False))
+    return _smtp_identity(
+        cfg.mail_provider, server, port, tls, ssl_enabled, cfg.mail_username)
+
+
+def _mail_verification_identity(connection_identity, from_email):
+    material = f'{connection_identity}\n{(from_email or "").strip().lower()}'.encode('utf-8')
+    return hashlib.sha256(material).hexdigest()
+
+
+def _validated_email(value, label, *, required=False):
+    address = (value or '').strip()
+    if not address and not required:
+        return ''
+    if not address or len(address) > 320 or not _EMAIL_RE.fullmatch(address):
+        raise ValueError(f'Enter a valid {label}.')
+    return address
+
+
+def _smtp_settings_from_payload(cfg, payload, *, allow_saved_password):
+    provider = (payload.get('provider', cfg.mail_provider) or 'custom').strip().lower()
+    server, port, tls, ssl_enabled = _canonical_smtp_transport(
+        provider,
+        payload.get('server', cfg.mail_server),
+        payload.get('port', cfg.mail_port or 587),
+        payload.get('use_tls', cfg.mail_use_tls),
+        payload.get('use_ssl', getattr(cfg, 'mail_use_ssl', False)),
     )
-    # CRITICAL: Flask-Mail caches its _Mail state object at init time in
-    # app.extensions['mail']. Without re-calling init_app(), mail.send() would
-    # still use the old cached server/port and connect to localhost instead.
-    mail.init_app(app)
+    username = (payload.get('username', cfg.mail_username) or '').strip()
+    from_email = _validated_email(
+        payload.get('from_email', cfg.mail_from_email), 'From email address', required=True)
+    from_name = (payload.get('from_name', cfg.mail_from_name) or 'Bus Tracker').strip()
+    if len(username) > 320 or len(from_name) > 100:
+        raise ValueError('Email account fields exceed the allowed length.')
+    if provider in SMTP_PROVIDER_PRESETS and not username:
+        raise ValueError('Username / Email is required for the selected provider.')
+
+    requested_identity = _smtp_identity(
+        provider, server, port, tls, ssl_enabled, username)
+    supplied_password = payload.get('password', '')
+    supplied_password = supplied_password if isinstance(supplied_password, str) else ''
+    if supplied_password:
+        password = supplied_password
+    elif (allow_saved_password and cfg.mail_password and
+          requested_identity == _current_smtp_identity(cfg)):
+        password = _decrypt_mail_password(cfg.mail_password or '')
+    elif username:
+        raise EmailTransportError(
+            'password_required_for_changes',
+            'Re-enter the SMTP password because the connection settings changed.',
+        )
+    else:
+        password = ''
+
+    return SMTPSettings(
+        provider=provider,
+        server=server,
+        port=port,
+        use_tls=tls,
+        use_ssl=ssl_enabled,
+        username=username,
+        password=password,
+        from_email=from_email,
+        from_name=from_name,
+    ), requested_identity
+
+
+def _smtp_settings_from_config(cfg):
+    return _smtp_settings_from_payload(cfg, {}, allow_saved_password=True)[0]
+
+
+def configure_mail(cfg, override=None):
+    """Compatibility wrapper returning immutable settings instead of mutating Flask."""
+    if override is None:
+        return _smtp_settings_from_config(cfg)
+    return _smtp_settings_from_payload(
+        cfg, override, allow_saved_password=True)[0]
+
+
+def _record_mail_verification(cfg, connection_identity, from_email, status, error_code=''):
+    cfg.mail_last_verified_at = _utcnow()
+    cfg.mail_last_verified_identity = _mail_verification_identity(
+        connection_identity, from_email)
+    cfg.mail_last_verification_status = status
+    cfg.mail_last_error_code = error_code
+    db.session.commit()
+
+
+def _matches_saved_mail_identity(cfg, connection_identity, from_email):
+    try:
+        return bool(
+            connection_identity and
+            connection_identity == _current_smtp_identity(cfg) and
+            (from_email or '').strip().lower() ==
+            (cfg.mail_from_email or '').strip().lower()
+        )
+    except (ValueError, RuntimeError):
+        return False
+
+
+def _mail_configuration_status(cfg):
+    status = {
+        'has_server': False,
+        'has_credentials': bool(cfg.mail_username and cfg.mail_password),
+        'has_from': bool(cfg.mail_from_email),
+        'valid': False,
+        'connection_verified': False,
+        'verified': False,
+        'encrypted': _mail_password_is_encrypted(cfg),
+        'last_verified_at': cfg.mail_last_verified_at,
+        'last_error_code': cfg.mail_last_error_code or '',
+    }
+    try:
+        server, port, tls, ssl_enabled = _canonical_smtp_transport(
+            cfg.mail_provider, cfg.mail_server, cfg.mail_port or 587,
+            cfg.mail_use_tls, getattr(cfg, 'mail_use_ssl', False))
+        _validated_email(cfg.mail_from_email, 'From email address', required=True)
+        identity = _smtp_identity(
+            cfg.mail_provider, server, port, tls, ssl_enabled, cfg.mail_username)
+        status['has_server'] = bool(server)
+        status['valid'] = bool(server and status['has_credentials'] and status['has_from'])
+        verification_identity = _mail_verification_identity(identity, cfg.mail_from_email)
+        status['connection_verified'] = bool(
+            status['valid'] and cfg.mail_last_verification_status in {
+                'connection_verified', 'delivery_verified'} and
+            cfg.mail_last_verified_identity == verification_identity)
+        status['verified'] = bool(
+            status['valid'] and cfg.mail_last_verification_status == 'delivery_verified' and
+            cfg.mail_last_verified_identity == verification_identity)
+    except (ValueError, RuntimeError):
+        pass
+    return status
+
+
+def _smtp_public_settings(cfg):
+    try:
+        server, port, tls, ssl_enabled = _canonical_smtp_transport(
+            cfg.mail_provider, cfg.mail_server, cfg.mail_port or 587,
+            cfg.mail_use_tls, getattr(cfg, 'mail_use_ssl', False))
+    except ValueError:
+        server = cfg.mail_server or ''
+        port = cfg.mail_port or 587
+        tls = bool(cfg.mail_use_tls)
+        ssl_enabled = bool(getattr(cfg, 'mail_use_ssl', False))
+    return {
+        'provider': cfg.mail_provider,
+        'server': server,
+        'port': port,
+        'use_tls': tls,
+        'use_ssl': ssl_enabled,
+    }
+
+
+@app.cli.command('migrate-email-config')
+def migrate_email_config_command():
+    """Encrypt a legacy credential and normalize provider-owned transport values."""
+    cfg = Configuration.query.first()
+    if not cfg:
+        raise click.ClickException('Application configuration does not exist.')
+
+    changed = []
+    try:
+        if cfg.mail_password and not _mail_password_is_encrypted(cfg):
+            cfg.mail_password = _encrypt_mail_password(cfg.mail_password)
+            changed.append('credential_encrypted')
+        elif cfg.mail_password:
+            _decrypt_mail_password(cfg.mail_password)
+
+        if cfg.mail_provider in SMTP_PROVIDER_PRESETS:
+            server, port, use_tls, use_ssl = _canonical_smtp_transport(
+                cfg.mail_provider,
+                cfg.mail_server,
+                cfg.mail_port or 587,
+                cfg.mail_use_tls,
+                getattr(cfg, 'mail_use_ssl', False),
+            )
+            current = (
+                cfg.mail_server, cfg.mail_port,
+                bool(cfg.mail_use_tls), bool(getattr(cfg, 'mail_use_ssl', False)),
+            )
+            normalized = (server, port, use_tls, use_ssl)
+            if current != normalized:
+                cfg.mail_server, cfg.mail_port = server, port
+                cfg.mail_use_tls, cfg.mail_use_ssl = use_tls, use_ssl
+                cfg.mail_last_verification_status = 'unverified'
+                cfg.mail_last_verified_identity = ''
+                cfg.mail_last_error_code = ''
+                changed.append('transport_normalized')
+        db.session.commit()
+    except (ValueError, RuntimeError) as exc:
+        db.session.rollback()
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(','.join(changed) if changed else 'already_current')
 
 
 # ── PERMISSION DECORATOR ─────────────────────────────────────────────────────
@@ -1478,6 +1776,238 @@ def _audit(action, module, target='', details=''):
 
 # ── APSCHEDULER ──────────────────────────────────────────────────────────────
 
+def _email_dedupe_key(kind, *parts):
+    material = '\n'.join([kind, *(str(part) for part in parts)]).encode('utf-8')
+    return f'{kind}:{hashlib.sha256(material).hexdigest()}'
+
+
+def _enqueue_email(*, dedupe_key, kind, recipient_name, recipient_address,
+                   subject, body, available_at=None, incident_record_id=None,
+                   subscriber_id=None, group_id=None, group_name='', bus_id=None,
+                   bus_label='', broadcast_job_id=None):
+    """Add one durable delivery without duplicating an already-known message."""
+    address = _validated_email(
+        recipient_address, 'recipient email address', required=True).lower()
+    existing = EmailOutbox.query.filter_by(dedupe_key=dedupe_key).first()
+    if existing:
+        return existing
+    row = EmailOutbox(
+        dedupe_key=dedupe_key,
+        kind=kind,
+        recipient_name=(recipient_name or '')[:160],
+        recipient_address=address,
+        subject=(subject or '')[:300],
+        body=body or '',
+        status='pending',
+        attempts=0,
+        max_attempts=app.config['EMAIL_OUTBOX_MAX_ATTEMPTS'],
+        available_at=available_at or _utcnow(),
+        incident_record_id=incident_record_id,
+        subscriber_id=subscriber_id,
+        group_id=group_id,
+        group_name=(group_name or '')[:100],
+        bus_id=bus_id,
+        bus_label=(bus_label or '')[:80],
+        broadcast_job_id=broadcast_job_id,
+    )
+    try:
+        with db.session.begin_nested():
+            db.session.add(row)
+            db.session.flush()
+        return row
+    except IntegrityError:
+        return EmailOutbox.query.filter_by(dedupe_key=dedupe_key).first()
+
+
+def _complete_broadcast_if_ready(job_id):
+    if not job_id:
+        return
+    job = db.session.get(BroadcastJob, job_id)
+    if not job:
+        return
+    if (job.status != 'completed' and
+            int(job.sent or 0) + int(job.failed or 0) >= int(job.total or 0)):
+        job.status = 'completed'
+        job.updated_at = _utcnow()
+        owner = db.session.get(User, job.owner_id)
+        db.session.add(AuditLog(
+            user_id=job.owner_id,
+            username=owner.username if owner else 'system',
+            action='broadcast_completed',
+            module='notifications',
+            target=job.public_id,
+            details=f'{job.sent} sent; {job.failed} failed',
+            ip_address='background',
+        ))
+
+
+def _requeue_configuration_failures():
+    """Make configuration-related terminal deliveries eligible after a config fix."""
+    retryable_codes = {
+        'authentication_rejected', 'sender_rejected', 'configuration_invalid',
+        'password_required', 'tls_failed', 'connection_failed',
+        'connection_timeout', 'server_disconnected', 'smtp_feature_unsupported',
+        'smtp_rejected', 'smtp_temporary_failure', 'delivery_failed',
+    }
+    rows = EmailOutbox.query.filter(
+        EmailOutbox.status == 'failed',
+        EmailOutbox.last_error_code.in_(retryable_codes),
+    ).all()
+    now = _utcnow()
+    for row in rows:
+        row.status = 'retry'
+        row.attempts = 0
+        row.available_at = now
+        row.locked_at = None
+        row.updated_at = now
+        if row.broadcast_job_id:
+            job = db.session.get(BroadcastJob, row.broadcast_job_id)
+            if job:
+                job.failed = max(0, int(job.failed or 0) - 1)
+                job.status = 'running'
+                job.updated_at = now
+    return len(rows)
+
+
+def _record_outbox_notification(row, status, error_code=''):
+    if not row.incident_record_id:
+        return
+    existing = NotificationLog.query.filter_by(
+        incident_record_id=row.incident_record_id,
+        channel='email',
+        recipient_address=row.recipient_address,
+    ).first()
+    if existing:
+        existing.status = status
+        existing.error_message = error_code or None
+        existing.sent_at = _utcnow()
+        return
+    db.session.add(NotificationLog(
+        incident_record_id=row.incident_record_id,
+        channel='email',
+        recipient_name=row.recipient_name,
+        recipient_address=row.recipient_address,
+        subscriber_id=row.subscriber_id,
+        group_id=row.group_id,
+        group_name=row.group_name,
+        bus_id=row.bus_id,
+        bus_label=row.bus_label,
+        status=status,
+        error_message=error_code or None,
+    ))
+
+
+def _claim_due_email_ids():
+    now = _utcnow()
+    stale_before = now - timedelta(minutes=10)
+    query = EmailOutbox.query.filter(
+        db.or_(
+            db.and_(EmailOutbox.status.in_(['pending', 'retry']),
+                    EmailOutbox.available_at <= now),
+            db.and_(EmailOutbox.status == 'processing',
+                    EmailOutbox.locked_at < stale_before),
+        )
+    ).order_by(EmailOutbox.available_at, EmailOutbox.id)
+    if str(db.engine.url).startswith('postgresql'):
+        query = query.with_for_update(skip_locked=True)
+    rows = query.limit(app.config['EMAIL_OUTBOX_BATCH_SIZE']).all()
+    ids = []
+    for row in rows:
+        row.status = 'processing'
+        row.locked_at = now
+        row.updated_at = now
+        ids.append(row.id)
+    db.session.commit()
+    return ids
+
+
+def process_email_outbox():
+    """Deliver a bounded durable batch and retain retry state across restarts."""
+    with app.app_context():
+        try:
+            row_ids = _claim_due_email_ids()
+        except Exception as exc:
+            db.session.rollback()
+            print(f'[EmailOutbox] claim error: {type(exc).__name__}')
+            return
+
+        for row_id in row_ids:
+            row = db.session.get(EmailOutbox, row_id)
+            if not row or row.status != 'processing':
+                continue
+            try:
+                cfg = Configuration.query.first()
+                if not cfg:
+                    raise EmailTransportError(
+                        'configuration_missing', 'Email configuration is missing.')
+                settings = _smtp_settings_from_config(cfg)
+                send_email(
+                    settings,
+                    subject=row.subject,
+                    recipients=[row.recipient_address],
+                    body=row.body,
+                )
+                row.attempts = int(row.attempts or 0) + 1
+                row.status = 'sent'
+                row.sent_at = _utcnow()
+                row.locked_at = None
+                row.last_error_code = ''
+                _record_outbox_notification(row, 'sent')
+                if row.broadcast_job_id:
+                    job = db.session.get(BroadcastJob, row.broadcast_job_id)
+                    if job:
+                        job.status = 'running'
+                        job.sent = int(job.sent or 0) + 1
+                        job.updated_at = _utcnow()
+                        _complete_broadcast_if_ready(job.public_id)
+                db.session.commit()
+            except Exception as exc:
+                db.session.rollback()
+                row = db.session.get(EmailOutbox, row_id)
+                if not row:
+                    continue
+                if isinstance(exc, EmailTransportError):
+                    failure = exc
+                elif isinstance(exc, (ValueError, RuntimeError)):
+                    failure = EmailTransportError(
+                        'configuration_invalid', 'The saved email configuration is invalid.')
+                else:
+                    failure = EmailTransportError(
+                        'delivery_failed',
+                        'Email delivery failed for an unexpected internal reason.',
+                        retryable=True,
+                    )
+                row.attempts = int(row.attempts or 0) + 1
+                row.last_error_code = failure.code
+                row.locked_at = None
+                terminal = not failure.retryable or row.attempts >= row.max_attempts
+                if terminal:
+                    row.status = 'failed'
+                    _record_outbox_notification(row, 'failed', failure.code)
+                    if row.broadcast_job_id:
+                        job = db.session.get(BroadcastJob, row.broadcast_job_id)
+                        if job:
+                            job.status = 'running'
+                            job.failed = int(job.failed or 0) + 1
+                            errors = job.errors
+                            if len(errors) < 100:
+                                errors.append(
+                                    f'{_mask_email(row.recipient_address)}: {failure.code}')
+                            job.errors_json = json.dumps(errors)
+                            job.updated_at = _utcnow()
+                            _complete_broadcast_if_ready(job.public_id)
+                else:
+                    delay = min(
+                        app.config['EMAIL_OUTBOX_RETRY_MAX_SECONDS'],
+                        app.config['EMAIL_OUTBOX_RETRY_BASE_SECONDS'] *
+                        (2 ** max(0, row.attempts - 1)),
+                    )
+                    row.status = 'retry'
+                    row.available_at = _utcnow() + timedelta(seconds=delay)
+                row.updated_at = _utcnow()
+                db.session.commit()
+
+
 def commit_pending_incidents():
     with app.app_context():
         try:
@@ -1505,12 +2035,7 @@ def _send_bus_notifications(rec):
         bus, it = rec.bus, rec.incident_type
 
         # ── Email ────────────────────────────────────────────────────────────
-        email_enabled = cfg.mail_server or cfg.mail_provider != 'custom'
-        if email_enabled:
-            try:
-                configure_mail(cfg)
-            except Exception:
-                email_enabled = False
+        email_enabled = bool(cfg.mail_server or cfg.mail_provider in SMTP_PROVIDER_PRESETS)
 
         subject = f"Bus Update: {bus.display_name}"
         email_body = (f"Bus {bus.display_name} — Status Update\n\n"
@@ -1565,11 +2090,24 @@ def _send_bus_notifications(rec):
                 if email in sent_emails: continue
                 sent_emails.add(email)
                 try:
-                    mail.send(Message(subject=subject, recipients=[email], body=email_body))
-                    _log('email', name, email, sub, grp_id, grp_name, 'sent')
-                except Exception as e:
-                    print(f'[Notifications] email error to {email}: {e}')
-                    _log('email', name, email, sub, grp_id, grp_name, 'failed', error=str(e))
+                    _enqueue_email(
+                        dedupe_key=_email_dedupe_key(
+                            'bus_notification', rec.id, email.strip().lower()),
+                        kind='bus_notification',
+                        recipient_name=name,
+                        recipient_address=email,
+                        subject=subject,
+                        body=email_body,
+                        incident_record_id=rec.id,
+                        subscriber_id=sub.id if sub else None,
+                        group_id=grp_id,
+                        group_name=grp_name,
+                        bus_id=bus.id,
+                        bus_label=bus.display_name,
+                    )
+                except ValueError:
+                    _log('email', name, email, sub, grp_id, grp_name, 'failed',
+                         error='invalid_recipient')
 
         def _try_sms(name, phone, sub, grp_id, grp_name):
             if not phone or phone in sent_phones or not twilio_on: return
@@ -1632,7 +2170,10 @@ def _start_scheduler_once():
     if not SCHEDULER_AVAILABLE or os.environ.get('DISABLE_SCHEDULER') == '1':
         return
     sched = BackgroundScheduler(daemon=True)
-    sched.add_job(commit_pending_incidents, 'interval', minutes=1, id='commit_pending')
+    sched.add_job(commit_pending_incidents, 'interval', minutes=1,
+                  id='commit_pending', coalesce=True, max_instances=1)
+    sched.add_job(process_email_outbox, 'interval', seconds=10,
+                  id='process_email_outbox', coalesce=True, max_instances=1)
     try:
         import fcntl
         _sched_lock_fh = open('/tmp/bustrack_sched.lock', 'w')
@@ -2922,8 +3463,9 @@ def email_statistics():
         flash('Enter a recipient email.', 'error')
         return redirect(url_for('statistics'))
     cfg = get_config()
-    configure_mail(cfg)
     try:
+        to_email = _validated_email(to_email, 'recipient email address', required=True)
+        settings = _smtp_settings_from_config(cfg)
         today = date.today()
         records = BusIncidentRecord.query.filter(
             BusIncidentRecord.is_pending == False,
@@ -2934,11 +3476,17 @@ def email_statistics():
         body += '-' * 60 + '\n'
         for r in records:
             body += f"{r.bus.identifier:<12} {r.incident_type.name:<22} {r.delay_minutes:>5}m  {r.schedule_type.name if r.schedule_type else ''}\n"
-        msg = Message(subject=f"Bus Report — {today}", recipients=[to_email], body=body)
-        mail.send(msg)
+        send_email(
+            settings,
+            subject=f"Bus Report — {today}",
+            recipients=[to_email],
+            body=body,
+        )
         flash(f'Report sent to {to_email}.', 'success')
-    except Exception as e:
-        flash(f'Could not send email: {e}', 'error')
+    except (EmailTransportError, ValueError, RuntimeError) as exc:
+        failure = exc if isinstance(exc, EmailTransportError) else EmailTransportError(
+            'configuration_invalid', str(exc))
+        flash(f'Could not send email: {failure.safe_message}', 'error')
     return redirect(url_for('statistics'))
 
 
@@ -5108,51 +5656,6 @@ def _build_recipient_list(target, group_ids, subscriber_id, user_id):
     return recipients
 
 
-def _broadcast_worker(job_id, recipients, subject, body, interval_sec):
-    """Background worker with database-backed progress shared by all web workers."""
-    with app.app_context():
-        job = db.session.get(BroadcastJob, job_id)
-        if not job or job.expires_at <= _utcnow():
-            return
-        job.status = 'running'
-        job.updated_at = _utcnow()
-        db.session.commit()
-        cfg = Configuration.query.first()
-        try:
-            if cfg:
-                configure_mail(cfg)
-        except Exception:
-            job.status = 'failed'
-            job.errors_json = json.dumps(['Approved SMTP configuration could not be initialized.'])
-            job.updated_at = _utcnow()
-            db.session.commit()
-            return
-        for i, (name, email) in enumerate(recipients):
-            if i > 0 and interval_sec > 0:
-                time.sleep(interval_sec)
-            try:
-                msg = Message(subject=subject, recipients=[email],
-                              body=f"Hi {name or 'there'},\n\n{body}")
-                mail.send(msg)
-                job.sent += 1
-            except Exception:
-                job.failed += 1
-                errors = job.errors
-                if len(errors) < 100:
-                    errors.append(f'{_mask_email(email)}: delivery failed')
-                job.errors_json = json.dumps(errors)
-            job.updated_at = _utcnow()
-            db.session.commit()
-        job.status = 'completed'
-        job.updated_at = _utcnow()
-        owner = db.session.get(User, job.owner_id)
-        db.session.add(AuditLog(
-            user_id=job.owner_id, username=owner.username if owner else 'system',
-            action='broadcast_completed', module='notifications', target=job.public_id,
-            details=f'{job.sent} sent; {job.failed} failed', ip_address='background'))
-        db.session.commit()
-
-
 @app.route('/admin/notifications/broadcast', methods=['POST'])
 @login_required
 @require_capability('notifications.broadcast')
@@ -5164,7 +5667,10 @@ def send_broadcast():
     user_id      = data.get('user_id')
     subject      = (data.get('subject') or '').strip()
     body         = (data.get('body') or '').strip()
-    interval_sec = max(0, int(data.get('interval', 0)))
+    try:
+        interval_sec = max(0, min(3600, int(data.get('interval', 0))))
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'message': 'Send interval must be numeric.'}), 400
 
     if not subject or not body:
         return jsonify({'ok': False, 'message': 'Subject and body are required.'})
@@ -5175,19 +5681,39 @@ def send_broadcast():
 
     job_id = secrets.token_urlsafe(32)
     now = _utcnow()
-    db.session.add(BroadcastJob(
+    job = BroadcastJob(
         public_id=job_id, owner_id=current_user.id, status='queued',
         total=len(recipients), sent=0, failed=0, errors_json='[]',
         created_at=now, updated_at=now,
-        expires_at=now + timedelta(seconds=app.config['BROADCAST_JOB_TTL_SECONDS'])))
+        expires_at=now + timedelta(seconds=max(
+            app.config['BROADCAST_JOB_TTL_SECONDS'],
+            interval_sec * max(0, len(recipients) - 1) + 3600,
+        )))
+    db.session.add(job)
+    db.session.flush()
+    for index, (name, email) in enumerate(recipients):
+        try:
+            _enqueue_email(
+                dedupe_key=_email_dedupe_key(
+                    'broadcast', job_id, email.strip().lower()),
+                kind='broadcast',
+                recipient_name=name,
+                recipient_address=email,
+                subject=subject,
+                body=f"Hi {name or 'there'},\n\n{body}",
+                available_at=now + timedelta(seconds=index * interval_sec),
+                broadcast_job_id=job_id,
+            )
+        except ValueError:
+            job.failed += 1
+            errors = job.errors
+            if len(errors) < 100:
+                errors.append(f'{_mask_email(email)}: invalid_recipient')
+            job.errors_json = json.dumps(errors)
+    _complete_broadcast_if_ready(job_id)
     db.session.commit()
     _audit('broadcast_started', 'notifications', job_id,
            f'{len(recipients)} recipients')
-
-    t = threading.Thread(target=_broadcast_worker,
-                         args=(job_id, recipients, subject, body, interval_sec),
-                         daemon=True)
-    t.start()
     return jsonify({'ok': True, 'job_id': job_id, 'total': len(recipients)})
 
 
@@ -5269,27 +5795,42 @@ def config_page():
             cfg.lang_frontend = frontend
             cfg.lang_backend = backend
         elif section == 'email':
-            provider = request.form.get('mail_provider', 'custom')
+            provider = request.form.get('mail_provider', 'custom').strip().lower()
             server = request.form.get('mail_server', '').strip()
-            try:
-                port = _validated_smtp_port(request.form.get('mail_port', 587))
-                validated_server = _validated_smtp_host(provider, server)
-            except ValueError as exc:
-                flash(str(exc), 'error')
-                return redirect(url_for('config_page', tab='email'))
             tls = 'mail_use_tls' in request.form
             ssl = 'mail_use_ssl' in request.form
             username = request.form.get('mail_username', '').strip()
-            if tls and ssl:
-                abort(400)
-            new_pwd = request.form.get('mail_password', '').strip()
-            old_server = (SMTP_PRESET_SERVERS.get(cfg.mail_provider) or cfg.mail_server or '').lower().rstrip('.')
-            old_identity = (cfg.mail_provider, old_server,
-                            cfg.mail_port, bool(cfg.mail_use_tls),
-                            bool(cfg.mail_use_ssl), cfg.mail_username or '')
-            new_identity = (provider, validated_server, port, tls, ssl, username)
+            from_email = request.form.get('mail_from_email', '').strip()
+            from_name = request.form.get('mail_from_name', '').strip()
+            try:
+                validated_server, port, tls, ssl = _canonical_smtp_transport(
+                    provider, server, request.form.get('mail_port', 587), tls, ssl)
+                from_email = _validated_email(
+                    from_email, 'From email address', required=True)
+                if len(username) > 320 or len(from_name) > 100:
+                    raise ValueError('Email account fields exceed the allowed length.')
+            except (ValueError, RuntimeError) as exc:
+                flash(str(exc), 'error')
+                return redirect(url_for('config_page', tab='email'))
+            new_pwd = request.form.get('mail_password', '')
+            try:
+                old_identity = _current_smtp_identity(cfg)
+            except ValueError:
+                old_identity = ''
+            new_identity = _smtp_identity(
+                provider, validated_server, port, tls, ssl, username)
             if old_identity != new_identity and cfg.mail_password and not new_pwd:
                 flash('Re-enter the SMTP password when changing connection settings.', 'error')
+                return redirect(url_for('config_page', tab='email'))
+            try:
+                if new_pwd:
+                    encrypted_password = _encrypt_mail_password(new_pwd)
+                elif cfg.mail_password and not _mail_password_is_encrypted(cfg):
+                    encrypted_password = _encrypt_mail_password(cfg.mail_password)
+                else:
+                    encrypted_password = cfg.mail_password or ''
+            except RuntimeError as exc:
+                flash(str(exc), 'error')
                 return redirect(url_for('config_page', tab='email'))
             cfg.mail_provider = provider
             cfg.mail_server = validated_server
@@ -5297,10 +5838,14 @@ def config_page():
             cfg.mail_use_tls = tls
             cfg.mail_use_ssl = ssl
             cfg.mail_username = username
-            if new_pwd:
-                cfg.mail_password = new_pwd
-            cfg.mail_from_email = request.form.get('mail_from_email', '').strip()
-            cfg.mail_from_name  = request.form.get('mail_from_name', '').strip()
+            cfg.mail_password = encrypted_password
+            cfg.mail_from_email = from_email
+            cfg.mail_from_name = from_name or 'Bus Tracker'
+            new_verification_identity = _mail_verification_identity(
+                new_identity, cfg.mail_from_email)
+            if cfg.mail_last_verified_identity != new_verification_identity:
+                cfg.mail_last_verification_status = 'unverified'
+                cfg.mail_last_error_code = ''
         elif section == 'sms':
             enabled = 'twilio_enabled' in request.form
             account_sid = request.form.get('twilio_account_sid', '').strip()
@@ -5320,7 +5865,13 @@ def config_page():
                 cfg.twilio_sms_cost_per_seg = float(request.form.get('twilio_sms_cost_per_seg', 0.0079))
             except (ValueError, TypeError):
                 pass
+        requeued_email_count = _requeue_configuration_failures() if section == 'email' else 0
         db.session.commit()
+        if section == 'email':
+            _audit(
+                'email_config_saved', 'config', cfg.mail_provider,
+                f'credential_updated={bool(new_pwd)}; requeued={requeued_email_count}',
+            )
         flash('Configuration saved.', 'success')
         return redirect(url_for('config_page', tab=section))
 
@@ -5335,7 +5886,10 @@ def config_page():
     can_write  = current_user.has_access('config', 'full')
     return render_template('admin/config.html', cfg=cfg, schedules=schedules,
                            holidays=holidays, schedule_types=schedule_types,
-                           timezones=timezones, active_tab=active_tab, can_write=can_write)
+                           timezones=timezones, active_tab=active_tab, can_write=can_write,
+                           mail_status=_mail_configuration_status(cfg),
+                           smtp_presets=SMTP_PROVIDER_PRESETS,
+                           smtp_current=_smtp_public_settings(cfg))
 
 @app.route('/admin/config/upload-logo', methods=['POST'])
 @login_required
@@ -5388,16 +5942,30 @@ def test_email():
     cfg = get_config()
     to = request.form.get('test_email', current_user.email or '')
     try:
-        configure_mail(cfg)
-        msg = Message(subject=f'Test Email — {cfg.app_name}',
-                      recipients=[to],
-                      body=f'This is a test email from {cfg.app_name}.')
-        mail.send(msg)
+        to = _validated_email(to, 'recipient email address', required=True)
+        settings = _smtp_settings_from_config(cfg)
+        send_email(
+            settings,
+            subject=f'Test Email — {cfg.app_name}',
+            recipients=[to],
+            body=f'This is a test email from {cfg.app_name}.',
+        )
+        _record_mail_verification(
+            cfg, _current_smtp_identity(cfg), settings.from_email,
+            'delivery_verified')
         _audit('smtp_test_succeeded', 'config', 'saved approved destination')
         flash(f'Test email sent to {to}.', 'success')
-    except Exception:
-        _audit('smtp_test_failed', 'config', 'saved configuration')
-        flash('Email test failed. Review the approved SMTP settings and server log.', 'error')
+    except (EmailTransportError, ValueError, RuntimeError) as exc:
+        failure = exc if isinstance(exc, EmailTransportError) else EmailTransportError(
+            'configuration_invalid', str(exc))
+        try:
+            _record_mail_verification(
+                cfg, _current_smtp_identity(cfg), cfg.mail_from_email,
+                'failed', failure.code)
+        except (ValueError, RuntimeError):
+            db.session.rollback()
+        _audit('smtp_test_failed', 'config', failure.code)
+        flash(f'Email test failed: {failure.safe_message}', 'error')
     return redirect(url_for('config_page', tab='email'))
 
 
@@ -5407,143 +5975,76 @@ def test_email():
 def test_email_live():
     """AJAX endpoint: test SMTP with current form values (does not save to DB)."""
     data = request.get_json(silent=True) or {}
-    test_to = data.get('test_to', '').strip()
-    if not test_to:
-        return jsonify({'ok': False, 'message': 'Recipient email is required.'})
     cfg = get_config()
-    override = {
-        'provider':   data.get('provider', 'custom'),
-        'server':     data.get('server', ''),
-        'port':       data.get('port', 587),
-        'use_tls':    data.get('use_tls', True),
-        'use_ssl':    data.get('use_ssl', False),
-        'username':   data.get('username', ''),
-        'password':   data.get('password', ''),
-        'from_email': data.get('from_email', ''),
-        'from_name':  data.get('from_name', ''),
-    }
-    if override['username'] and not override['password']:
-        return jsonify({'ok': False, 'message':
-                        'Enter the SMTP password to run a live test.'}), 400
+    settings = None
+    identity = None
     try:
-        configure_mail(cfg, override=override)
-        msg = Message(
+        test_to = _validated_email(
+            data.get('test_to', ''), 'recipient email address', required=True)
+        settings, identity = _smtp_settings_from_payload(
+            cfg, data, allow_saved_password=True)
+        send_email(
+            settings,
             subject=f'Test Email — {cfg.app_name}',
             recipients=[test_to],
             body=(f'This is a test email from {cfg.app_name}.\n\n'
-                  f'SMTP: {app.config.get("MAIL_SERVER")}:{app.config.get("MAIL_PORT")}\n'
-                  f'TLS: {app.config.get("MAIL_USE_TLS")}  SSL: {app.config.get("MAIL_USE_SSL")}\n'
-                  f'From: {app.config.get("MAIL_DEFAULT_SENDER")}'),
+                  f'SMTP: {settings.server}:{settings.port}\n'
+                  f'TLS: {settings.use_tls}  SSL: {settings.use_ssl}\n'
+                  f'From: {settings.from_name} <{settings.from_email}>'),
         )
-        mail.send(msg)
-        _audit('smtp_live_test_succeeded', 'config',
-               app.config.get('MAIL_SERVER', 'approved destination'))
+        if _matches_saved_mail_identity(cfg, identity, settings.from_email):
+            _record_mail_verification(
+                cfg, identity, settings.from_email, 'delivery_verified')
+        _audit('smtp_live_test_succeeded', 'config', settings.server)
         return jsonify({'ok': True, 'message': f'Test email sent successfully to {test_to}.'})
-    except ValueError as exc:
-        return jsonify({'ok': False, 'message': str(exc)}), 400
-    except Exception:
-        _audit('smtp_live_test_failed', 'config', 'approved destination')
-        return jsonify({'ok': False, 'message':
-                        'SMTP test failed. Verify credentials and the approved destination.'}), 400
+    except (EmailTransportError, ValueError, RuntimeError) as exc:
+        failure = exc if isinstance(exc, EmailTransportError) else EmailTransportError(
+            'configuration_invalid', str(exc))
+        if settings and _matches_saved_mail_identity(cfg, identity, settings.from_email):
+            _record_mail_verification(
+                cfg, identity, settings.from_email, 'failed', failure.code)
+        _audit('smtp_live_test_failed', 'config', failure.code)
+        return jsonify({'ok': False, 'message': failure.safe_message,
+                        'code': failure.code}), 400
 
 @app.route('/admin/config/check-smtp', methods=['POST'])
 @login_required
 @require_capability('smtp.diagnose')
 def check_smtp():
-    """AJAX endpoint: step-by-step SMTP diagnostics using smtplib directly."""
-    import smtplib, socket as _socket
+    """Verify the current form using an isolated SMTP connection."""
     data = request.get_json(silent=True) or {}
     cfg  = get_config()
-
-    provider = data.get('provider', 'custom')
+    settings = None
+    identity = None
     try:
-        server = _validated_smtp_host(provider, data.get('server', ''))
-        port = _validated_smtp_port(data.get('port', None) or cfg.mail_port or 587)
-    except ValueError as exc:
-        _audit('smtp_diagnostic_rejected', 'config', 'unapproved destination')
-        return jsonify({'ok': False, 'steps': [
-            {'ok': False, 'label': 'SMTP configuration rejected', 'detail': str(exc)}]}), 400
-    use_tls  = bool(data.get('use_tls', cfg.mail_use_tls))
-    use_ssl  = bool(data.get('use_ssl', getattr(cfg, 'mail_use_ssl', False)))
-    username = data.get('username', '') or ''
-    password = data.get('password', '') or ''
-    _audit('smtp_diagnostic_started', 'config', f'{server}:{port}')
-
-    steps = []
-
-    if not server:
-        return jsonify({'ok': False, 'steps': [
-            {'ok': False, 'label': 'SMTP Server not configured',
-             'detail': 'Enter a server hostname or select a preset provider.'}]})
-
-    # Step 1 — TCP connection
-    try:
-        sock = _socket.create_connection((server, port), timeout=10)
-        sock.close()
-        steps.append({'ok': True,  'label': f'TCP connect to {server}:{port}'})
-    except _socket.timeout:
-        steps.append({'ok': False, 'label': f'TCP connect to {server}:{port}',
-                      'detail': 'Connection timed out — server unreachable or port blocked by firewall/ISP.'})
-        return jsonify({'ok': False, 'steps': steps})
-    except ConnectionRefusedError:
-        steps.append({'ok': False, 'label': f'TCP connect to {server}:{port}',
-                      'detail': 'Connection refused — wrong server/port, or a local firewall is blocking Python.'})
-        return jsonify({'ok': False, 'steps': steps})
-    except Exception:
-        steps.append({'ok': False, 'label': f'TCP connect to {server}:{port}',
-                      'detail': 'Connection failed.'})
-        return jsonify({'ok': False, 'steps': steps})
-
-    # Step 2 — SMTP handshake
-    smtp = None
-    try:
-        if use_ssl:
-            smtp = smtplib.SMTP_SSL(server, port, timeout=15)
-        else:
-            smtp = smtplib.SMTP(server, port, timeout=15)
-        smtp.ehlo()
-        steps.append({'ok': True, 'label': f'SMTP handshake (EHLO) — {"SSL" if use_ssl else "plain"}'})
-    except Exception:
-        steps.append({'ok': False, 'label': 'SMTP handshake', 'detail': 'SMTP handshake failed.'})
-        return jsonify({'ok': False, 'steps': steps})
-
-    # Step 3 — STARTTLS
-    if use_tls and not use_ssl:
-        try:
-            smtp.starttls()
-            smtp.ehlo()
-            steps.append({'ok': True, 'label': 'STARTTLS upgrade'})
-        except Exception:
-            steps.append({'ok': False, 'label': 'STARTTLS upgrade', 'detail': 'TLS negotiation failed.'})
-            smtp.quit()
-            return jsonify({'ok': False, 'steps': steps})
-
-    # Step 4 — Authentication
-    if username and not password:
-        steps.append({'ok': False, 'label': 'Authentication',
-                      'detail': 'Enter the SMTP password to run diagnostics.'})
-        smtp.quit()
-        return jsonify({'ok': False, 'steps': steps}), 400
-    if username and password:
-        try:
-            smtp.login(username, password)
-            steps.append({'ok': True, 'label': f'Authentication ({username})'})
-        except smtplib.SMTPAuthenticationError:
-            steps.append({'ok': False, 'label': f'Authentication ({username})',
-                          'detail': 'Authentication was rejected by the SMTP server.'})
-            smtp.quit()
-            return jsonify({'ok': False, 'steps': steps})
-        except Exception:
-            steps.append({'ok': False, 'label': f'Authentication ({username})',
-                          'detail': 'Authentication failed.'})
-            smtp.quit()
-            return jsonify({'ok': False, 'steps': steps})
-    else:
-        steps.append({'ok': None, 'label': 'Authentication skipped — no credentials entered'})
-
-    smtp.quit()
-    _audit('smtp_diagnostic_succeeded', 'config', f'{server}:{port}')
-    return jsonify({'ok': True, 'steps': steps})
+        settings, identity = _smtp_settings_from_payload(
+            cfg, data, allow_saved_password=True)
+        _audit('smtp_diagnostic_started', 'config', f'{settings.server}:{settings.port}')
+        verify_connection(settings)
+        if _matches_saved_mail_identity(cfg, identity, settings.from_email):
+            _record_mail_verification(
+                cfg, identity, settings.from_email, 'connection_verified')
+        security_label = 'SSL/TLS' if settings.use_ssl else (
+            'STARTTLS' if settings.use_tls else 'unencrypted')
+        steps = [
+            {'ok': True, 'label': f'TCP and SMTP handshake — {settings.server}:{settings.port}'},
+            {'ok': True, 'label': f'Connection security — {security_label}'},
+            {'ok': True, 'label': 'Authentication accepted' if settings.username
+             else 'Authentication not configured'},
+        ]
+        _audit('smtp_diagnostic_succeeded', 'config', f'{settings.server}:{settings.port}')
+        return jsonify({'ok': True, 'steps': steps})
+    except (EmailTransportError, ValueError, RuntimeError) as exc:
+        failure = exc if isinstance(exc, EmailTransportError) else EmailTransportError(
+            'configuration_invalid', str(exc))
+        if settings and _matches_saved_mail_identity(cfg, identity, settings.from_email):
+            _record_mail_verification(
+                cfg, identity, settings.from_email, 'failed', failure.code)
+        _audit('smtp_diagnostic_failed', 'config', failure.code)
+        return jsonify({'ok': False, 'code': failure.code, 'steps': [{
+            'ok': False, 'label': 'SMTP diagnostic failed',
+            'detail': failure.safe_message,
+        }]}), 400
 
 
 @app.route('/admin/config/check-twilio', methods=['POST'])
@@ -5860,7 +6361,7 @@ _IMPORT_TABLE_ORDER_V1 = [
     'notification_bus_assignment', 'holiday', 'audit_log', 'login_throttle',
 ]
 
-_IMPORT_TABLE_ORDER = [
+_IMPORT_TABLE_ORDER_V2 = [
     'user_group', 'group_permission', 'group_capability', 'user', 'configuration',
     'operational_schedule', 'bus_schedule_type', 'incident_type',
     'delay_reason', 'bus', 'bus_schedule_assignment',
@@ -5868,6 +6369,18 @@ _IMPORT_TABLE_ORDER = [
     'notification_subscriber', 'subscriber_contact',
     'notification_bus_assignment', 'notification_log', 'holiday',
     'audit_log', 'login_throttle', 'broadcast_job',
+    'import_mapping_profile', 'import_batch', 'import_file', 'import_row',
+    'external_identity', 'import_change',
+]
+
+_IMPORT_TABLE_ORDER = [
+    'user_group', 'group_permission', 'group_capability', 'user', 'configuration',
+    'operational_schedule', 'bus_schedule_type', 'incident_type',
+    'delay_reason', 'bus', 'bus_schedule_assignment',
+    'bus_incident_record', 'subscriber_group', 'group_bus_assignment',
+    'notification_subscriber', 'subscriber_contact',
+    'notification_bus_assignment', 'notification_log', 'holiday',
+    'audit_log', 'login_throttle', 'broadcast_job', 'email_outbox',
     'import_mapping_profile', 'import_batch', 'import_file', 'import_row',
     'external_identity', 'import_change',
 ]
@@ -5886,8 +6399,8 @@ _SAFE_CONFIGURATION_COLUMNS = [
     'twilio_from_number', 'twilio_sms_cost_per_seg',
 ]
 _BACKUP_FORMAT = 'bustrack-full-backup'
-_BACKUP_VERSION = 2
-_SUPPORTED_BACKUP_VERSIONS = {1, 2}
+_BACKUP_VERSION = 3
+_SUPPORTED_BACKUP_VERSIONS = {1, 2, 3}
 
 
 def _json_default(value):
@@ -6068,7 +6581,9 @@ def _validate_backup_document(document):
         raise ValueError('Backup does not contain tables.')
     inspector = sa_inspect(db.engine)
     existing = set(inspector.get_table_names())
-    import_order = _IMPORT_TABLE_ORDER if version == 2 else _IMPORT_TABLE_ORDER_V1
+    import_order = (_IMPORT_TABLE_ORDER if version == 3 else
+                    _IMPORT_TABLE_ORDER_V2 if version == 2 else
+                    _IMPORT_TABLE_ORDER_V1)
     allowed = set(import_order) & existing
     unknown = set(tables) - allowed
     if unknown:
@@ -6162,6 +6677,14 @@ def import_run(job_id):
             'version': job.get('backup_version', _BACKUP_VERSION),
             'tables': dict(job['tables']),
         })
+        for table_name, rows in tables:
+            if table_name != 'configuration' or not rows:
+                continue
+            restored_secret = rows[0].get('mail_password') or ''
+            if restored_secret.startswith(_ENCRYPTED_SECRET_PREFIX):
+                _decrypt_mail_password(restored_secret)
+            elif restored_secret:
+                rows[0]['mail_password'] = _encrypt_mail_password(restored_secret)
         snapshot = json.dumps(_full_backup_document(), default=_json_default,
                               separators=(',', ':'), ensure_ascii=False).encode('utf-8')
         encrypted_snapshot = _backup_fernet().encrypt(snapshot)
@@ -6177,13 +6700,17 @@ def import_run(job_id):
                 'external_identity', 'broadcast_job', 'group_capability',
                 'import_mapping_profile',
             ] if job.get('backup_version') == 1 else []
+            legacy_phase3_tables = (
+                ['email_outbox'] if job.get('backup_version') in {1, 2} else [])
             if job.get('is_pg'):
-                clear_tables = table_names + legacy_phase2_tables
+                clear_tables = table_names + legacy_phase2_tables + legacy_phase3_tables
                 quoted = ', '.join(f'"{table}"' for table in clear_tables)
                 if quoted:
                     conn.execute(sa_text(f'TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE'))
             else:
-                for table in legacy_phase2_tables:
+                # Phase 3 outbox rows reference phase 2 broadcast jobs, so clear
+                # the newer child tables first when restoring an older backup.
+                for table in legacy_phase3_tables + legacy_phase2_tables:
                     conn.execute(sa_text(f'DELETE FROM "{table}"'))
                 for table in reversed(table_names):
                     conn.execute(sa_text(f'DELETE FROM "{table}"'))

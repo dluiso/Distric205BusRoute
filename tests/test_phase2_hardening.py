@@ -204,12 +204,18 @@ def test_phase1_backup_restores_after_phase2_tables_exist(logged_in_client):
             'tables': {name: current['tables'][name]
                        for name in application._IMPORT_TABLE_ORDER_V1},
         }
+        legacy['tables']['configuration'][0]['mail_password'] = 'legacy-mail-secret'
         owner = application.User.query.filter_by(username='admin').one()
         now = application._utcnow()
-        application.db.session.add(application.BroadcastJob(
+        job = application.BroadcastJob(
             public_id='pre-v1-restore-job', owner_id=owner.id, status='completed',
             total=1, sent=1, failed=0, errors_json='[]', created_at=now,
-            updated_at=now, expires_at=now + timedelta(hours=1)))
+            updated_at=now, expires_at=now + timedelta(hours=1))
+        application.db.session.add(job)
+        application.db.session.add(application.EmailOutbox(
+            dedupe_key='pre-v1-restore-outbox', kind='broadcast',
+            recipient_address='parent@example.test', subject='Old', body='Old',
+            status='sent', available_at=now, broadcast_job_id=job.public_id))
         application.db.session.commit()
         encrypted = application._backup_fernet().encrypt(json.dumps(
             legacy, default=application._json_default).encode())
@@ -224,6 +230,10 @@ def test_phase1_backup_restores_after_phase2_tables_exist(logged_in_client):
     assert restored.status_code == 200, restored.get_data(as_text=True)
     with application.app.app_context():
         assert application.BroadcastJob.query.count() == 0
+        assert application.EmailOutbox.query.count() == 0
+        cfg = application.get_config()
+        assert cfg.mail_password.startswith('enc:v1:')
+        assert application._decrypt_mail_password(cfg.mail_password) == 'legacy-mail-secret'
         assert application.ImportMappingProfile.query.filter_by(
             source_type='legacy_csv', schema_version='1').one()
 

@@ -292,20 +292,25 @@ def test_full_backup_is_encrypted_and_versioned(logged_in_client):
     assert 'user' in document['tables']
 
 
-def test_smtp_live_test_never_falls_back_to_stored_password(logged_in_client):
+def test_smtp_live_test_does_not_reuse_password_for_changed_connection(logged_in_client):
     with application.app.app_context():
         cfg = application.get_config()
         cfg.mail_provider = 'custom'
         cfg.mail_server = 'smtp.example.test'
+        cfg.mail_port = 587
+        cfg.mail_use_tls = True
+        cfg.mail_use_ssl = False
         cfg.mail_username = 'mailer'
         cfg.mail_password = 'stored-secret'
+        cfg.mail_from_email = 'mailer@example.test'
         application.db.session.commit()
     response = logged_in_client.post('/admin/config/test-email-live', json={
         'provider': 'custom', 'server': 'alternate.example.test', 'port': 587,
-        'username': 'mailer', 'password': '', 'test_to': 'recipient@example.test',
+        'use_tls': True, 'use_ssl': False, 'username': 'mailer', 'password': '',
+        'from_email': 'mailer@example.test', 'test_to': 'recipient@example.test',
     }, headers={'X-CSRF-Token': csrf_token(logged_in_client)})
     assert response.status_code == 400
-    assert 'Enter the SMTP password' in response.get_json()['message']
+    assert response.get_json()['code'] == 'password_required_for_changes'
 
 
 def test_smtp_connection_change_requires_password_reentry(logged_in_client):
@@ -316,12 +321,13 @@ def test_smtp_connection_change_requires_password_reentry(logged_in_client):
         cfg.mail_port = 587
         cfg.mail_username = 'mailer'
         cfg.mail_password = 'stored-secret'
+        cfg.mail_from_email = 'mailer@example.test'
         application.db.session.commit()
     response = logged_in_client.post('/admin/config', data={
         '_csrf': csrf_token(logged_in_client), 'section': 'email',
         'mail_provider': 'custom', 'mail_server': 'alternate.example.test',
         'mail_port': '587', 'mail_use_tls': 'on', 'mail_username': 'mailer',
-        'mail_password': '',
+        'mail_password': '', 'mail_from_email': 'mailer@example.test',
     })
     assert response.status_code == 302
     with application.app.app_context():

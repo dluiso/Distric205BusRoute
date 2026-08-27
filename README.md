@@ -82,6 +82,7 @@ DB_USER=bususer
 DB_PASS=a-strong-database-password
 INSTALL_TOKEN=a-one-time-random-bootstrap-token
 BACKUP_ENCRYPTION_KEY=a-valid-fernet-key
+EMAIL_CREDENTIAL_ENCRYPTION_KEY=a-different-valid-fernet-key
 ```
 
 Generate a secure key with:
@@ -94,6 +95,11 @@ Generate the dedicated backup-encryption key separately:
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
+
+Run the Fernet command a second time for `EMAIL_CREDENTIAL_ENCRYPTION_KEY`.
+The application encrypts saved SMTP credentials with that stable key. After upgrading
+an existing installation, run `flask --app app migrate-email-config` once to encrypt
+the legacy value and normalize provider-owned transport settings.
 
 ```bash
 # 3. Start the services
@@ -279,7 +285,12 @@ unless `POWERSCHOOL_IMPORT_ENABLED=1`. See
 | `DATABASE_URL` | SQLAlchemy database URL | `sqlite:///bustrack.db` |
 | `INSTALL_TOKEN` | One-time authorization for initial setup | Required while uninstalled |
 | `BACKUP_ENCRYPTION_KEY` | Dedicated Fernet key for full backups/restores | Required for full backup operations |
+| `EMAIL_CREDENTIAL_ENCRYPTION_KEY` | Dedicated Fernet key for encrypted SMTP credentials | Required when an SMTP credential is saved |
 | `SMTP_ALLOWED_HOSTS` | Exact custom SMTP relays allowed for save/test | Preset providers only |
+| `EMAIL_OUTBOX_MAX_ATTEMPTS` | Maximum durable email delivery attempts | `5` |
+| `EMAIL_OUTBOX_RETRY_BASE_SECONDS` | Initial retry delay for transient SMTP failures | `60` |
+| `EMAIL_OUTBOX_RETRY_MAX_SECONDS` | Maximum retry delay | `3600` |
+| `EMAIL_OUTBOX_BATCH_SIZE` | Maximum deliveries claimed per background pass | `50` |
 | `TRUSTED_PROXY_X_FOR` | Trusted proxy hops for client IP | `0` |
 | `TRUSTED_PROXY_X_PROTO` | Trusted proxy hops for scheme | `0` |
 | `TRUSTED_PROXY_X_HOST` | Trusted proxy hops for host | `0` |

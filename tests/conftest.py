@@ -52,6 +52,7 @@ os.environ.update({
     'INSTALL_TOKEN': 'test-install-token-that-is-long-and-randomized',
     'SMTP_ALLOWED_HOSTS': 'smtp.example.test,alternate.example.test',
     'BACKUP_ENCRYPTION_KEY': Fernet.generate_key().decode('ascii'),
+    'EMAIL_CREDENTIAL_ENCRYPTION_KEY': Fernet.generate_key().decode('ascii'),
     'LOGIN_RATE_LIMIT_ATTEMPTS': '3',
     'LOGIN_RATE_LIMIT_WINDOW_SECONDS': '300',
     'LOGIN_RATE_LIMIT_LOCK_SECONDS': '300',
