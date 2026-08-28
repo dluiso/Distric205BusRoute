@@ -247,7 +247,7 @@ class Configuration(db.Model):
     color_accent        = db.Column(db.String(20), default='#3b82f6')
     color_nav_text      = db.Column(db.String(20), default='#f8fafc')
     # Operational
-    timezone            = db.Column(db.String(50), default='America/New_York')
+    timezone            = db.Column(db.String(50), default='America/Chicago')
     daily_reset_time    = db.Column(db.String(5), default='05:00')
     commit_delay_min    = db.Column(db.Integer, default=5)
     offline_message     = db.Column(db.Text, default='Bus service is currently offline. Check back during operational hours.')
@@ -542,7 +542,7 @@ class BusIncidentRecord(db.Model):
     delay_reason_id   = db.Column(db.Integer, db.ForeignKey('delay_reason.id'), nullable=True)
     delay_reason_text = db.Column(db.String(200))  # free-text if no preset chosen
     notes             = db.Column(db.Text)
-    incident_date     = db.Column(db.Date, default=date.today)
+    incident_date     = db.Column(db.Date, default=lambda: district_today())
     is_pending        = db.Column(db.Boolean, default=True)
     committed_at      = db.Column(db.DateTime)
     created_by_id     = db.Column(db.Integer, db.ForeignKey('user.id'))
@@ -809,6 +809,42 @@ def get_config():
         db.session.commit()
     return cfg
 
+
+def district_timezone(cfg=None):
+    """Return the configured district timezone with a safe district-local fallback."""
+    timezone_name = (getattr(cfg or get_config(), 'timezone', '') or 'America/Chicago').strip()
+    try:
+        return pytz.timezone(timezone_name)
+    except pytz.UnknownTimeZoneError:
+        app.logger.error('Invalid configured district timezone %r; using America/Chicago.',
+                         timezone_name)
+        return pytz.timezone('America/Chicago')
+
+
+def district_now(cfg=None, now_utc=None):
+    """Return an aware datetime in the configured district timezone."""
+    instant = now_utc or datetime.now(timezone.utc)
+    if instant.tzinfo is None:
+        instant = pytz.utc.localize(instant)
+    return instant.astimezone(district_timezone(cfg))
+
+
+def district_today(cfg=None, now_utc=None):
+    """Return the district's business date, independent of the server timezone."""
+    return district_now(cfg, now_utc).date()
+
+
+def district_date_utc_bounds(date_from, date_to, cfg=None):
+    """Convert inclusive district-local dates to naive UTC database boundaries."""
+    tz = district_timezone(cfg)
+    local_start = tz.localize(datetime.combine(date_from, datetime.min.time()))
+    local_end = tz.localize(datetime.combine(
+        date_to + timedelta(days=1), datetime.min.time()))
+    return (
+        local_start.astimezone(timezone.utc).replace(tzinfo=None),
+        local_end.astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
 def hex_to_text_class(hex_color):
     """Return 'text-white' or 'text-gray-900' based on luminance"""
     h = hex_color.lstrip('#')
@@ -826,6 +862,39 @@ TRANSLATIONS = {
         'favorite': 'Favorite', 'remove_fav': 'Remove favorite',
         'loading': 'Loading…', 'route': 'Route', 'capacity': 'Capacity',
         'schedule': 'Schedule', 'morning': 'Morning', 'midday': 'Midday', 'afternoon': 'Afternoon',
+        'all_schedules': 'All schedules', 'live': 'Live', 'admin': 'Admin',
+        'no_bus_service_on': 'No bus service on', 'tomorrow': 'Tomorrow',
+        'in_days': 'In {count} days', 'service_offline': 'Service Offline',
+        'no_service_today': 'No bus service today.', 'holiday': 'Holiday',
+        'period': 'Period', 'showing_period': 'Showing buses for this period only',
+        'attention_title': 'Service attention',
+        'attention_count': '{count} {bus_word} with a status update',
+        'all_on_time': 'All buses are currently on time',
+        'show_affected': 'Show affected buses', 'show_all': 'Show all buses',
+        'search_label': 'Search buses', 'status_label': 'Filter by status',
+        'schedule_label': 'Filter by schedule', 'clear_search': 'Clear search',
+        'results_count': '{count} {bus_word}', 'bus': 'bus', 'buses': 'buses',
+        'no_matches': 'No buses match your filters', 'no_buses': 'No buses registered yet',
+        'todays_updates': "Today's Updates", 'service_schedule': 'Service schedule:',
+        'updated': 'Updated', 'updated_just_now': 'Updated just now',
+        'updated_seconds': 'Updated {count}s ago', 'updated_minutes': 'Updated {count}m ago',
+        'reconnecting': 'Reconnecting…', 'connection_interrupted': 'Live updates interrupted',
+        'theme_toggle': 'Toggle dark mode', 'favorite_bus': 'Favorite {bus}',
+        'remove_favorite_bus': 'Remove {bus} from favorites',
+        'e_learning': 'E-Learning', 'combined': 'Combined', 'double_back': 'Double-back',
+        'out_of_service': 'Out of Service', 'combined_delayed': 'Combined/Delayed',
+        'home': 'Home', 'alerts': 'Alerts', 'filters_nav': 'Filters',
+        'affected_buses': 'Buses needing attention', 'favorite_buses': 'Favorite buses',
+        'other_buses': 'Other buses', 'filters_title': 'Filters and legend',
+        'filters_hint': 'Narrow the list by status or schedule.', 'close': 'Close',
+        'reset_filters': 'Reset filters', 'apply_filters': 'View results',
+        'install_app': 'Install Bus Tracker',
+        'install_app_hint': 'Add this portal to your home screen for faster access.',
+        'install': 'Install', 'offline_title': 'You are offline',
+        'offline_message': 'Current bus statuses require an internet connection. Reconnect and try again for the latest information.',
+        'offline_retry': 'Try again', 'current_alerts': 'Current service alerts',
+        'no_current_alerts': 'There are no active service alerts.',
+        'open_filters': 'Open filters and legend', 'mobile_search': 'Search a bus',
     },
     'es': {
         'bus_legend': 'Leyenda de Buses', 'filters': 'Filtros', 'search': 'Buscar buses, rutas, estado…',
@@ -834,13 +903,45 @@ TRANSLATIONS = {
         'favorite': 'Favorito', 'remove_fav': 'Quitar favorito',
         'loading': 'Cargando…', 'route': 'Ruta', 'capacity': 'Capacidad',
         'schedule': 'Horario', 'morning': 'Mañana', 'midday': 'Medio día', 'afternoon': 'Tarde',
+        'all_schedules': 'Todos los horarios', 'live': 'En vivo', 'admin': 'Administración',
+        'no_bus_service_on': 'No habrá servicio de buses el', 'tomorrow': 'Mañana',
+        'in_days': 'En {count} días', 'service_offline': 'Servicio fuera de horario',
+        'no_service_today': 'No hay servicio de buses hoy.', 'holiday': 'Día feriado',
+        'period': 'Período', 'showing_period': 'Mostrando únicamente los buses de este período',
+        'attention_title': 'Atención de servicio',
+        'attention_count': '{count} {bus_word} con un cambio de estado',
+        'all_on_time': 'Todos los buses están a tiempo',
+        'show_affected': 'Mostrar buses afectados', 'show_all': 'Mostrar todos los buses',
+        'search_label': 'Buscar buses', 'status_label': 'Filtrar por estado',
+        'schedule_label': 'Filtrar por horario', 'clear_search': 'Borrar búsqueda',
+        'results_count': '{count} {bus_word}', 'bus': 'bus', 'buses': 'buses',
+        'no_matches': 'Ningún bus coincide con los filtros', 'no_buses': 'Aún no hay buses registrados',
+        'todays_updates': 'Actualizaciones de hoy', 'service_schedule': 'Horario de servicio:',
+        'updated': 'Actualizado', 'updated_just_now': 'Actualizado ahora',
+        'updated_seconds': 'Actualizado hace {count}s', 'updated_minutes': 'Actualizado hace {count}m',
+        'reconnecting': 'Reconectando…', 'connection_interrupted': 'Actualizaciones en vivo interrumpidas',
+        'theme_toggle': 'Cambiar modo oscuro', 'favorite_bus': 'Marcar {bus} como favorito',
+        'remove_favorite_bus': 'Quitar {bus} de favoritos',
+        'e_learning': 'Aprendizaje virtual', 'combined': 'Combinado', 'double_back': 'Doble recorrido',
+        'out_of_service': 'Fuera de servicio', 'combined_delayed': 'Combinado/Retrasado',
+        'home': 'Inicio', 'alerts': 'Alertas', 'filters_nav': 'Filtros',
+        'affected_buses': 'Buses que requieren atención', 'favorite_buses': 'Buses favoritos',
+        'other_buses': 'Otros buses', 'filters_title': 'Filtros y leyenda',
+        'filters_hint': 'Limita la lista por estado u horario.', 'close': 'Cerrar',
+        'reset_filters': 'Restablecer filtros', 'apply_filters': 'Ver resultados',
+        'install_app': 'Instalar Bus Tracker',
+        'install_app_hint': 'Agrega este portal a la pantalla de inicio para acceder más rápido.',
+        'install': 'Instalar', 'offline_title': 'No tienes conexión',
+        'offline_message': 'Los estados actuales de los buses requieren conexión a internet. Reconéctate e inténtalo nuevamente para obtener la información más reciente.',
+        'offline_retry': 'Intentar nuevamente', 'current_alerts': 'Alertas de servicio actuales',
+        'no_current_alerts': 'No hay alertas de servicio activas.',
+        'open_filters': 'Abrir filtros y leyenda', 'mobile_search': 'Buscar un bus',
     }
 }
 
-def t(key):
+def t(key, lang=None):
     try:
-        cfg = get_config()
-        lang = cfg.lang_frontend
+        lang = lang or get_config().lang_frontend
     except Exception:
         lang = 'en'
     return TRANSLATIONS.get(lang, TRANSLATIONS['en']).get(key, key)
@@ -869,6 +970,85 @@ def fmt_time(time_str, fmt='12h'):
     except Exception:
         return str(time_str)
 
+
+def _parse_clock_value(value):
+    text = str(value or '').strip()
+    if not re.fullmatch(r'\d{2}:\d{2}', text):
+        return None
+    try:
+        parsed = datetime.strptime(text, '%H:%M')
+    except ValueError:
+        return None
+    return parsed.hour * 60 + parsed.minute
+
+
+def _time_is_in_window(value, window_start, window_end):
+    selected = _parse_clock_value(value)
+    start = _parse_clock_value(window_start)
+    end = _parse_clock_value(window_end)
+    if selected is None or start is None or end is None:
+        return False
+    if start <= end:
+        return start <= selected <= end
+    return selected >= start or selected <= end
+
+
+def schedule_assignment_warning(assignment):
+    """Describe an invalid persisted departure time without modifying existing data."""
+    value = getattr(assignment, 'departure_time', None)
+    schedule = getattr(assignment, 'schedule_type', None)
+    if not value:
+        return None
+    if _parse_clock_value(value) is None:
+        return f'Invalid departure time: {value}'
+    if (schedule and schedule.window_start and schedule.window_end and
+            not _time_is_in_window(value, schedule.window_start, schedule.window_end)):
+        return (f'{fmt_time(value)} is outside the {schedule.name} window '
+                f'({fmt_time(schedule.window_start)}–{fmt_time(schedule.window_end)}).')
+    return None
+
+
+_PUBLIC_STATUS_KEYS = {
+    'On Time': 'on_time', 'Delayed': 'delayed', 'E-Learning': 'e_learning',
+    'Combined': 'combined', 'Double-back': 'double_back',
+    'Out of Service': 'out_of_service', 'Combined/Delayed': 'combined_delayed',
+}
+_PUBLIC_SCHEDULE_KEYS = {
+    'Morning': 'morning', 'Midday': 'midday', 'Afternoon': 'afternoon',
+}
+
+
+def public_status_label(name, lang=None):
+    """Translate fixed system statuses while preserving administrator-defined names."""
+    return t(_PUBLIC_STATUS_KEYS[name], lang) if name in _PUBLIC_STATUS_KEYS else name
+
+
+def public_schedule_label(name, lang=None):
+    """Translate fixed schedule names while preserving administrator-defined names."""
+    return t(_PUBLIC_SCHEDULE_KEYS[name], lang) if name in _PUBLIC_SCHEDULE_KEYS else name
+
+
+def format_public_date(value, lang='en', include_year=False):
+    """Locale-independent date display for the two supported portal languages."""
+    if not value:
+        return ''
+    weekdays = {
+        'en': ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
+        'es': ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'],
+    }
+    months = {
+        'en': ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+               'August', 'September', 'October', 'November', 'December'],
+        'es': ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio',
+               'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'],
+    }
+    selected = lang if lang in weekdays else 'en'
+    if selected == 'es':
+        rendered = f'{weekdays[selected][value.weekday()]}, {value.day} de {months[selected][value.month - 1]}'
+        return f'{rendered} de {value.year}' if include_year else rendered
+    rendered = f'{weekdays[selected][value.weekday()]}, {months[selected][value.month - 1]} {value.day}'
+    return f'{rendered}, {value.year}' if include_year else rendered
+
 def _csrf_token():
     """Generate (or retrieve) per-session CSRF token, stored in Flask session."""
     if '_csrf' not in session:
@@ -881,6 +1061,10 @@ app.jinja_env.globals.update(
     hex_to_text_class=hex_to_text_class,
     t=t, t_admin=t_admin,
     fmt_time=fmt_time,
+    public_status_label=public_status_label,
+    public_schedule_label=public_schedule_label,
+    format_public_date=format_public_date,
+    schedule_assignment_warning=schedule_assignment_warning,
     csrf_token=_csrf_token,
 )
 
@@ -1349,8 +1533,7 @@ def get_current_period():
     """Returns the active BusScheduleType based on current local time, or None."""
     try:
         cfg = get_config()
-        tz = pytz.timezone(cfg.timezone)
-        now = datetime.now(tz)
+        now = district_now(cfg)
         current_time = now.strftime('%H:%M')
         periods = BusScheduleType.query.filter(
             BusScheduleType.window_start != None,
@@ -1366,7 +1549,7 @@ def get_current_period():
 
 def get_bus_status(bus_id, for_date=None, schedule_type_id=None):
     """Returns (IncidentType, delay_minutes) for a bus on a given date/period."""
-    if for_date is None: for_date = date.today()
+    if for_date is None: for_date = district_today()
     q = BusIncidentRecord.query.filter_by(bus_id=bus_id, incident_date=for_date)
     if schedule_type_id:
         q = q.filter_by(schedule_type_id=schedule_type_id)
@@ -1376,14 +1559,44 @@ def get_bus_status(bus_id, for_date=None, schedule_type_id=None):
     default = IncidentType.query.filter_by(is_default=True).first()
     return default, 0
 
+
+def _schedule_assignments_from_form():
+    """Validate and return selected schedule/departure pairs from an admin form."""
+    raw_ids = request.form.getlist('schedule_ids')
+    try:
+        schedule_ids = list(dict.fromkeys(int(value) for value in raw_ids))
+    except (TypeError, ValueError):
+        return None, 'One or more selected schedule periods are invalid.'
+    if not schedule_ids:
+        return [], None
+
+    schedules = BusScheduleType.query.filter(BusScheduleType.id.in_(schedule_ids)).all()
+    schedule_by_id = {schedule.id: schedule for schedule in schedules}
+    if len(schedule_by_id) != len(schedule_ids):
+        return None, 'One or more selected schedule periods no longer exist.'
+
+    validated = []
+    for schedule_id in schedule_ids:
+        schedule = schedule_by_id[schedule_id]
+        departure_time = request.form.get(f'departure_time_{schedule_id}', '').strip() or None
+        if departure_time and _parse_clock_value(departure_time) is None:
+            return None, f'Enter a valid departure time for {schedule.name}.'
+        if (departure_time and schedule.window_start and schedule.window_end and
+                not _time_is_in_window(
+                    departure_time, schedule.window_start, schedule.window_end)):
+            return None, (
+                f'{fmt_time(departure_time)} is outside the {schedule.name} window '
+                f'({fmt_time(schedule.window_start)}–{fmt_time(schedule.window_end)}).')
+        validated.append((schedule_id, departure_time))
+    return validated, None
+
 def is_operational():
     """Check current time against operational schedules. Returns (bool, message)."""
     cfg = get_config()
     if cfg.show_always:
         return True, None
     try:
-        tz = pytz.timezone(cfg.timezone)
-        now = datetime.now(tz)
+        now = district_now(cfg)
         today_str = now.strftime('%A').lower()[:3]  # mon, tue…
         current_time = now.strftime('%H:%M')
         # Check holidays
@@ -1413,7 +1626,7 @@ def bus_list_today(period=None, admin=False):
     admin=True  → all active buses, all today's incidents (no period filter).
     admin=False → public view: only buses assigned to current period.
     """
-    today = date.today()
+    today = district_today()
     current_period = period
     if current_period is None:
         current_period = get_current_period()
@@ -2279,8 +2492,13 @@ _start_scheduler_once()
 
 # ── SECURITY MIDDLEWARE ───────────────────────────────────────────────────────
 
-_WIZARD_ENDPOINTS = {'install_wizard', 'install_test_db', 'install_run', 'static', 'health'}
-_PUBLIC_ENDPOINTS = {'index', 'api_buses'}
+_WIZARD_ENDPOINTS = {
+    'install_wizard', 'install_test_db', 'install_run', 'static', 'health',
+    'web_manifest', 'service_worker', 'offline_portal',
+}
+_PUBLIC_ENDPOINTS = {
+    'index', 'api_buses', 'web_manifest', 'service_worker', 'offline_portal',
+}
 
 @app.before_request
 def pre_request_checks():
@@ -2601,16 +2819,118 @@ def _seed_defaults():
 
 # ── PUBLIC ROUTES ─────────────────────────────────────────────────────────────
 
+@app.route('/manifest.webmanifest')
+def web_manifest():
+    response = send_file(
+        os.path.join(BASE_DIR, 'static', 'manifest.webmanifest'),
+        mimetype='application/manifest+json',
+        conditional=True,
+    )
+    response.headers['Cache-Control'] = 'public, max-age=3600'
+    return response
+
+
+@app.route('/service-worker.js')
+def service_worker():
+    response = send_file(
+        os.path.join(BASE_DIR, 'static', 'js', 'service-worker.js'),
+        mimetype='application/javascript',
+        conditional=True,
+    )
+    response.headers['Cache-Control'] = 'no-cache, max-age=0'
+    response.headers['Service-Worker-Allowed'] = '/'
+    return response
+
+
+@app.route('/offline')
+def offline_portal():
+    cfg = get_config()
+    response = make_response(render_template('public/offline.html', cfg=cfg))
+    response.headers['Cache-Control'] = 'public, max-age=300'
+    return response
+
+def _public_bus_payload(item, cfg):
+    bus = item['bus']
+    status = item['status']
+    status_name = status.name if status else 'On Time'
+    incidents = []
+    for incident in item['incidents']:
+        incidents.append({
+            'id': incident.id,
+            'type': incident.incident_type.name,
+            'type_label': public_status_label(incident.incident_type.name, cfg.lang_frontend),
+            'color': incident.incident_type.color,
+            'icon': incident.incident_type.icon,
+            'delay': incident.delay_minutes or 0,
+            'eta': incident.eta or '',
+            'reason': (incident.delay_reason.reason
+                       if incident.delay_reason_id and incident.delay_reason
+                       else incident.delay_reason_text or ''),
+            'notes': incident.notes or '',
+            'created_at': incident.created_at.isoformat() if incident.created_at else '',
+            'schedule': incident.schedule_type.name if incident.schedule_type else '',
+        })
+    assignments = [{
+        'id': assignment.schedule_type_id,
+        'name': assignment.schedule_type.name,
+        'label': public_schedule_label(assignment.schedule_type.name, cfg.lang_frontend),
+        'departure_time': assignment.departure_time or '',
+    } for assignment in item['schedule_assignments']]
+    return {
+        'id': bus.id,
+        'identifier': bus.identifier,
+        'name': bus.name,
+        'display_name': bus.display_name,
+        'route': bus.route or '',
+        'capacity': bus.capacity,
+        'description': bus.description or '',
+        'status': {
+            'name': status_name,
+            'label': public_status_label(status_name, cfg.lang_frontend),
+            'color': status.color if status else '#10b981',
+            'icon': status.icon if status else 'fa-check-circle',
+            'is_default': bool(status.is_default) if status else True,
+        },
+        'delay_minutes': item['delay'] or 0,
+        'incidents': incidents,
+        'schedules': assignments,
+    }
+
+
+def _public_state(operational, current_period, buses_data, today_value, cfg):
+    buses = [_public_bus_payload(item, cfg) for item in buses_data]
+    period = None
+    if current_period:
+        period = {
+            'id': current_period.id,
+            'name': current_period.name,
+            'label': public_schedule_label(current_period.name, cfg.lang_frontend),
+            'window_start': current_period.window_start or '',
+            'window_end': current_period.window_end or '',
+        }
+    stable = {
+        'operational': bool(operational),
+        'district_date': today_value.isoformat(),
+        'current_period': period,
+        'buses': buses,
+    }
+    revision = hashlib.sha256(json.dumps(
+        stable, sort_keys=True, separators=(',', ':'), ensure_ascii=False
+    ).encode('utf-8')).hexdigest()
+    stable['attention_count'] = sum(
+        1 for bus in buses if not bus['status']['is_default'])
+    stable['revision'] = revision
+    return stable
+
 @app.route('/')
 def index():
-    from datetime import timedelta
     cfg = get_config()
     operational, offline_msg = is_operational()
     current_period = get_current_period() if operational else None
     buses_data     = bus_list_today(period=current_period) if operational else []
     incident_types = IncidentType.query.order_by(IncidentType.sort_order).all()
     schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
-    today_dt = date.today()
+    today_dt = district_today(cfg)
     # Holiday for today (for richer offline display)
     today_holiday = Holiday.query.filter_by(
         holiday_date=today_dt, is_active=True).first() if not operational else None
@@ -2620,6 +2940,8 @@ def index():
         Holiday.holiday_date > today_dt,
         Holiday.holiday_date <= today_dt + timedelta(days=7)
     ).order_by(Holiday.holiday_date).all()
+    public_state = _public_state(
+        operational, current_period, buses_data, today_dt, cfg)
     return render_template('public/index.html',
                            buses_data=buses_data, incident_types=incident_types,
                            schedule_types=schedule_types, cfg=cfg,
@@ -2627,38 +2949,32 @@ def index():
                            operational=operational, offline_msg=offline_msg,
                            today=today_dt,
                            today_holiday=today_holiday,
-                           upcoming_holidays=upcoming_holidays)
+                           upcoming_holidays=upcoming_holidays,
+                           public_state=public_state,
+                           portal_i18n=TRANSLATIONS.get(
+                               cfg.lang_frontend, TRANSLATIONS['en']),
+                           portal_time_zone=district_timezone(cfg).zone)
 
 @app.route('/api/buses')
 def api_buses():
+    cfg = get_config()
     operational, _ = is_operational()
-    if not operational:
-        return jsonify({'operational': False, 'buses': []})
-    today          = date.today()
-    current_period = get_current_period()
-    buses_data     = bus_list_today(period=current_period)
-    result = []
-    for item in buses_data:
-        bus = item['bus']
-        status = item['status']
-        result.append({
-            'id': bus.id, 'identifier': bus.identifier, 'name': bus.name,
-            'display_name': bus.display_name, 'route': bus.route or '',
-            'capacity': bus.capacity, 'description': bus.description or '',
-            'status': {'name': status.name if status else 'On Time',
-                       'color': status.color if status else '#10b981',
-                       'icon': status.icon if status else 'fa-check-circle',
-                       'is_default': status.is_default if status else True},
-            'delay_minutes': item['delay'],
-            'incidents': [{'type': i.incident_type.name, 'color': i.incident_type.color,
-                           'icon': i.incident_type.icon, 'delay': i.delay_minutes,
-                           'notes': i.notes or '', 'time': i.created_at.strftime('%H:%M'),
-                           'schedule': i.schedule_type.name if i.schedule_type else ''}
-                          for i in item['incidents']],
-            'schedules': [s.name for s in item['schedules']],
-        })
-    period_info = {'id': current_period.id, 'name': current_period.name} if current_period else None
-    return jsonify({'operational': True, 'current_period': period_info, 'buses': result})
+    current_period = get_current_period() if operational else None
+    buses_data = bus_list_today(period=current_period) if operational else []
+    state = _public_state(
+        operational, current_period, buses_data, district_today(cfg), cfg)
+    revision = state['revision']
+    if request.if_none_match.contains(revision):
+        response = make_response('', 304)
+    else:
+        state['generated_at'] = district_now(cfg).isoformat()
+        if request.args.get('render') == '1':
+            state['cards_html'] = render_template(
+                'public/_bus_cards.html', buses_data=buses_data, cfg=cfg)
+        response = jsonify(state)
+    response.set_etag(revision)
+    response.headers['Cache-Control'] = 'no-cache, max-age=0'
+    return response
 
 
 # ── AUTH ROUTES ───────────────────────────────────────────────────────────────
@@ -2777,7 +3093,7 @@ def logout():
 @app.route('/admin/dashboard')
 @login_required
 def dashboard():
-    today = date.today()
+    today = district_today()
     # Date filter
     period = request.args.get('period', 'today')
     date_from = request.args.get('date_from', today.isoformat())
@@ -2875,7 +3191,7 @@ def dashboard():
 @login_required
 @require_module('buses')
 def buses():
-    today          = date.today()
+    today          = district_today()
     current_period = get_current_period()
     buses_data     = bus_list_today(admin=True)   # show all buses regardless of schedule period
     incident_types = IncidentType.query.order_by(IncidentType.sort_order).all()
@@ -2901,16 +3217,19 @@ def add_bus():
     if Bus.query.filter_by(identifier=identifier, name=name).first():
         flash(f'A bus with identifier "{identifier}" and name "{name}" already exists.', 'error')
         return redirect(url_for('buses'))
+    assignments, assignment_error = _schedule_assignments_from_form()
+    if assignment_error:
+        flash(assignment_error, 'error')
+        return redirect(url_for('buses'))
     bus = Bus(identifier=identifier, name=name,
               route=request.form.get('route','').strip() or None,
               capacity=request.form.get('capacity', type=int),
               description=request.form.get('description','').strip() or None)
     db.session.add(bus)
     db.session.flush()
-    for sid in request.form.getlist('schedule_ids'):
-        dep_time = request.form.get(f'departure_time_{sid}', '').strip() or None
-        db.session.add(BusScheduleAssignment(bus_id=bus.id, schedule_type_id=int(sid),
-                                             departure_time=dep_time))
+    for schedule_id, departure_time in assignments:
+        db.session.add(BusScheduleAssignment(
+            bus_id=bus.id, schedule_type_id=schedule_id, departure_time=departure_time))
     db.session.commit()
     _audit('add_bus', 'buses', bus.display_name)
     flash(f'Bus {bus.display_name} registered successfully.', 'success')
@@ -2930,6 +3249,10 @@ def edit_bus(bus_id):
         if dup and dup.id != bus_id:
             flash(f'A bus with identifier "{new_identifier}" and name "{new_name}" already exists.', 'error')
             return redirect(url_for('buses'))
+    assignments, assignment_error = _schedule_assignments_from_form()
+    if assignment_error:
+        flash(assignment_error, 'error')
+        return redirect(url_for('buses'))
     bus.identifier  = new_identifier
     bus.name        = new_name
     bus.route       = request.form.get('route', '').strip() or None
@@ -2938,10 +3261,9 @@ def edit_bus(bus_id):
     bus.active      = 'active' in request.form
     # Update schedules
     BusScheduleAssignment.query.filter_by(bus_id=bus_id).delete()
-    for sid in request.form.getlist('schedule_ids'):
-        dep_time = request.form.get(f'departure_time_{sid}', '').strip() or None
-        db.session.add(BusScheduleAssignment(bus_id=bus_id, schedule_type_id=int(sid),
-                                             departure_time=dep_time))
+    for schedule_id, departure_time in assignments:
+        db.session.add(BusScheduleAssignment(
+            bus_id=bus_id, schedule_type_id=schedule_id, departure_time=departure_time))
     db.session.commit()
     _audit('edit_bus', 'buses', bus.display_name)
     flash(f'Bus {bus.display_name} updated.', 'success')
@@ -2981,7 +3303,7 @@ def add_bus_incident(bus_id):
         delay_reason_id=reason_id,
         delay_reason_text=reason_text,
         notes=request.form.get('notes', '').strip() or None,
-        incident_date=date.today(), is_pending=True,
+        incident_date=district_today(), is_pending=True,
         created_by_id=current_user.id,
     )
     db.session.add(rec)
@@ -3093,7 +3415,7 @@ def delete_incident_type(type_id):
 @login_required
 @require_module('statistics')
 def statistics():
-    today    = date.today()
+    today    = district_today()
     period   = request.args.get('period', 'today')
     d_from_s = request.args.get('date_from', today.isoformat())
     d_to_s   = request.args.get('date_to',   today.isoformat())
@@ -3281,7 +3603,7 @@ def _parse_period(period, d_from_s, d_to_s, today):
 @login_required
 @require_module('statistics')
 def export_statistics(fmt):
-    today    = date.today()
+    today    = district_today()
     period   = request.args.get('period', 'today')
     d_from_s = request.args.get('date_from', today.isoformat())
     d_to_s   = request.args.get('date_to',   today.isoformat())
@@ -3558,7 +3880,7 @@ def email_statistics():
     try:
         to_email = _validated_email(to_email, 'recipient email address', required=True)
         settings = _smtp_settings_from_config(cfg)
-        today = date.today()
+        today = district_today(cfg)
         records = BusIncidentRecord.query.filter(
             BusIncidentRecord.is_pending == False,
             BusIncidentRecord.incident_date == today,
@@ -3589,7 +3911,7 @@ def reset_statistics():
     preset      = request.form.get('preset', '')
     date_from_s = request.form.get('rs_date_from', '')
     date_to_s   = request.form.get('rs_date_to', '')
-    today = date.today()
+    today = district_today()
     try:
         if preset == 'today':
             d_from = d_to = today
@@ -3666,16 +3988,18 @@ def reset_statistics():
 @require_module('notifications', 'limited')
 @require_capability('notifications.export_pii')
 def export_notification_stats():
-    today    = date.today()
+    cfg = get_config()
+    today    = district_today(cfg)
     period   = request.args.get('period', 'today')
     d_from_s = request.args.get('date_from', today.isoformat())
     d_to_s   = request.args.get('date_to',   today.isoformat())
     bus_id   = request.args.get('bus_id', type=int)
     d_from, d_to = _parse_period(period, d_from_s, d_to_s, today)
 
+    utc_from, utc_until = district_date_utc_bounds(d_from, d_to, cfg)
     q = NotificationLog.query.filter(
-        NotificationLog.sent_at >= datetime.combine(d_from, datetime.min.time()),
-        NotificationLog.sent_at <= datetime.combine(d_to,   datetime.max.time()),
+        NotificationLog.sent_at >= utc_from,
+        NotificationLog.sent_at < utc_until,
     )
     if bus_id:
         q = q.filter_by(bus_id=bus_id)
@@ -8659,7 +8983,7 @@ def export_db():
         try:
             with open(db_path, 'rb') as stream:
                 response = _encrypted_download(stream.read(),
-                                               f'bustrack_sqlite_{date.today()}.bustrack-db')
+                                               f'bustrack_sqlite_{district_today()}.bustrack-db')
             _audit('export_full_backup', 'config', 'encrypted SQLite database')
             return response
         except RuntimeError as exc:
@@ -8943,7 +9267,7 @@ def export_operational_json():
     response = make_response(payload)
     response.headers['Content-Type'] = 'application/json; charset=utf-8'
     response.headers['Content-Disposition'] = (
-        f'attachment; filename="bustrack_operational_{date.today()}.json"')
+        f'attachment; filename="bustrack_operational_{district_today()}.json"')
     response.headers['Cache-Control'] = 'no-store'
     _audit('export_operational', 'config', 'redacted operational data')
     return response
@@ -8956,7 +9280,7 @@ def export_json():
     try:
         payload = json.dumps(_full_backup_document(), default=_json_default,
                              separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-        response = _encrypted_download(payload, f'bustrack_full_{date.today()}.bustrack')
+        response = _encrypted_download(payload, f'bustrack_full_{district_today()}.bustrack')
         _audit('export_full_backup', 'config', 'encrypted JSON backup')
         return response
     except RuntimeError as exc:
@@ -8988,7 +9312,7 @@ def export_sql():
             lines.append(f'INSERT INTO "{table}" ({columns}) VALUES ({", ".join(values)});')
     try:
         response = _encrypted_download('\n'.join(lines).encode('utf-8'),
-                                       f'bustrack_sql_{date.today()}.bustrack-sql')
+                                       f'bustrack_sql_{district_today()}.bustrack-sql')
         _audit('export_full_backup', 'config', 'encrypted SQL backup')
         return response
     except RuntimeError as exc:
@@ -9290,7 +9614,7 @@ def export_logs_csv():
         ]))
     resp = make_response(buf.getvalue())
     resp.headers['Content-Type'] = 'text/csv; charset=utf-8'
-    resp.headers['Content-Disposition'] = f'attachment; filename=audit_log_{date.today()}.csv'
+    resp.headers['Content-Disposition'] = f'attachment; filename=audit_log_{district_today()}.csv'
     return resp
 
 

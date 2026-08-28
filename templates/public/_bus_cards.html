@@ -1,0 +1,114 @@
+{% for item in buses_data %}
+{% set bus = item.bus %}
+{% set status = item.status %}
+{% set status_name = status.name if status else 'On Time' %}
+{% set status_label = public_status_label(status_name, cfg.lang_frontend) %}
+{% set schedules = item.schedules %}
+<article class="bus-card c-card rounded-3xl shadow-sm border border-slate-100 overflow-hidden flex flex-col"
+         id="card-{{ bus.id }}"
+         aria-labelledby="bus-title-{{ bus.id }}"
+         data-bus-id="{{ bus.id }}"
+         data-name="{{ bus.name }}"
+         data-identifier="{{ bus.identifier }}"
+         data-route="{{ bus.route or '' }}"
+         data-status="{{ status_name }}"
+         data-status-label="{{ status_label }}"
+         data-default-status="{{ '1' if not status or status.is_default else '0' }}"
+         data-schedules="{{ schedules | map(attribute='name') | join(',') }}"
+         data-schedule-labels="{% for schedule in schedules %}{{ public_schedule_label(schedule.name, cfg.lang_frontend) }}{% if not loop.last %},{% endif %}{% endfor %}">
+  <div class="px-4 py-3.5 min-h-16 flex items-center justify-between gap-2"
+       style="background-color:{{ status.color if status else '#10b981' }}">
+    <div class="flex items-center space-x-3 min-w-0">
+      <span class="w-9 h-9 rounded-xl bg-white/20 flex items-center justify-center flex-shrink-0" aria-hidden="true">
+        <i class="fas {{ status.icon if status else 'fa-check-circle' }} text-white text-sm"></i>
+      </span>
+      <div class="min-w-0">
+        <h2 id="bus-title-{{ bus.id }}" class="text-white font-extrabold text-base truncate">
+          {{ bus.identifier }} - {{ bus.name }}
+        </h2>
+        <p class="text-white/80 text-xs font-semibold mt-0.5">{{ status_label }}{% if item.delay and item.delay > 0 %} · +{{ item.delay }} {{ t('delay') }}{% endif %}</p>
+      </div>
+    </div>
+    <button type="button"
+            class="fav-btn opacity-80 hover:opacity-100 transition-opacity flex-shrink-0 w-11 h-11 rounded-xl bg-white/10 hover:bg-white/20 flex items-center justify-center"
+            data-bus-id="{{ bus.id }}"
+            data-bus-label="{{ bus.identifier }} - {{ bus.name }}"
+            aria-pressed="false"
+            aria-label="{{ t('favorite_bus').format(bus=bus.identifier ~ ' - ' ~ bus.name) }}"
+            title="{{ t('favorite') }}">
+      <i class="fas fa-star text-white text-sm" aria-hidden="true"></i>
+    </button>
+  </div>
+
+  <div class="p-4 flex-1 space-y-3.5">
+    {% if item.incidents %}
+    <div>
+      <p class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">{{ t('todays_updates') }}</p>
+      <div class="space-y-2">
+        {% for inc in item.incidents %}
+        <div>
+          <div class="flex flex-wrap items-center gap-1.5">
+            <span class="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-semibold text-white"
+                  style="background-color:{{ inc.incident_type.color }}">
+              <i class="fas {{ inc.incident_type.icon }} text-xs" aria-hidden="true"></i>
+              <span>{{ public_status_label(inc.incident_type.name, cfg.lang_frontend) }}</span>
+            </span>
+            {% if inc.delay_minutes and inc.delay_minutes > 0 %}
+            <span class="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
+              <i class="fas fa-clock text-xs" aria-hidden="true"></i>+{{ inc.delay_minutes }} {{ t('delay') }}
+            </span>
+            {% endif %}
+            {% if inc.eta %}
+            <span class="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">
+              <i class="fas fa-hourglass-half text-xs" aria-hidden="true"></i>ETA {{ fmt_time(inc.eta, cfg.time_format) }}
+            </span>
+            {% endif %}
+          </div>
+          {% if inc.delay_reason_id and inc.delay_reason %}
+          <p class="text-xs text-slate-400 mt-0.5 ml-0.5"><i class="fas fa-comment-alt mr-1 opacity-50" aria-hidden="true"></i>{{ inc.delay_reason.reason }}</p>
+          {% elif inc.delay_reason_text %}
+          <p class="text-xs text-slate-400 mt-0.5 ml-0.5"><i class="fas fa-comment-alt mr-1 opacity-50" aria-hidden="true"></i>{{ inc.delay_reason_text }}</p>
+          {% endif %}
+          {% if inc.notes %}<p class="text-xs text-slate-400 italic mt-0.5 ml-0.5">{{ inc.notes }}</p>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% else %}
+    <div class="flex flex-wrap items-center gap-1.5">
+      <span class="inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-semibold text-white"
+            style="background-color:{{ status.color if status else '#10b981' }}">
+        <i class="fas {{ status.icon if status else 'fa-check-circle' }} text-xs" aria-hidden="true"></i>
+        <span>{{ status_label }}</span>
+      </span>
+    </div>
+    <p class="text-xs text-slate-300"><i class="fas fa-check mr-1" aria-hidden="true"></i>{{ t('no_incidents') }}</p>
+    {% endif %}
+
+    {% if bus.route %}
+    <p class="text-xs text-slate-400"><i class="fas fa-map-marker-alt mr-1" aria-hidden="true"></i>{{ bus.route }}</p>
+    {% endif %}
+
+    {% if item.schedule_assignments %}
+    <div>
+      <p class="text-xs text-slate-400 mb-1">{{ t('service_schedule') }}</p>
+      <div class="flex flex-wrap gap-1">
+        {% for assignment in item.schedule_assignments %}
+        <span class="text-xs px-2 py-0.5 bg-slate-100 text-slate-500 rounded-full">
+          {{ public_schedule_label(assignment.schedule_type.name, cfg.lang_frontend) }}{% if assignment.departure_time %}
+          <span class="text-blue-500 font-medium">{{ fmt_time(assignment.departure_time, cfg.time_format) }}</span>{% endif %}
+        </span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  {% if bus.capacity %}
+  <div class="px-4 py-2 border-t border-slate-50 flex items-center space-x-1.5 text-xs opacity-40">
+    <i class="fas fa-users text-xs" aria-hidden="true"></i>
+    <span>{{ bus.capacity }} {{ t('capacity') }}</span>
+  </div>
+  {% endif %}
+</article>
+{% endfor %}

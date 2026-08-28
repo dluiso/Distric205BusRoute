@@ -1,0 +1,27 @@
+{
+  "id": "/",
+  "name": "District 205 Bus Tracker",
+  "short_name": "Bus Tracker",
+  "description": "Live District 205 school bus status portal.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#f1f5f9",
+  "theme_color": "#1e293b",
+  "categories": ["education", "navigation", "utilities"],
+  "icons": [
+    {
+      "src": "/static/icons/bus-route-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icons/bus-route-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

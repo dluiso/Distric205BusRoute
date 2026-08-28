@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="{{ cfg.lang_frontend }}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="{{ cfg.color_nav }}">
+  <title>{{ t('offline_title') }} · {{ cfg.app_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/public.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/fontawesome/css/all.min.css') }}">
+  <style>:root{--bg:{{ cfg.color_bg }};--nav:{{ cfg.color_nav }};--card:{{ cfg.color_card }};--text:{{ cfg.color_text }};--accent:{{ cfg.color_accent }};--nav-text:{{ cfg.color_nav_text }};}</style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-5">
+  <main class="c-card w-full max-w-md rounded-3xl shadow-app border border-slate-100 p-8 text-center">
+    <span class="w-20 h-20 rounded-3xl mx-auto mb-5 flex items-center justify-center text-white text-3xl" style="background:var(--accent)" aria-hidden="true"><i class="fas fa-wifi"></i></span>
+    <h1 class="text-2xl font-black">{{ t('offline_title') }}</h1>
+    <p class="text-sm opacity-60 mt-3 leading-relaxed">{{ t('offline_message') }}</p>
+    <a href="{{ url_for('index') }}" class="mt-6 min-h-12 rounded-xl text-white font-bold inline-flex items-center justify-center px-6" style="background:var(--accent)"><i class="fas fa-rotate-right mr-2" aria-hidden="true"></i>{{ t('offline_retry') }}</a>
+    <p class="text-xs opacity-40 mt-6">{{ cfg.app_name }} · {{ cfg.app_subtitle }}</p>
+  </main>
+</body>
+</html>

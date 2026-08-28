@@ -1,0 +1,14 @@
+{
+  "name": "district205-busroute-public-assets",
+  "private": true,
+  "scripts": {
+    "build:public-css": "tailwindcss -c tailwind.config.js -i static/src/public.css -o static/css/public.css --minify",
+    "copy:public-icons": "mkdir -p static/vendor/fontawesome/css static/vendor/fontawesome/webfonts && cp node_modules/@fortawesome/fontawesome-free/css/all.min.css static/vendor/fontawesome/css/all.min.css && cp node_modules/@fortawesome/fontawesome-free/webfonts/fa-solid-900.woff2 static/vendor/fontawesome/webfonts/fa-solid-900.woff2",
+    "build:public": "npm run build:public-css && npm run copy:public-icons",
+    "test:public-js": "node --test tests/js/public_portal.test.cjs"
+  },
+  "devDependencies": {
+    "@fortawesome/fontawesome-free": "6.7.2",
+    "tailwindcss": "3.4.17"
+  }
+}

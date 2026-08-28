@@ -85,7 +85,7 @@
       {% if bus.schedule_assignments %}
       <div class="flex items-start space-x-2 text-xs text-slate-400">
         <i class="fas fa-clock text-slate-300 w-4 text-center mt-0.5"></i>
-        <span>{% for a in bus.schedule_assignments %}{{ a.schedule_type.name }}{% if a.departure_time %} <span class="text-blue-400 font-medium">{{ a.departure_time }}</span>{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}</span>
+        <span>{% for a in bus.schedule_assignments %}{{ a.schedule_type.name }}{% if a.departure_time %} <span class="text-blue-400 font-medium">{{ fmt_time(a.departure_time, get_config().time_format) }}</span>{% endif %}{% if schedule_assignment_warning(a) %} <span class="text-amber-600 font-semibold" title="{{ schedule_assignment_warning(a) }}"><i class="fas fa-triangle-exclamation"></i> Check time</span>{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}</span>
       </div>
       {% endif %}
       {% if item.delay_reason %}
@@ -218,8 +218,10 @@
               </label>
               <div id="dep-add-{{ s.id }}" class="hidden ml-6 mt-1 flex items-center space-x-2">
                 <input type="time" name="departure_time_{{ s.id }}"
+                       {% if s.window_start %}min="{{ s.window_start }}"{% endif %}
+                       {% if s.window_end %}max="{{ s.window_end }}"{% endif %}
                        class="px-2 py-1 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <span class="text-xs text-slate-400">Departure time for this bus</span>
+                <span class="text-xs text-slate-400">{% if s.window_start and s.window_end %}{{ fmt_time(s.window_start, get_config().time_format) }}–{{ fmt_time(s.window_end, get_config().time_format) }}{% else %}Departure time for this bus{% endif %}</span>
               </div>
             </div>
             {% endfor %}
@@ -290,8 +292,10 @@
               </label>
               <div id="dep-edit-{{ s.id }}" class="hidden ml-6 mt-1 flex items-center space-x-2">
                 <input type="time" name="departure_time_{{ s.id }}" id="dep-edit-time-{{ s.id }}"
+                       {% if s.window_start %}min="{{ s.window_start }}"{% endif %}
+                       {% if s.window_end %}max="{{ s.window_end }}"{% endif %}
                        class="px-2 py-1 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <span class="text-xs text-slate-400">Departure time</span>
+                <span class="text-xs text-slate-400">{% if s.window_start and s.window_end %}{{ fmt_time(s.window_start, get_config().time_format) }}–{{ fmt_time(s.window_end, get_config().time_format) }}{% else %}Departure time{% endif %}</span>
               </div>
             </div>
             {% endfor %}
