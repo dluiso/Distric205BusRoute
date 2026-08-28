@@ -1,3 +1,4 @@
+import ast
 import io
 import json
 import os
@@ -9,7 +10,51 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 
 import app as application
-from conftest import INSTANCE_DIR, csrf_token, login
+from conftest import INSTANCE_DIR, csrf_token, ephemeral_credential, login
+
+
+def _static_string(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_string(node.left)
+        right = _static_string(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _is_mail_password_target(target):
+    if isinstance(target, ast.Attribute):
+        return target.attr == 'mail_password'
+    if isinstance(target, ast.Subscript):
+        return _static_string(target.slice) == 'mail_password'
+    return False
+
+
+def _static_smtp_password_lines(source, filename='<smtp-secret-check>'):
+    tree = ast.parse(source, filename=filename)
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if (_static_string(node.value) and
+                    any(_is_mail_password_target(target) for target in targets)):
+                violations.append(node.lineno)
+        elif isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if (_static_string(key) == 'mail_password' and _static_string(value)):
+                    violations.append(node.lineno)
+        elif isinstance(node, ast.Call):
+            name = getattr(node.func, 'attr', getattr(node.func, 'id', ''))
+            if (name == '_encrypt_mail_password' and node.args and
+                    _static_string(node.args[0])):
+                violations.append(node.lineno)
+            elif (name == 'setattr' and len(node.args) >= 3 and
+                  _static_string(node.args[1]) == 'mail_password' and
+                  _static_string(node.args[2])):
+                violations.append(node.lineno)
+    return violations
 
 
 def add_group(name, permissions):
@@ -230,18 +275,21 @@ def test_nonadmin_cannot_download_or_restore_full_backup(client):
 
 
 def test_operational_export_is_redacted(client):
+    mail_secret = ephemeral_credential()
+    sms_secret = ephemeral_credential()
     with application.app.app_context():
         group = add_group('Config Managers', {'config': 'full'})
         add_user('configmanager', group)
         cfg = application.get_config()
-        cfg.mail_password = 'must-not-leak'
-        cfg.twilio_auth_token = 'must-not-leak-either'
+        cfg.mail_password = mail_secret
+        cfg.twilio_auth_token = sms_secret
         application.db.session.commit()
     login(client, 'configmanager', 'Another-Safe-Password')
     response = client.get('/admin/config/export-operational-json')
     assert response.status_code == 200
     payload = response.get_data(as_text=True)
-    assert 'must-not-leak' not in payload
+    assert mail_secret not in payload
+    assert sms_secret not in payload
     assert 'password_hash' not in payload
     assert 'subscriber_contact' not in payload
     assert 'audit_log' not in payload
@@ -293,6 +341,7 @@ def test_full_backup_is_encrypted_and_versioned(logged_in_client):
 
 
 def test_smtp_live_test_does_not_reuse_password_for_changed_connection(logged_in_client):
+    stored_password = ephemeral_credential()
     with application.app.app_context():
         cfg = application.get_config()
         cfg.mail_provider = 'custom'
@@ -301,7 +350,7 @@ def test_smtp_live_test_does_not_reuse_password_for_changed_connection(logged_in
         cfg.mail_use_tls = True
         cfg.mail_use_ssl = False
         cfg.mail_username = 'mailer'
-        cfg.mail_password = 'stored-secret'
+        cfg.mail_password = stored_password
         cfg.mail_from_email = 'mailer@example.test'
         application.db.session.commit()
     response = logged_in_client.post('/admin/config/test-email-live', json={
@@ -314,13 +363,14 @@ def test_smtp_live_test_does_not_reuse_password_for_changed_connection(logged_in
 
 
 def test_smtp_connection_change_requires_password_reentry(logged_in_client):
+    stored_password = ephemeral_credential()
     with application.app.app_context():
         cfg = application.get_config()
         cfg.mail_provider = 'custom'
         cfg.mail_server = 'smtp.example.test'
         cfg.mail_port = 587
         cfg.mail_username = 'mailer'
-        cfg.mail_password = 'stored-secret'
+        cfg.mail_password = stored_password
         cfg.mail_from_email = 'mailer@example.test'
         application.db.session.commit()
     response = logged_in_client.post('/admin/config', data={
@@ -333,7 +383,38 @@ def test_smtp_connection_change_requires_password_reentry(logged_in_client):
     with application.app.app_context():
         cfg = application.get_config()
         assert cfg.mail_server == 'smtp.example.test'
-        assert cfg.mail_password == 'stored-secret'
+        assert cfg.mail_password == stored_password
+
+
+def test_python_sources_do_not_embed_static_smtp_passwords():
+    root = Path(__file__).resolve().parents[1]
+    source_paths = sorted(root.glob('*.py')) + sorted((root / 'tests').glob('*.py'))
+    violations = []
+
+    for path in source_paths:
+        source = path.read_text(encoding='utf-8')
+        violations.extend(
+            f'{path.relative_to(root)}:{line}' for line in
+            _static_smtp_password_lines(source, filename=str(path)))
+
+    assert not violations, f'Static SMTP password fixture(s): {", ".join(violations)}'
+
+
+def test_static_smtp_password_guard_covers_equivalent_literal_forms():
+    password_field = 'mail_' + 'password'
+    password_literal = repr('embedded-' + 'value')
+    encrypt_function = '_encrypt_' + password_field
+    unsafe_sources = (
+        f'cfg.{password_field} = {password_literal}',
+        f'cfg[{password_field!r}] = {password_literal}',
+        f'payload = {{{password_field!r}: {password_literal}}}',
+        f'setattr(cfg, {password_field!r}, {password_literal})',
+        f'cfg.{password_field} = {"embedded-"!r} + {"value"!r}',
+        f'application.{encrypt_function}({password_literal})',
+    )
+    assert all(_static_smtp_password_lines(source) for source in unsafe_sources)
+    assert not _static_smtp_password_lines(
+        "cfg.mail_password = ephemeral_credential()")
 
 
 def test_restore_failure_is_atomic_and_preserves_existing_data(logged_in_client):

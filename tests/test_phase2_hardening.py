@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import inspect
 
 import app as application
-from conftest import csrf_token, login
+from conftest import csrf_token, ephemeral_credential, login
 from test_phase1_security import add_group, add_user
 
 
@@ -197,6 +197,7 @@ def test_phase1_backup_version_remains_accepted():
 
 
 def test_phase1_backup_restores_after_phase2_tables_exist(logged_in_client):
+    legacy_mail_password = ephemeral_credential()
     with application.app.app_context():
         current = application._full_backup_document()
         legacy = {
@@ -204,7 +205,7 @@ def test_phase1_backup_restores_after_phase2_tables_exist(logged_in_client):
             'tables': {name: current['tables'][name]
                        for name in application._IMPORT_TABLE_ORDER_V1},
         }
-        legacy['tables']['configuration'][0]['mail_password'] = 'legacy-mail-secret'
+        legacy['tables']['configuration'][0]['mail_password'] = legacy_mail_password
         owner = application.User.query.filter_by(username='admin').one()
         now = application._utcnow()
         job = application.BroadcastJob(
@@ -233,7 +234,8 @@ def test_phase1_backup_restores_after_phase2_tables_exist(logged_in_client):
         assert application.EmailOutbox.query.count() == 0
         cfg = application.get_config()
         assert cfg.mail_password.startswith('enc:v1:')
-        assert application._decrypt_mail_password(cfg.mail_password) == 'legacy-mail-secret'
+        assert application._decrypt_mail_password(
+            cfg.mail_password) == legacy_mail_password
         assert application.ImportMappingProfile.query.filter_by(
             source_type='legacy_csv', schema_version='1').one()
 

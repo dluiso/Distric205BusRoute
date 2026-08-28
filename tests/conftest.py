@@ -1,4 +1,5 @@
 import os
+import secrets
 import shutil
 import sys
 import tempfile
@@ -12,6 +13,11 @@ TEST_ROOT = tempfile.mkdtemp(prefix='bustrack-tests-')
 INSTANCE_DIR = os.path.join(TEST_ROOT, 'instance')
 UPLOAD_DIR = os.path.join(TEST_ROOT, 'uploads')
 DB_PATH = os.path.join(TEST_ROOT, 'test.db')
+
+
+def ephemeral_credential():
+    """Create non-persisted credential material for security-sensitive tests."""
+    return secrets.token_urlsafe(32)
 
 
 def _database_url_for_tests():

@@ -2,11 +2,12 @@ import smtplib
 import re
 
 import app as application
-from conftest import csrf_token
+from conftest import csrf_token, ephemeral_credential
 from email_service import EmailTransportError, classify_transport_error
 
 
-def _configure_custom_email(password='saved-secret'):
+def _configure_custom_email(password=None):
+    password = password or ephemeral_credential()
     cfg = application.get_config()
     cfg.mail_provider = 'custom'
     cfg.mail_server = 'smtp.example.test'
@@ -23,8 +24,9 @@ def _configure_custom_email(password='saved-secret'):
 
 def test_live_test_reuses_encrypted_password_for_exact_saved_identity(
         logged_in_client, monkeypatch):
+    saved_password = ephemeral_credential()
     with application.app.app_context():
-        _configure_custom_email()
+        _configure_custom_email(saved_password)
 
     observed = {}
 
@@ -49,7 +51,7 @@ def test_live_test_reuses_encrypted_password_for_exact_saved_identity(
 
     assert response.status_code == 200
     assert observed == {
-        'password': 'saved-secret',
+        'password': saved_password,
         'server': 'smtp.example.test',
         'recipients': ['recipient@example.test'],
     }
@@ -60,6 +62,7 @@ def test_live_test_reuses_encrypted_password_for_exact_saved_identity(
 
 
 def test_office365_save_normalizes_transport_and_encrypts_password(logged_in_client):
+    supplied_password = ephemeral_credential()
     response = logged_in_client.post('/admin/config', data={
         '_csrf': csrf_token(logged_in_client),
         'section': 'email',
@@ -68,7 +71,7 @@ def test_office365_save_normalizes_transport_and_encrypts_password(logged_in_cli
         'mail_port': '465',
         'mail_use_tls': 'on',
         'mail_username': 'transport@example.test',
-        'mail_password': 'not-a-real-production-password',
+        'mail_password': supplied_password,
         'mail_from_email': 'transport@example.test',
         'mail_from_name': 'District Transport',
     })
@@ -81,13 +84,13 @@ def test_office365_save_normalizes_transport_and_encrypts_password(logged_in_cli
         assert cfg.mail_use_tls is True
         assert cfg.mail_use_ssl is False
         assert cfg.mail_password.startswith('enc:v1:')
-        assert application._decrypt_mail_password(cfg.mail_password) == (
-            'not-a-real-production-password')
+        assert application._decrypt_mail_password(cfg.mail_password) == supplied_password
         assert cfg.mail_last_verification_status == 'unverified'
 
 
 def test_email_page_renders_canonical_preset_and_real_verification_status(
         logged_in_client):
+    saved_password = ephemeral_credential()
     with application.app.app_context():
         cfg = application.get_config()
         cfg.mail_provider = 'office365'
@@ -96,7 +99,7 @@ def test_email_page_renders_canonical_preset_and_real_verification_status(
         cfg.mail_use_tls = True
         cfg.mail_use_ssl = False
         cfg.mail_username = 'transport@example.test'
-        cfg.mail_password = application._encrypt_mail_password('saved-secret')
+        cfg.mail_password = application._encrypt_mail_password(saved_password)
         cfg.mail_from_email = 'transport@example.test'
         application.db.session.commit()
 
@@ -109,6 +112,7 @@ def test_email_page_renders_canonical_preset_and_real_verification_status(
 
 
 def test_migration_command_encrypts_legacy_secret_and_normalizes_office365():
+    legacy_password = ephemeral_credential()
     with application.app.app_context():
         cfg = application.get_config()
         cfg.mail_provider = 'office365'
@@ -117,7 +121,7 @@ def test_migration_command_encrypts_legacy_secret_and_normalizes_office365():
         cfg.mail_use_tls = True
         cfg.mail_use_ssl = False
         cfg.mail_username = 'transport@example.test'
-        cfg.mail_password = 'legacy-plaintext-value'
+        cfg.mail_password = legacy_password
         cfg.mail_from_email = 'transport@example.test'
         application.db.session.commit()
 
@@ -130,8 +134,7 @@ def test_migration_command_encrypts_legacy_secret_and_normalizes_office365():
         assert cfg.mail_port == 587
         assert cfg.mail_use_tls is True
         assert cfg.mail_use_ssl is False
-        assert application._decrypt_mail_password(cfg.mail_password) == (
-            'legacy-plaintext-value')
+        assert application._decrypt_mail_password(cfg.mail_password) == legacy_password
 
 
 def test_outbox_retries_transient_failure_then_marks_delivery_sent(monkeypatch):
