@@ -171,34 +171,37 @@
     return badge;
   }
 
-  function actionButton(action, bus, label, iconName, classes, compactButton) {
-    const button = make('button', `${compactButton ? 'w-9 h-9' : 'min-h-10 px-3'} rounded-xl text-xs font-bold inline-flex items-center justify-center gap-1.5 ${classes || 'border border-slate-200 text-slate-600 hover:bg-slate-50'}`);
+  function actionButton(action, bus, label, iconName, classes, compactButton, displayLabel, cardButton) {
+    const sizeClasses = compactButton ? 'w-9 h-9' : cardButton ? 'bus-card-action min-h-10' : 'min-h-10 px-3';
+    const button = make('button', `${sizeClasses} rounded-xl text-xs font-bold inline-flex items-center justify-center gap-1.5 ${classes || 'border border-slate-200 text-slate-600 hover:bg-slate-50'}`);
     button.type = 'button';
     button.dataset.busAction = action;
     button.dataset.busId = String(bus.id);
     button.setAttribute('aria-label', `${label} ${bus.display_name}`);
     button.title = label;
     button.append(icon(iconName, 'text-xs'));
-    if (!compactButton) button.append(document.createTextNode(label));
+    if (!compactButton) button.append(make('span', 'bus-card-action-label', displayLabel || label));
     return button;
   }
 
-  function busActions(bus, compactButtons) {
-    const actions = make('div', 'flex flex-wrap items-center gap-2');
-    actions.append(actionButton('details', bus, 'Details', 'fa-eye', '', compactButtons));
+  function busActions(bus, compactButtons, cardButtons) {
+    const actions = make('div', cardButtons ? 'bus-card-actions flex items-center gap-1' : 'flex flex-wrap items-center gap-2');
+    const addAction = (action, label, cardLabel, iconName, classes) => actions.append(
+      actionButton(action, bus, label, iconName, classes, compactButtons, cardButtons ? cardLabel : label, cardButtons));
+    addAction('details', 'Details', 'Details', 'fa-eye', '');
     if (!config.canWrite) return actions;
-    if (bus.lifecycle_state !== 'trash') actions.append(actionButton('edit', bus, 'Edit', 'fa-pen', '', compactButtons));
+    if (bus.lifecycle_state !== 'trash') addAction('edit', 'Edit', 'Edit', 'fa-pen', '');
     if (bus.lifecycle_state === 'active') {
-      actions.append(actionButton('incident', bus, 'Status update', 'fa-circle-plus', 'bg-blue-600 text-white hover:bg-blue-700', compactButtons));
-      actions.append(actionButton('deactivate', bus, 'Deactivate', 'fa-circle-pause', 'border border-amber-200 text-amber-700 hover:bg-amber-50', compactButtons));
-      actions.append(actionButton('trash', bus, 'Move to Trash', 'fa-trash-can', 'border border-rose-200 text-rose-700 hover:bg-rose-50', compactButtons));
+      addAction('incident', 'Status update', 'Update', 'fa-circle-plus', 'bg-blue-600 text-white hover:bg-blue-700');
+      addAction('deactivate', 'Deactivate', 'Pause', 'fa-circle-pause', 'border border-amber-200 text-amber-700 hover:bg-amber-50');
+      addAction('trash', 'Move to Trash', 'Trash', 'fa-trash-can', 'border border-rose-200 text-rose-700 hover:bg-rose-50');
     } else if (bus.lifecycle_state === 'inactive') {
-      actions.append(actionButton('activate', bus, 'Activate', 'fa-circle-play', 'bg-emerald-600 text-white hover:bg-emerald-700', compactButtons));
-      actions.append(actionButton('trash', bus, 'Move to Trash', 'fa-trash-can', 'border border-rose-200 text-rose-700 hover:bg-rose-50', compactButtons));
+      addAction('activate', 'Activate', 'Activate', 'fa-circle-play', 'bg-emerald-600 text-white hover:bg-emerald-700');
+      addAction('trash', 'Move to Trash', 'Trash', 'fa-trash-can', 'border border-rose-200 text-rose-700 hover:bg-rose-50');
     } else {
-      actions.append(actionButton('restore', bus, 'Restore', 'fa-rotate-left', 'bg-blue-600 text-white hover:bg-blue-700', compactButtons));
+      addAction('restore', 'Restore', 'Restore', 'fa-rotate-left', 'bg-blue-600 text-white hover:bg-blue-700');
       if (config.canPurge) {
-        const purge = actionButton('purge', bus, 'Delete permanently', 'fa-trash', 'border border-red-200 text-red-700 hover:bg-red-50', compactButtons);
+        const purge = actionButton('purge', bus, 'Delete permanently', 'fa-trash', 'border border-red-200 text-red-700 hover:bg-red-50', compactButtons, cardButtons ? 'Delete' : 'Delete permanently', cardButtons);
         purge.disabled = !bus.purge_eligible;
         if (purge.disabled) { purge.classList.add('opacity-40', 'cursor-not-allowed'); purge.title = (bus.purge_blockers || []).join(' '); }
         actions.append(purge);
@@ -244,7 +247,7 @@
       const item = make('div', 'min-w-0'); item.append(make('p', 'font-black text-slate-700', value), make('p', 'text-[10px] text-slate-400 truncate', label)); metrics.append(item);
     });
     body.append(metrics);
-    const footer = busActions(bus, false); footer.classList.add('mt-4'); body.append(footer);
+    const footer = busActions(bus, false, true); footer.classList.add('mt-4'); body.append(footer);
     card.append(body);
     return card;
   }
