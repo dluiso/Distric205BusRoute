@@ -285,6 +285,41 @@ batches. It preserves manual subscribers. If any selected change or cutover oper
 fails, none of them are committed. This one-time provenance cutover is distinct from
 absence-based deactivation and cannot accompany a Delta batch.
 
+### Interrupted Apply recovery
+
+If the web worker is terminated during Apply, do not press Apply again and do not edit
+the batch status directly. First stop or restart the terminated application workers so
+the original database transaction cannot still be running. Then run the recovery command
+from the application environment without `--apply`:
+
+```bash
+flask --app app recover-powerschool-apply BATCH_ID
+```
+
+The dry run verifies the immutable plan, raw-file checksums, selected count, target
+pre-state, cutover population and absence of any committed change. It prints aggregate
+evidence only. `recoverable=true` means the roster transaction did not commit; any other
+result is a NO-GO for automated recovery. To close only that proven clean interruption,
+copy every pin exactly and run:
+
+```bash
+flask --app app recover-powerschool-apply BATCH_ID \
+  --apply \
+  --manifest-sha MANIFEST_SHA_FROM_DRY_RUN \
+  --expected-plan-hash PLAN_HASH_FROM_DRY_RUN \
+  --expected-file-sha FILE_SHA_FROM_DRY_RUN \
+  --expected-selected SELECTED_COUNT_FROM_DRY_RUN \
+  --approved-by ACTIVE_ADMIN_USERNAME \
+  --confirm-worker-stopped
+```
+
+Recovery marks the interrupted batch `failed`, retains its rows/files as evidence and
+records an audit event. It never changes roster data and never returns the old batch to
+`staged`; upload the three exact exports again, re-analyze, review and approve a new
+immutable plan. If a commit acknowledgement was lost after PostgreSQL actually committed,
+the normal Apply handler recognizes the coherent `applied` state and returns success
+instead of marking the batch failed.
+
 The cutover is recorded as part of the PowerSchool batch and is rollbackable within the
 normal rollback retention window. A successful batch rollback reverses the selected
 PowerSchool changes and restores the prior active state of its legacy cutover candidates,

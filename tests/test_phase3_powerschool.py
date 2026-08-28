@@ -6,6 +6,7 @@ from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from sqlalchemy import event
 
 import app as application
 from powerschool_import import (
@@ -279,6 +280,203 @@ def apply_batch(client, report):
         f"/admin/notifications/powerschool/batch/{report['batch_id']}/apply",
         json={'plan_hash': report['plan_hash']},
         headers={'X-CSRF-Token': csrf_token(client)})
+
+
+def test_apply_database_round_trips_remain_bounded(logged_in_client):
+    """Protect the production-sized Apply path from per-identity SELECT loops."""
+    setup_route()
+    student_count = 120
+    transportation = ''.join(
+        transport_v2_row(
+            f'{index:04d}', first=f'Student{index}', last='LoadTest')
+        for index in range(1, student_count + 1)
+    )
+    contacts = ''.join(
+        contact_row(
+            f'{index:04d}', contact=f'C-{index}',
+            first=f'Guardian{index}', email=f'g{index}@example.test')
+        for index in range(1, student_count + 1)
+    )
+    preview_response = preview_v2(
+        logged_in_client, transportation, contacts)
+    assert preview_response.status_code == 200
+    report = preview_response.get_json()
+
+    statements = 0
+    verbs = {}
+
+    def count_statement(_conn, _cursor, statement, *_args, **_kwargs):
+        nonlocal statements
+        statements += 1
+        verb = statement.lstrip().split(None, 1)[0].upper()
+        verbs[verb] = verbs.get(verb, 0) + 1
+
+    with application.app.app_context():
+        engine = application.db.engine
+        event.listen(engine, 'before_cursor_execute', count_statement)
+    try:
+        response = apply_batch(logged_in_client, report)
+    finally:
+        event.remove(engine, 'before_cursor_execute', count_statement)
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert statements <= (14 * student_count) + 80, statements
+    assert verbs.get('SELECT', 0) <= 80, verbs
+    assert verbs.get('UPDATE', 0) <= 10, verbs
+
+
+def test_apply_treats_lost_commit_ack_as_success(
+        logged_in_client, monkeypatch):
+    setup_route()
+    report = preview_v2(
+        logged_in_client, transport_v2_row(),
+        contact_row()).get_json()
+    original_commit = application.db.session.commit
+    calls = {'count': 0}
+
+    def commit_then_lose_ack():
+        calls['count'] += 1
+        original_commit()
+        if calls['count'] == 2:
+            raise RuntimeError('synthetic lost commit acknowledgement')
+
+    monkeypatch.setattr(
+        application.db.session, 'commit', commit_then_lose_ack)
+    response = apply_batch(logged_in_client, report)
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert calls['count'] >= 3
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        assert batch.status == 'applied'
+        assert batch.applied_at is not None
+        assert application.NotificationSubscriber.query.count() == 1
+        assert application.ImportChange.query.filter_by(
+            batch_id=batch.id).count() > 0
+
+
+def test_recovery_command_closes_clean_interruption_and_preserves_evidence(
+        logged_in_client):
+    setup_route()
+    report = preview_v2(
+        logged_in_client, transport_v2_row(),
+        contact_row()).get_json()
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        batch.status = 'applying'
+        application.db.session.commit()
+
+    runner = application.app.test_cli_runner()
+    dry_run = runner.invoke(args=[
+        'recover-powerschool-apply', report['batch_id'],
+    ])
+    assert dry_run.exit_code == 0, dry_run.output
+    proof = json.loads(dry_run.output)
+    assert proof['recoverable'] is True
+    assert proof['prestate_mismatches'] == 0
+
+    recovered = runner.invoke(args=[
+        'recover-powerschool-apply', report['batch_id'],
+        '--apply', '--manifest-sha', proof['manifest_sha256'],
+        '--expected-plan-hash', proof['plan_hash'],
+        '--expected-file-sha', proof['file_sha256'],
+        '--expected-selected', str(proof['selected_rows']),
+        '--approved-by', 'admin', '--confirm-worker-stopped',
+    ])
+    assert recovered.exit_code == 0, recovered.output
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        assert batch.status == 'failed'
+        assert application.ImportRow.query.filter_by(
+            batch_id=batch.id).count() == batch.total_rows
+        assert application.ImportFile.query.filter_by(
+            batch_id=batch.id).count() == 2
+        assert application.NotificationSubscriber.query.count() == 0
+        assert application.AuditLog.query.filter_by(
+            action='powerschool_import_apply_recovered',
+            target=batch.public_id).count() == 1
+
+    reanalysis = preview_v2(
+        logged_in_client, transport_v2_row(), contact_row())
+    assert reanalysis.status_code == 200
+
+
+def test_recovery_command_fails_closed_when_any_change_exists(
+        logged_in_client):
+    setup_route()
+    report = preview_v2(
+        logged_in_client, transport_v2_row(),
+        contact_row()).get_json()
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        row = application.ImportRow.query.filter_by(batch_id=batch.id).first()
+        batch.status = 'applying'
+        application.db.session.add(application.ImportChange(
+            batch_id=batch.id, row_id=row.id, operation='create',
+            target_table='notification_subscriber', target_id=999))
+        application.db.session.commit()
+
+    runner = application.app.test_cli_runner()
+    result = runner.invoke(args=[
+        'recover-powerschool-apply', report['batch_id'],
+    ])
+    assert result.exit_code == 0, result.output
+    proof = json.loads(result.output)
+    assert proof['recoverable'] is False
+    assert proof['durable_state'] == 'inconsistent'
+    with application.app.app_context():
+        assert application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one().status == 'applying'
+
+
+@pytest.mark.parametrize('processing_status', ['selecting', 'applying'])
+def test_cleanup_closes_expired_clean_processing_claims(
+        logged_in_client, processing_status):
+    setup_route()
+    report = preview_v2(
+        logged_in_client, transport_v2_row(), contact_row()).get_json()
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        batch.status = processing_status
+        batch.expires_at = application._utcnow() - timedelta(hours=1)
+        application.db.session.commit()
+
+        application._cleanup_import_stages()
+
+        batch = application.db.session.get(application.ImportBatch, batch.id)
+        assert batch.status == 'expired'
+        assert application.ImportRow.query.filter_by(
+            batch_id=batch.id).count() == 0
+        assert application.ImportFile.query.filter_by(
+            batch_id=batch.id).count() == 0
+        assert application.NotificationSubscriber.query.count() == 0
+
+
+def test_cleanup_returns_expired_rollback_claim_to_retryable_failure(
+        logged_in_client):
+    setup_route()
+    report = preview_v2(
+        logged_in_client, transport_v2_row(), contact_row()).get_json()
+    assert apply_batch(logged_in_client, report).status_code == 200
+    with application.app.app_context():
+        batch = application.ImportBatch.query.filter_by(
+            public_id=report['batch_id']).one()
+        batch.status = 'rolling_back'
+        batch.expires_at = application._utcnow() - timedelta(hours=1)
+        application.db.session.commit()
+
+        application._cleanup_import_stages()
+
+        batch = application.db.session.get(application.ImportBatch, batch.id)
+        assert batch.status == 'rollback_failed'
+        assert application.ImportChange.query.filter_by(
+            batch_id=batch.id).count() > 0
+        assert application.NotificationSubscriber.query.count() == 1
 
 
 def test_powerschool_new_apply_is_idempotent_reported_and_rollbackable(logged_in_client):
@@ -796,11 +994,11 @@ def test_apply_rechecks_expiry_after_claim(logged_in_client, monkeypatch):
     original = application._expire_powerschool_stage
     calls = {'count': 0}
 
-    def expire_after_claim(batch):
+    def expire_after_claim(batch, processing_owner=False):
         calls['count'] += 1
         if calls['count'] == 2:
             batch.expires_at = application._utcnow() - timedelta(seconds=1)
-        return original(batch)
+        return original(batch, processing_owner=processing_owner)
 
     monkeypatch.setattr(
         application, '_expire_powerschool_stage', expire_after_claim)

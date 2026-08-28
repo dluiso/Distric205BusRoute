@@ -4317,10 +4317,13 @@ def _purge_import_raw_files(batch):
     return failures
 
 
-def _expire_powerschool_stage(batch):
+def _expire_powerschool_stage(batch, processing_owner=False):
     """Expire one owned PowerSchool stage before it can mutate the roster."""
+    expirable_statuses = {'staged'}
+    if processing_owner:
+        expirable_statuses.update({'selecting', 'applying'})
     if (batch.source_type != 'powerschool'
-            or batch.status not in {'staged', 'selecting', 'applying'}
+            or batch.status not in expirable_statuses
             or batch.expires_at > _utcnow()):
         return False
     cleanup_failures = _purge_import_raw_files(batch)
@@ -4349,25 +4352,85 @@ def _active_powerschool_roster_exists():
     ).first() is not None
 
 
+def _recover_abandoned_import_processing(now):
+    """Close expired worker claims only while the roster mutex is free.
+
+    Apply and rollback hold the same cross-worker mutex for their full
+    request. Acquiring it here proves that no live mutation still owns the
+    claim. Ambiguous Apply evidence remains untouched for manual recovery.
+    """
+    processing_grace = now - timedelta(minutes=15)
+    candidate_ids = [batch_id for (batch_id,) in db.session.query(
+        ImportBatch.id,
+    ).filter(
+        ImportBatch.expires_at <= processing_grace,
+        ImportBatch.status.in_(['selecting', 'applying', 'rolling_back']),
+    ).all()]
+    if not candidate_ids:
+        return
+    with _roster_import_lock() as acquired:
+        if not acquired:
+            return
+        candidates = ImportBatch.query.filter(
+            ImportBatch.id.in_(candidate_ids),
+            ImportBatch.expires_at <= processing_grace,
+            ImportBatch.status.in_(['selecting', 'applying', 'rolling_back']),
+        ).with_for_update().all()
+        changed = False
+        for batch in candidates:
+            metadata = _import_metadata(batch)
+            if batch.status == 'selecting':
+                batch.status = 'expired'
+                action = 'powerschool_import_selection_abandoned'
+                details = 'Expired selection claim closed after worker exit.'
+            elif batch.status == 'rolling_back':
+                # A successful compensating commit stores `rolled_back` in
+                # the same transaction. A durable `rolling_back` claim means
+                # the compensating transaction did not commit.
+                batch.status = 'rollback_failed'
+                metadata['rollback_failure'] = (
+                    'Worker exited before the atomic rollback commit.')
+                batch.metadata_json = json.dumps(metadata, sort_keys=True)
+                action = 'powerschool_import_rollback_abandoned'
+                details = 'Rollback transaction did not commit; retry remains available.'
+            else:
+                durable_state, _, _ = _powerschool_apply_durable_state(
+                    batch.id, batch.selected_rows)
+                if durable_state == 'clean_interruption':
+                    batch.status = 'failed'
+                    metadata['failure'] = (
+                        'Worker exited before the atomic Apply commit.')
+                    batch.metadata_json = json.dumps(metadata, sort_keys=True)
+                    action = 'powerschool_import_apply_abandoned'
+                    details = 'Apply transaction did not commit; reanalysis is required.'
+                else:
+                    if metadata.get('processing_cleanup_alerted_at'):
+                        continue
+                    metadata['processing_cleanup_alerted_at'] = (
+                        now.isoformat() + 'Z')
+                    batch.metadata_json = json.dumps(metadata, sort_keys=True)
+                    action = 'powerschool_import_processing_inconsistent'
+                    details = (
+                        'Expired Apply claim has inconsistent durable evidence; '
+                        'no status or roster data was changed.')
+            db.session.add(AuditLog(
+                username='system', action=action, module='notifications',
+                target=batch.public_id, details=details,
+                ip_address='background'))
+            changed = True
+        if changed:
+            db.session.commit()
+
+
 def _cleanup_import_stages():
     now = _utcnow()
-    processing_grace = now - timedelta(minutes=15)
+    _recover_abandoned_import_processing(now)
     expired = ImportBatch.query.filter(
-        or_(
-            and_(
-                ImportBatch.expires_at <= now,
-                ImportBatch.status.in_([
-                    'staged', 'blocked', 'applied', 'failed', 'expired',
-                    'rollback_failed', 'rolled_back', 'retention_closed',
-                ]),
-            ),
-            and_(
-                ImportBatch.expires_at <= processing_grace,
-                ImportBatch.status.in_([
-                    'selecting', 'applying', 'rolling_back',
-                ]),
-            ),
-        ),
+        ImportBatch.expires_at <= now,
+        ImportBatch.status.in_([
+            'staged', 'blocked', 'applied', 'failed', 'expired',
+            'rollback_failed', 'rolled_back', 'retention_closed',
+        ]),
     ).all()
     for batch in expired:
         failures = _purge_import_raw_files(batch)
@@ -4909,6 +4972,10 @@ def _subscriber_snapshot(subscriber, contact_identities=None):
                                               ExternalIdentity.external_key).all()
         else:
             identities = contact_identities.get(contact.id, [])
+        identities = sorted(
+            identities,
+            key=lambda item: (item.entity_type, item.external_key),
+        )
         contacts.append({
             'id': contact.id, 'first_name': contact.first_name,
             'last_name': contact.last_name, 'email': contact.email,
@@ -5010,7 +5077,9 @@ def _subscriber_group_matches_snapshot(group, expected,
     return all(current.get(key) == value for key, value in expected.items())
 
 
-def _powerschool_identity(entity_type, external_key):
+def _powerschool_identity(entity_type, external_key, identity_cache=None):
+    if identity_cache is not None:
+        return identity_cache.get((entity_type, external_key))
     return ExternalIdentity.query.filter_by(
         source_type='powerschool', entity_type=entity_type,
         external_key=external_key).first()
@@ -5046,7 +5115,9 @@ def _powerschool_bus_for_route(prefix, number, period=None):
     index = getattr(g, cache_key, None) if has_request_context() else None
     if index is None:
         index = {}
-        for bus in Bus.query.filter(Bus.active.is_(True)).order_by(Bus.id).all():
+        for bus in Bus.query.options(
+                selectinload(Bus.schedule_assignments),
+        ).filter(Bus.active.is_(True)).order_by(Bus.id).all():
             parsed = normalize_route(f'{bus.identifier or ""} {bus.name or ""}')
             if not parsed:
                 continue
@@ -5067,7 +5138,8 @@ def _powerschool_bus_for_route(prefix, number, period=None):
     return None
 
 
-def _powerschool_group(proposal, create=False):
+def _powerschool_group(proposal, create=False, assignment_index=None,
+                       schedule_types_by_name=None):
     assignments = proposal.get('assignments') or []
     if not assignments:
         return None, False, 'The proposal contains no bus assignments.'
@@ -5077,9 +5149,15 @@ def _powerschool_group(proposal, create=False):
     if unknown_periods:
         return None, False, 'One or more normalized periods are not configured.'
     desired_names = {period_map[item] for item in raw_periods if item in period_map}
-    types = BusScheduleType.query.filter(
-        BusScheduleType.name.in_(desired_names)).all() if desired_names else []
-    types_by_name = {item.name: item for item in types}
+    if schedule_types_by_name is None:
+        types = BusScheduleType.query.filter(
+            BusScheduleType.name.in_(desired_names)).all() if desired_names else []
+        types_by_name = {item.name: item for item in types}
+    else:
+        types_by_name = {
+            name: schedule_types_by_name[name]
+            for name in desired_names if name in schedule_types_by_name
+        }
     if len(types_by_name) != len(desired_names):
         return None, False, 'One or more normalized periods are not configured.'
 
@@ -5119,13 +5197,20 @@ def _powerschool_group(proposal, create=False):
             if schedule_type_id is None or bus_id not in all_period_bus_ids
         }
 
-    for group in SubscriberGroup.query.order_by(SubscriberGroup.id).all():
-        group_assignments = {
-            (item.bus_id, item.schedule_type_id)
-            for item in group.bus_assignments
-        }
-        if group_assignments and group_assignments == desired_assignments:
+    assignment_key = tuple(sorted(
+        desired_assignments, key=lambda value: (value[0], value[1] or 0)))
+    if assignment_index is not None:
+        group = assignment_index.get(assignment_key)
+        if group:
             return group, False, None
+    else:
+        for group in SubscriberGroup.query.order_by(SubscriberGroup.id).all():
+            group_assignments = {
+                (item.bus_id, item.schedule_type_id)
+                for item in group.bus_assignments
+            }
+            if group_assignments and group_assignments == desired_assignments:
+                return group, False, None
 
     buses = {bus.id: bus for _, bus in resolved}
     if len(buses) == 1:
@@ -5167,6 +5252,8 @@ def _powerschool_group(proposal, create=False):
             group_id=group.id, bus_id=bus_id,
             schedule_type_id=schedule_type_id))
     db.session.flush()
+    if assignment_index is not None:
+        assignment_index[assignment_key] = group
     return group, True, None
 
 
@@ -6830,6 +6917,7 @@ def powerschool_import_batch(public_id):
            methods=['POST'])
 @login_required
 @require_capability('import.powerschool')
+@_serialized_roster_mutation('json')
 def powerschool_import_selection(public_id):
     _powerschool_enabled()
     batch = _owned_powerschool_batch(public_id)
@@ -6869,7 +6957,7 @@ def powerschool_import_selection(public_id):
         return jsonify({'ok': False, 'message':
                         'The batch is being changed by another request.'}), 409
     batch = db.session.get(ImportBatch, batch.id)
-    if _expire_powerschool_stage(batch):
+    if _expire_powerschool_stage(batch, processing_owner=True):
         return jsonify({'ok': False, 'status': 'expired', 'message':
                         'This staged analysis expired during selection. '
                         'Analyze the three files again.'}), 410
@@ -6973,8 +7061,11 @@ def powerschool_import_selection(public_id):
 
 
 def _ensure_external_identity(batch, row, entity_type, external_key,
-                              local_table, local_id):
-    identity = _powerschool_identity(entity_type, external_key)
+                              local_table, local_id, identity_cache=None,
+                              contact_identities=None,
+                              pending_changes=None):
+    identity = _powerschool_identity(
+        entity_type, external_key, identity_cache)
     if identity:
         if identity.local_table != local_table or identity.local_id != local_id:
             raise ValueError('An external identity changed after preview.')
@@ -6989,17 +7080,36 @@ def _ensure_external_identity(batch, row, entity_type, external_key,
         source_type='powerschool', entity_type=entity_type,
         external_key=external_key, local_table=local_table, local_id=local_id)
     db.session.add(identity)
-    db.session.flush()
-    db.session.add(ImportChange(
-        batch_id=batch.id, row_id=row.id, operation='create',
-        target_table='external_identity', target_id=identity.id,
-        after_json=json.dumps({'entity_type': entity_type,
-                               'external_key': external_key}, sort_keys=True)))
+    if identity_cache is not None:
+        identity_cache[(entity_type, external_key)] = identity
+    if contact_identities is not None and local_table == 'subscriber_contact':
+        contact_identities.setdefault(local_id, []).append(identity)
+    if pending_changes is not None:
+        pending_changes.append((identity, entity_type, external_key))
+    else:
+        db.session.flush()
+        db.session.add(ImportChange(
+            batch_id=batch.id, row_id=row.id, operation='create',
+            target_table='external_identity', target_id=identity.id,
+            after_json=json.dumps({'entity_type': entity_type,
+                                   'external_key': external_key}, sort_keys=True)))
     return identity
 
 
-def _apply_powerschool_proposal(batch, row, proposal, created_groups):
-    identity = _powerschool_identity('student', proposal['student_number'])
+def _apply_powerschool_proposal(
+        batch, row, proposal, created_groups, identity_cache=None,
+        contact_identities=None, assignment_index=None,
+        schedule_types_by_name=None):
+    """Prepare one proposal without issuing per-row identity flushes.
+
+    Apply prepares every selected proposal first, flushes all subscribers and
+    contacts together, then attaches identities and records immutable changes.
+    Keeping those phases inside the request's single transaction preserves the
+    existing all-or-nothing behavior while avoiding thousands of database
+    round trips for district-sized imports.
+    """
+    identity = _powerschool_identity(
+        'student', proposal['student_number'], identity_cache)
     subscriber = None
     if identity:
         identity_subscriber = db.session.get(
@@ -7009,10 +7119,14 @@ def _apply_powerschool_proposal(batch, row, proposal, created_groups):
             raise ValueError(
                 'A student identity belongs to a stale enrollment incarnation.')
         subscriber = identity_subscriber
-    current_snapshot = _subscriber_snapshot(subscriber) if subscriber else None
+    current_snapshot = (
+        _subscriber_snapshot(subscriber, contact_identities)
+        if subscriber else None)
     if _snapshot_hash(current_snapshot) != proposal.get('expected_state_hash'):
         raise ValueError('An enrollment changed after preview; analyze the files again.')
-    group, created, group_error = _powerschool_group(proposal, create=True)
+    group, created, group_error = _powerschool_group(
+        proposal, create=True, assignment_index=assignment_index,
+        schedule_types_by_name=schedule_types_by_name)
     if group_error:
         raise ValueError(group_error)
     if created and group.id not in created_groups:
@@ -7026,15 +7140,16 @@ def _apply_powerschool_proposal(batch, row, proposal, created_groups):
     if not subscriber:
         subscriber = NotificationSubscriber(active=True)
         db.session.add(subscriber)
-        db.session.flush()
     subscriber.group_id = group.id
     subscriber.notes = _powerschool_household_label(proposal)
     subscriber.active = True
     specs = _powerschool_contact_specs(proposal)
+    prepared_contacts = []
     for index, spec in enumerate(specs):
         mapped = []
         for entity_type, external_key in spec['identities']:
-            contact_identity = _powerschool_identity(entity_type, external_key)
+            contact_identity = _powerschool_identity(
+                entity_type, external_key, identity_cache)
             if contact_identity:
                 contact = db.session.get(SubscriberContact,
                                          contact_identity.local_id)
@@ -7045,30 +7160,348 @@ def _apply_powerschool_proposal(batch, row, proposal, created_groups):
         if mapped and len({item.id for item in mapped}) != 1:
             raise ValueError('Contact identities no longer resolve consistently.')
         if not contact:
-            contact = SubscriberContact(subscriber_id=subscriber.id)
+            contact = SubscriberContact(subscriber=subscriber)
             db.session.add(contact)
-            db.session.flush()
         contact.first_name = spec['first_name'] or None
         contact.last_name = spec['last_name'] or None
         contact.email = spec['email'] or None
         contact.phone = spec['phone'] or None
         contact.role = spec['role']
         contact.sort_order = index
+        prepared_contacts.append((spec, contact))
+
+    return {
+        'row': row,
+        'proposal': proposal,
+        'subscriber': subscriber,
+        'current_snapshot': current_snapshot,
+        'operation': operation,
+        'contacts': prepared_contacts,
+        'pending_identity_changes': [],
+    }
+
+
+def _attach_powerschool_proposal_identities(
+        batch, prepared, identity_cache, contact_identities):
+    """Attach identities after the global subscriber/contact flush."""
+    row = prepared['row']
+    proposal = prepared['proposal']
+    pending = prepared['pending_identity_changes']
+    for spec, contact in prepared['contacts']:
         for entity_type, external_key in spec['identities']:
             _ensure_external_identity(
                 batch, row, entity_type, external_key,
-                'subscriber_contact', contact.id)
+                'subscriber_contact', contact.id,
+                identity_cache=identity_cache,
+                contact_identities=contact_identities,
+                pending_changes=pending)
     _ensure_external_identity(
         batch, row, 'student', proposal['student_number'],
-        'notification_subscriber', subscriber.id)
-    db.session.flush()
-    after_snapshot = _subscriber_snapshot(subscriber)
+        'notification_subscriber', prepared['subscriber'].id,
+        identity_cache=identity_cache,
+        contact_identities=contact_identities,
+        pending_changes=pending)
+
+
+def _record_powerschool_proposal_changes(
+        batch, prepared, contact_identities):
+    """Record immutable changes after every new identity has an ID."""
+    row = prepared['row']
+    for external_identity, entity_type, external_key in prepared[
+            'pending_identity_changes']:
+        db.session.add(ImportChange(
+            batch_id=batch.id, row_id=row.id, operation='create',
+            target_table='external_identity', target_id=external_identity.id,
+            after_json=json.dumps({'entity_type': entity_type,
+                                   'external_key': external_key}, sort_keys=True)))
+    subscriber = prepared['subscriber']
+    after_snapshot = _subscriber_snapshot(subscriber, contact_identities)
     db.session.add(ImportChange(
-        batch_id=batch.id, row_id=row.id, operation=operation,
+        batch_id=batch.id, row_id=row.id, operation=prepared['operation'],
         target_table='notification_subscriber', target_id=subscriber.id,
-        before_json=(json.dumps(current_snapshot, sort_keys=True)
-                     if current_snapshot else None),
+        before_json=(json.dumps(prepared['current_snapshot'], sort_keys=True)
+                     if prepared['current_snapshot'] else None),
         after_json=json.dumps(after_snapshot, sort_keys=True)))
+
+
+def _powerschool_apply_durable_state(batch_id, expected_selected=None):
+    """Classify the durable result after an Apply transaction error."""
+    batch = db.session.get(ImportBatch, batch_id)
+    if not batch:
+        return 'inconsistent', None, {'changes': 0}
+    changes = ImportChange.query.filter_by(batch_id=batch.id).count()
+    metadata = _import_metadata(batch)
+    summary = metadata.get('applied_summary')
+    selected_matches = (
+        expected_selected is None
+        or (isinstance(summary, dict)
+            and summary.get('selected') == expected_selected)
+    )
+    if (batch.status == 'applied'
+            and batch.applied_at is not None
+            and isinstance(summary, dict)
+            and summary.get('changes') == changes
+            and selected_matches):
+        return 'applied', batch, {'changes': changes}
+    if (batch.status == 'applying'
+            and batch.applied_at is None
+            and changes == 0
+            and summary is None):
+        return 'clean_interruption', batch, {'changes': 0}
+    return 'inconsistent', batch, {'changes': changes}
+
+
+def _powerschool_apply_recovery_summary(batch):
+    """Build an aggregate, PII-safe proof for an interrupted Apply."""
+    durable_state, _, durable = _powerschool_apply_durable_state(
+        batch.id, batch.selected_rows)
+    rows = ImportRow.query.filter_by(batch_id=batch.id).order_by(
+        ImportRow.row_number).all()
+    selected = [row for row in rows if row.selected]
+    recalculated_plan_hash = canonical_plan_hash(
+        batch.public_id, batch.schema_version,
+        _powerschool_row_records(batch))
+    plan_intact = hmac.compare_digest(
+        str(batch.plan_hash or ''), recalculated_plan_hash)
+    counts_intact = (
+        batch.total_rows == len(rows)
+        and batch.selected_rows == len(selected)
+        and batch.rejected_rows
+        == sum(row.classification == 'rejected' for row in rows)
+        and batch.excluded_rows
+        == len(rows) - len(selected)
+        - sum(row.classification == 'rejected' for row in rows)
+    )
+
+    files = ImportFile.query.filter_by(batch_id=batch.id).order_by(
+        ImportFile.file_type).all()
+    file_evidence_intact = bool(files)
+    for stored in files:
+        if not os.path.isfile(stored.storage_path):
+            file_evidence_intact = False
+            continue
+        digest = hashlib.sha256()
+        with open(stored.storage_path, 'rb') as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(chunk)
+        if (digest.hexdigest() != stored.sha256
+                or os.path.getsize(stored.storage_path) != stored.byte_size):
+            file_evidence_intact = False
+
+    identities = ExternalIdentity.query.filter_by(
+        source_type='powerschool').with_for_update().all()
+    identity_cache = {
+        (identity.entity_type, identity.external_key): identity
+        for identity in identities
+    }
+    target_ids = {
+        identity.local_id for identity in identities
+        if identity.entity_type == 'student'
+        and identity.local_table == 'notification_subscriber'
+    }
+    proposals = []
+    malformed_rows = 0
+    for row in selected:
+        try:
+            proposal = json.loads(row.normalized_json)
+            proposals.append((row, proposal))
+            target_id = proposal.get('target_subscriber_id')
+            if target_id is not None:
+                target_ids.add(int(target_id))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            malformed_rows += 1
+
+    subscribers = (
+        NotificationSubscriber.query.options(
+            selectinload(NotificationSubscriber.contacts),
+        ).filter(NotificationSubscriber.id.in_(target_ids)).with_for_update().all()
+        if target_ids else []
+    )
+    if target_ids:
+        SubscriberContact.query.filter(
+            SubscriberContact.subscriber_id.in_(target_ids),
+        ).with_for_update().all()
+    subscribers_by_id = {subscriber.id: subscriber for subscriber in subscribers}
+    contact_identities = {}
+    for identity in identities:
+        if identity.local_table == 'subscriber_contact':
+            contact_identities.setdefault(identity.local_id, []).append(identity)
+
+    prestate_mismatches = malformed_rows
+    for row, proposal in proposals:
+        subscriber = None
+        if row.classification in {'new', 'update'}:
+            identity = identity_cache.get(
+                ('student', str(proposal.get('student_number') or '')))
+            if identity:
+                subscriber = subscribers_by_id.get(identity.local_id)
+                if not _powerschool_subscriber_identity_current(
+                        identity, subscriber):
+                    prestate_mismatches += 1
+                    continue
+        elif row.classification == 'deactivate_candidate':
+            try:
+                subscriber = subscribers_by_id.get(
+                    int(proposal.get('target_subscriber_id')))
+            except (TypeError, ValueError):
+                prestate_mismatches += 1
+                continue
+        else:
+            prestate_mismatches += 1
+            continue
+        current = (_subscriber_snapshot(subscriber, contact_identities)
+                   if subscriber else None)
+        if _snapshot_hash(current) != proposal.get('expected_state_hash'):
+            prestate_mismatches += 1
+
+    applied_audits = AuditLog.query.filter_by(
+        action='powerschool_import_applied', target=batch.public_id).count()
+    cutover_error = _legacy_cutover_apply_error(batch)
+    recoverable = bool(
+        durable_state == 'clean_interruption'
+        and durable['changes'] == 0
+        and applied_audits == 0
+        and plan_intact
+        and counts_intact
+        and file_evidence_intact
+        and len(selected) > 0
+        and prestate_mismatches == 0
+        and cutover_error is None
+    )
+    proof = {
+        'batch_id': batch.public_id,
+        'status': batch.status,
+        'durable_state': durable_state,
+        'plan_hash': batch.plan_hash,
+        'file_sha256': batch.file_sha256,
+        'total_rows': len(rows),
+        'selected_rows': len(selected),
+        'changes': durable['changes'],
+        'applied_audits': applied_audits,
+        'prestate_mismatches': prestate_mismatches,
+        'plan_intact': plan_intact,
+        'counts_intact': counts_intact,
+        'file_evidence_intact': file_evidence_intact,
+        'cutover_intact': cutover_error is None,
+        'recoverable': recoverable,
+    }
+    proof['manifest_sha256'] = hashlib.sha256(json.dumps(
+        proof, ensure_ascii=False, sort_keys=True,
+        separators=(',', ':')).encode('utf-8')).hexdigest()
+    return proof
+
+
+@app.cli.command('recover-powerschool-apply')
+@click.argument('batch_public_id')
+@click.option('--apply', 'apply_changes', is_flag=True,
+              help='Mark a proven clean interruption failed so it can be reanalyzed.')
+@click.option('--manifest-sha', default=None,
+              help='Exact recovery manifest SHA-256 printed by the dry-run.')
+@click.option('--expected-plan-hash', default=None)
+@click.option('--expected-file-sha', default=None)
+@click.option('--expected-selected', type=click.IntRange(min=1), default=None)
+@click.option('--approved-by', default=None,
+              help='Username of the active administrator approving recovery.')
+@click.option('--confirm-worker-stopped', is_flag=True,
+              help='Confirm the interrupted worker/transaction no longer exists.')
+def recover_powerschool_apply_command(
+        batch_public_id, apply_changes, manifest_sha, expected_plan_hash,
+        expected_file_sha, expected_selected, approved_by,
+        confirm_worker_stopped):
+    """Prove and close one Apply interrupted before its atomic commit."""
+    with _roster_import_lock() as acquired:
+        if not acquired:
+            raise click.ClickException(
+                'Another roster mutation is in progress; try again later.')
+        try:
+            batch = ImportBatch.query.filter_by(
+                public_id=batch_public_id,
+                source_type='powerschool',
+            ).with_for_update().first()
+            if not batch:
+                raise ValueError('The PowerSchool batch was not found.')
+            proof = _powerschool_apply_recovery_summary(batch)
+            if not apply_changes:
+                db.session.rollback()
+                click.echo(json.dumps(proof, sort_keys=True))
+                return
+
+            required = {
+                '--manifest-sha': manifest_sha,
+                '--expected-plan-hash': expected_plan_hash,
+                '--expected-file-sha': expected_file_sha,
+                '--expected-selected': expected_selected,
+                '--approved-by': approved_by,
+            }
+            missing = [name for name, value in required.items()
+                       if value is None or value == '']
+            if missing or not confirm_worker_stopped:
+                raise ValueError(
+                    'Apply recovery requires every dry-run pin, an approver, '
+                    'and --confirm-worker-stopped.')
+            for label, value in (
+                    ('manifest', manifest_sha),
+                    ('plan', expected_plan_hash),
+                    ('file', expected_file_sha)):
+                if not re.fullmatch(r'[0-9a-fA-F]{64}', str(value)):
+                    raise ValueError(f'The expected {label} SHA-256 is invalid.')
+            if not proof['recoverable']:
+                raise ValueError(
+                    'The batch is not a proven clean interruption; leave it '
+                    'unchanged for manual review.')
+            pins_match = (
+                hmac.compare_digest(
+                    proof['manifest_sha256'], str(manifest_sha).lower())
+                and hmac.compare_digest(
+                    proof['plan_hash'], str(expected_plan_hash).lower())
+                and hmac.compare_digest(
+                    proof['file_sha256'], str(expected_file_sha).lower())
+                and proof['selected_rows'] == expected_selected
+            )
+            if not pins_match:
+                raise ValueError('The recovery proof changed after approval.')
+            approver = User.query.filter_by(
+                username=str(approved_by), active=True,
+            ).with_for_update().first()
+            approver_group = None
+            if approver and approver.group_id:
+                approver_group = UserGroup.query.filter_by(
+                    id=approver.group_id, is_admin=True,
+                ).with_for_update().first()
+            if not approver or not approver_group:
+                raise ValueError(
+                    'The approving username is not an active administrator.')
+
+            now = _utcnow()
+            metadata = _import_metadata(batch)
+            metadata['apply_recovery'] = {
+                'reason': 'worker_interrupted_before_atomic_commit',
+                'manifest_sha256': proof['manifest_sha256'],
+                'approved_by_id': approver.id,
+                'recovered_at': now.isoformat() + 'Z',
+            }
+            batch.status = 'failed'
+            batch.metadata_json = json.dumps(metadata, sort_keys=True)
+            db.session.add(AuditLog(
+                user_id=approver.id, username=approver.username,
+                action='powerschool_import_apply_recovered',
+                module='notifications', target=batch.public_id,
+                details=(
+                    f'clean_interruption; selected={proof["selected_rows"]}; '
+                    f'manifest_sha256={proof["manifest_sha256"]}'
+                ),
+                ip_address='cli', created_at=now,
+            ))
+            db.session.commit()
+            click.echo(json.dumps({
+                **proof, 'status': 'failed', 'recovered': True,
+            }, sort_keys=True))
+        except ValueError as exc:
+            db.session.rollback()
+            raise click.ClickException(str(exc)) from exc
+        except Exception:
+            db.session.rollback()
+            raise
 
 
 @app.route('/admin/notifications/powerschool/batch/<public_id>/apply',
@@ -7078,6 +7511,9 @@ def _apply_powerschool_proposal(batch, row, proposal, created_groups):
 @_serialized_roster_mutation('json')
 def powerschool_import_apply(public_id):
     _powerschool_enabled()
+    actor_id = current_user.id
+    actor_username = current_user.username
+    actor_ip = request.remote_addr or '0.0.0.0'
     payload = request.get_json(silent=True) or request.form
     plan_hash = str(payload.get('plan_hash', ''))
     batch = _owned_powerschool_batch(public_id)
@@ -7111,7 +7547,7 @@ def powerschool_import_apply(public_id):
         return jsonify({'ok': False, 'message':
                         'The batch is already being processed.'}), 409
     batch = db.session.get(ImportBatch, batch.id)
-    if _expire_powerschool_stage(batch):
+    if _expire_powerschool_stage(batch, processing_owner=True):
         return jsonify({'ok': False, 'status': 'expired', 'message':
                         'This staged analysis expired before Apply could '
                         'mutate the roster. Analyze the three files again.'}), 410
@@ -7152,32 +7588,80 @@ def powerschool_import_apply(public_id):
         locked_by_id = {
             subscriber.id: subscriber for subscriber in locked_subscribers
         }
-        locked_contact_identities = _contact_identity_map(
-            locked_subscribers, for_update=True)
+        locked_identities = ExternalIdentity.query.filter_by(
+            source_type='powerschool').with_for_update().all()
+        identity_cache = {
+            (identity.entity_type, identity.external_key): identity
+            for identity in locked_identities
+        }
+        contact_identities = {}
+        for identity in locked_identities:
+            if identity.local_table == 'subscriber_contact':
+                contact_identities.setdefault(
+                    identity.local_id, []).append(identity)
+        schedule_types_by_name = {
+            schedule_type.name: schedule_type
+            for schedule_type in BusScheduleType.query.all()
+        }
+        assignment_index = {}
+        groups = SubscriberGroup.query.options(
+            selectinload(SubscriberGroup.bus_assignments),
+        ).order_by(SubscriberGroup.id).all()
+        for group in groups:
+            assignment_key = tuple(sorted(
+                {
+                    (assignment.bus_id, assignment.schedule_type_id)
+                    for assignment in group.bus_assignments
+                },
+                key=lambda value: (value[0], value[1] or 0),
+            ))
+            if assignment_key:
+                assignment_index.setdefault(assignment_key, group)
 
+        prepared_proposals = []
+        prepared_deactivations = []
         for row, proposal in selected_items:
             if row.classification in {'new', 'update'}:
-                _apply_powerschool_proposal(
-                    batch, row, proposal, created_groups)
+                prepared_proposals.append(
+                    _apply_powerschool_proposal(
+                        batch, row, proposal, created_groups,
+                        identity_cache=identity_cache,
+                        contact_identities=contact_identities,
+                        assignment_index=assignment_index,
+                        schedule_types_by_name=schedule_types_by_name))
             elif row.classification == 'deactivate_candidate':
                 subscriber = locked_by_id.get(
                     int(proposal['target_subscriber_id']))
                 current = (_subscriber_snapshot(
-                    subscriber, locked_contact_identities)
+                    subscriber, contact_identities)
                     if subscriber else None)
                 if not subscriber or _snapshot_hash(current) != proposal.get(
                         'expected_state_hash'):
                     raise ValueError('A deactivation candidate changed after preview.')
                 subscriber.active = False
-                db.session.flush()
-                db.session.add(ImportChange(
-                    batch_id=batch.id, row_id=row.id, operation='deactivate',
-                    target_table='notification_subscriber', target_id=subscriber.id,
-                    before_json=json.dumps(current, sort_keys=True),
-                    after_json=json.dumps(_subscriber_snapshot(
-                        subscriber, locked_contact_identities), sort_keys=True)))
+                prepared_deactivations.append((row, subscriber, current))
             else:
                 raise ValueError('The staged selection contains a non-importable row.')
+
+        # Phase 1 assigns every new subscriber/contact ID in one unit-of-work
+        # flush. Phase 2 then creates every external identity and assigns those
+        # IDs in a second global flush. No operational row is committed until
+        # the immutable audit changes below are complete.
+        db.session.flush()
+        for prepared in prepared_proposals:
+            _attach_powerschool_proposal_identities(
+                batch, prepared, identity_cache, contact_identities)
+        db.session.flush()
+        for prepared in prepared_proposals:
+            _record_powerschool_proposal_changes(
+                batch, prepared, contact_identities)
+        for row, subscriber, current in prepared_deactivations:
+            db.session.add(ImportChange(
+                batch_id=batch.id, row_id=row.id, operation='deactivate',
+                target_table='notification_subscriber', target_id=subscriber.id,
+                before_json=json.dumps(current, sort_keys=True),
+                after_json=json.dumps(_subscriber_snapshot(
+                    subscriber, contact_identities), sort_keys=True)))
         batch.status = 'applied'
         batch.applied_at = _utcnow()
         metadata = _import_metadata(batch)
@@ -7188,22 +7672,61 @@ def powerschool_import_apply(public_id):
         batch.metadata_json = json.dumps(metadata, sort_keys=True)
         db.session.commit()
     except Exception as exc:
+        batch_id = batch.id
         db.session.rollback()
-        failed = db.session.get(ImportBatch, batch.id)
-        failed.status = 'failed'
-        metadata = _import_metadata(failed)
-        metadata['failure'] = str(exc)[:300]
-        failed.metadata_json = json.dumps(metadata, sort_keys=True)
-        db.session.commit()
-        _audit('powerschool_import_failed', 'notifications', public_id,
-               'Atomic transaction rolled back.')
-        return jsonify({'ok': False, 'message':
-                        'Import failed atomically; no selected changes were applied.'}), 409
+        db.session.remove()
+        try:
+            durable_state, durable_batch, _ = _powerschool_apply_durable_state(
+                batch_id, len(selected))
+        except Exception:
+            app.logger.exception(
+                'Could not classify the durable PowerSchool Apply result.')
+            return jsonify({'ok': False, 'message':
+                            'Apply ended in an unverified database state. '
+                            'Do not retry until an administrator runs the '
+                            'recovery proof.'}), 503
+        if durable_state == 'applied':
+            # PostgreSQL committed, but the client connection lost the commit
+            # acknowledgement. Continue the idempotent cleanup/audit path and
+            # report success instead of corrupting the durable status.
+            batch = durable_batch
+            app.logger.warning(
+                'PowerSchool Apply commit was confirmed after a request error.')
+        elif durable_state == 'clean_interruption':
+            failed = durable_batch
+            failed.status = 'failed'
+            metadata = _import_metadata(failed)
+            metadata['failure'] = (
+                f'{type(exc).__name__}: {str(exc)[:240]}')
+            failed.metadata_json = json.dumps(metadata, sort_keys=True)
+            db.session.add(AuditLog(
+                user_id=actor_id,
+                username=actor_username,
+                action='powerschool_import_failed',
+                module='notifications', target=public_id,
+                details='Atomic transaction rolled back.',
+                ip_address=actor_ip))
+            db.session.commit()
+            return jsonify({'ok': False, 'message':
+                            'Import failed atomically; no selected changes '
+                            'were applied. Analyze the files again.'}), 409
+        else:
+            app.logger.exception(
+                'PowerSchool Apply ended in an inconsistent durable state.')
+            return jsonify({'ok': False, 'message':
+                            'Apply ended in an unverified database state. '
+                            'Do not retry until an administrator runs the '
+                            'recovery proof.'}), 503
     cleanup_failures = _purge_import_raw_files(batch)
+    db.session.add(AuditLog(
+        user_id=actor_id, username=actor_username,
+        action='powerschool_import_applied', module='notifications',
+        target=public_id,
+        details=(f'{len(selected)} selected rows; '
+                 f'{batch.excluded_rows} excluded; '
+                 f'{batch.rejected_rows} rejected'),
+        ip_address=actor_ip))
     db.session.commit()
-    _audit('powerschool_import_applied', 'notifications', public_id,
-           f'{len(selected)} selected rows; {batch.excluded_rows} excluded; '
-           f'{batch.rejected_rows} rejected')
     return jsonify({
         'ok': True, 'cleanup_warnings': len(cleanup_failures),
         'batch': _powerschool_batch_payload(batch, include_rows=False),
