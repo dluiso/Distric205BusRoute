@@ -253,6 +253,7 @@ def test_dashboard_phase_three_and_four_ui_contracts():
         'dashboard-filter-toggle', 'dashboard-filter-panel',
         'dashboard-filter-count', 'dashboard-operations-header',
         'drawer-preview-recipients', 'dashboard-toast-region',
+        "static_asset_version('js/admin_dashboard.js')",
     ):
         assert contract in template
     for contract in (
@@ -264,3 +265,10 @@ def test_dashboard_phase_three_and_four_ui_contracts():
         assert contract in script
     assert 'data-contact-field="preferred_language"' in notifications
     assert 'edit-subscriber-school' in notifications
+
+
+def test_static_asset_version_changes_cache_key_without_path_escape():
+    version = application.static_asset_version('js/admin_dashboard.js')
+    assert version.isdigit()
+    assert version != '0'
+    assert application.static_asset_version('../app.py') == '0'

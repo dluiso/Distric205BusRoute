@@ -316,4 +316,4 @@
 }|tojson }}</script>
 {% endblock %}
 
-{% block scripts %}<script src="{{ url_for('static', filename='js/admin_dashboard.js') }}"></script>{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/admin_dashboard.js', v=static_asset_version('js/admin_dashboard.js')) }}"></script>{% endblock %}

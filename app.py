@@ -1102,6 +1102,19 @@ def _csrf_token():
         session['_csrf'] = secrets.token_hex(32)
     return session['_csrf']
 
+
+def static_asset_version(filename):
+    """Return a deployment-specific version for a template-owned static asset."""
+    static_root = os.path.realpath(
+        app.static_folder or os.path.join(BASE_DIR, 'static'))
+    asset_path = os.path.realpath(os.path.join(static_root, filename))
+    try:
+        if os.path.commonpath((static_root, asset_path)) != static_root:
+            return '0'
+        return str(os.stat(asset_path).st_mtime_ns)
+    except (OSError, ValueError):
+        return '0'
+
 app.jinja_env.globals.update(
     get_config=get_config,
     MODULES=MODULES,
@@ -1113,6 +1126,7 @@ app.jinja_env.globals.update(
     format_public_date=format_public_date,
     schedule_assignment_warning=schedule_assignment_warning,
     format_district_datetime=format_district_datetime,
+    static_asset_version=static_asset_version,
     csrf_token=_csrf_token,
 )
 
