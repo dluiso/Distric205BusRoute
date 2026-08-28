@@ -134,6 +134,8 @@ app.config['IMPORT_MAX_COLUMNS'] = _env_int('IMPORT_MAX_COLUMNS', 64, 1, 512)
 app.config['IMPORT_STAGE_TTL_HOURS'] = _env_int('IMPORT_STAGE_TTL_HOURS', 24, 1, 720)
 app.config['POWERSCHOOL_ROLLBACK_RETENTION_DAYS'] = _env_int(
     'POWERSCHOOL_ROLLBACK_RETENTION_DAYS', 30, 1, 365)
+app.config['BUS_TRASH_RETENTION_DAYS'] = _env_int(
+    'BUS_TRASH_RETENTION_DAYS', 90, 1, 3650)
 app.config['POWERSCHOOL_IMPORT_ENABLED'] = (
     os.environ.get('POWERSCHOOL_IMPORT_ENABLED', '0').strip().lower() in {'1', 'true', 'yes'})
 app.config['CSP_ENFORCE'] = (
@@ -384,6 +386,7 @@ CAPABILITIES = {
     'import.legacy':               {},
     'import.powerschool':          {},
     'import.rollback':             {},
+    'buses.purge':                 {},
 }
 
 MODULE_CAPABILITIES = {
@@ -525,12 +528,25 @@ class Bus(db.Model):
     description  = db.Column(db.Text)
     active       = db.Column(db.Boolean, default=True)
     created_at   = db.Column(db.DateTime, default=_utcnow)
+    updated_at   = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+    deactivated_at = db.Column(db.DateTime)
+    deactivated_by = db.Column(db.String(80))
+    deactivation_reason = db.Column(db.String(255))
+    deleted_at   = db.Column(db.DateTime, index=True)
+    deleted_by   = db.Column(db.String(80))
+    deletion_reason = db.Column(db.String(255))
     schedule_assignments = db.relationship('BusScheduleAssignment', backref='bus', lazy=True, cascade='all, delete-orphan')
     incident_records     = db.relationship('BusIncidentRecord', backref='bus', lazy=True)
     __table_args__ = (db.UniqueConstraint('identifier', 'name', name='uq_bus_identifier_name'),)
 
     @property
     def display_name(self): return f"{self.identifier} — {self.name}"
+
+    @property
+    def lifecycle_state(self):
+        if self.deleted_at is not None:
+            return 'trash'
+        return 'active' if self.active else 'inactive'
 
 
 class BusScheduleAssignment(db.Model):
@@ -1146,12 +1162,20 @@ def _migrate_bus_table():
         ]
         # Check if old constraint (only on identifier) still exists
         if {'identifier'} in unique_cols:
+            old_columns = [column['name'] for column in insp.get_columns('bus')]
             with db.engine.connect() as conn:
                 conn.execute(text('ALTER TABLE bus RENAME TO bus_old'))
                 conn.commit()
             db.create_all()  # creates bus with new schema
+            new_columns = {
+                column['name'] for column in sa_inspect(db.engine).get_columns('bus')
+            }
+            common_columns = [name for name in old_columns if name in new_columns]
+            quoted_columns = ', '.join(f'"{name}"' for name in common_columns)
             with db.engine.connect() as conn:
-                conn.execute(text('INSERT INTO bus SELECT * FROM bus_old'))
+                conn.execute(text(
+                    f'INSERT INTO bus ({quoted_columns}) '
+                    f'SELECT {quoted_columns} FROM bus_old'))
                 conn.execute(text('DROP TABLE bus_old'))
                 conn.commit()
             print('[Migration] bus table: unique constraint updated to (identifier, name)')
@@ -1198,6 +1222,13 @@ def _migrate_add_columns():
         ('import_batch',            'analysis_context_sha256','VARCHAR(64)'),
         ('incident_type',           'operational_priority',  'INTEGER NOT NULL DEFAULT 50'),
         ('bus_incident_record',     'request_token',         'VARCHAR(64)'),
+        ('bus',                     'updated_at',             'TIMESTAMP'),
+        ('bus',                     'deactivated_at',         'TIMESTAMP'),
+        ('bus',                     'deactivated_by',         'VARCHAR(80)'),
+        ('bus',                     'deactivation_reason',    'VARCHAR(255)'),
+        ('bus',                     'deleted_at',             'TIMESTAMP'),
+        ('bus',                     'deleted_by',             'VARCHAR(80)'),
+        ('bus',                     'deletion_reason',        'VARCHAR(255)'),
     ]
     # Use a separate connection per column so a failed ALTER TABLE (column already
     # exists) never leaves a shared connection in an aborted-transaction state.
@@ -1238,6 +1269,17 @@ def _migrate_add_columns():
                 'CREATE UNIQUE INDEX IF NOT EXISTS '
                 'uq_bus_incident_record_request_token '
                 'ON bus_incident_record (request_token)'))
+            conn.commit()
+    except Exception:
+        pass
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(text(
+                'CREATE INDEX IF NOT EXISTS ix_bus_deleted_at '
+                'ON bus (deleted_at)'))
+            conn.execute(text(
+                'UPDATE bus SET updated_at = created_at '
+                'WHERE updated_at IS NULL'))
             conn.commit()
     except Exception:
         pass
@@ -1597,6 +1639,7 @@ def _initialize_database_unlocked():
     from sqlalchemy import inspect as sa_inspect
     inspector = sa_inspect(db.engine)
     user_columns = {column['name'] for column in inspector.get_columns('user')}
+    bus_columns = {column['name'] for column in inspector.get_columns('bus')}
     import_batch_columns = {
         column['name'] for column in inspector.get_columns('import_batch')}
     throttle_columns = ({column['name'] for column in inspector.get_columns('login_throttle')}
@@ -1612,6 +1655,12 @@ def _initialize_database_unlocked():
         raise RuntimeError('Security schema migration did not complete; refusing to start.')
     if 'analysis_context_sha256' not in import_batch_columns:
         raise RuntimeError('PowerSchool import schema migration did not complete; refusing to start.')
+    if not {
+            'updated_at', 'deactivated_at', 'deactivated_by',
+            'deactivation_reason', 'deleted_at', 'deleted_by',
+            'deletion_reason',
+    }.issubset(bus_columns):
+        raise RuntimeError('Bus lifecycle schema migration did not complete; refusing to start.')
     if not required_phase2_tables.issubset(set(inspector.get_table_names())):
         raise RuntimeError('Phase 2 additive schema migration did not complete; refusing to start.')
 
@@ -1730,16 +1779,20 @@ def bus_list_today(period=None, admin=False):
         current_period = get_current_period()
 
     if admin:
-        buses = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
+        buses = Bus.query.filter(
+            Bus.active.is_(True), Bus.deleted_at.is_(None),
+        ).order_by(Bus.identifier).all()
     elif current_period is not None:
         assigned_ids = {a.bus_id for a in BusScheduleAssignment.query.filter_by(
             schedule_type_id=current_period.id).all()}
         buses = Bus.query.filter(
-            Bus.active == True,
+            Bus.active.is_(True), Bus.deleted_at.is_(None),
             Bus.id.in_(assigned_ids),
         ).order_by(Bus.identifier).all()
     else:
-        buses = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
+        buses = Bus.query.filter(
+            Bus.active.is_(True), Bus.deleted_at.is_(None),
+        ).order_by(Bus.identifier).all()
 
     period_id = current_period.id if current_period else None
     result = []
@@ -2300,7 +2353,13 @@ def _record_outbox_notification(row, status, error_code=''):
 def _claim_due_email_ids():
     now = _utcnow()
     stale_before = now - timedelta(minutes=10)
+    active_bus_ids = db.session.query(Bus.id).filter(
+        Bus.active.is_(True), Bus.deleted_at.is_(None))
     query = EmailOutbox.query.filter(
+        db.or_(
+            EmailOutbox.bus_id.is_(None),
+            EmailOutbox.bus_id.in_(active_bus_ids),
+        ),
         db.or_(
             db.and_(EmailOutbox.status.in_(['pending', 'retry']),
                     EmailOutbox.available_at <= now),
@@ -2444,6 +2503,8 @@ def _commit_pending_incident_once(record_id):
     claimed = BusIncidentRecord.query.filter(
         BusIncidentRecord.id == record_id,
         BusIncidentRecord.is_pending.is_(True),
+        BusIncidentRecord.bus_id.in_(db.session.query(Bus.id).filter(
+            Bus.active.is_(True), Bus.deleted_at.is_(None))),
     ).update({
         BusIncidentRecord.is_pending: False,
         BusIncidentRecord.committed_at: committed_at,
@@ -3356,7 +3417,9 @@ def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
         buses = Bus.query.options(
             selectinload(Bus.schedule_assignments).selectinload(
                 BusScheduleAssignment.schedule_type),
-        ).filter_by(active=True).order_by(Bus.identifier, Bus.name).all()
+        ).filter(
+            Bus.active.is_(True), Bus.deleted_at.is_(None),
+        ).order_by(Bus.identifier, Bus.name).all()
         bus_ids = [bus.id for bus in buses]
         today_records = []
         if bus_ids:
@@ -3601,7 +3664,8 @@ def _dashboard_recipient_preview(bus_ids, schedule_type_id=None):
     bus_ids = {int(bus_id) for bus_id in bus_ids}
     active_bus_ids = {
         bus_id for (bus_id,) in db.session.query(Bus.id).filter(
-            Bus.active.is_(True), Bus.id.in_(bus_ids)).all()
+            Bus.active.is_(True), Bus.deleted_at.is_(None),
+            Bus.id.in_(bus_ids)).all()
     }
     if not active_bus_ids:
         return {
@@ -3812,46 +3876,343 @@ def dashboard_recipient_preview():
 
 # ── BUSES MODULE ──────────────────────────────────────────────────────────────
 
+_BUS_OUTBOX_ACTIVE_STATUSES = ('pending', 'retry', 'processing')
+
+
+def _bus_count_map(model, bus_ids, *filters):
+    if not bus_ids:
+        return {}
+    rows = db.session.query(
+        model.bus_id, func.count(model.id),
+    ).filter(model.bus_id.in_(bus_ids), *filters).group_by(model.bus_id).all()
+    return {bus_id: int(count) for bus_id, count in rows}
+
+
+def _bus_inventory_impacts(bus_ids):
+    """Return aggregate, PII-free dependency counts for lifecycle decisions."""
+    bus_ids = sorted({int(bus_id) for bus_id in bus_ids})
+    if not bus_ids:
+        return {}
+    incidents = _bus_count_map(BusIncidentRecord, bus_ids)
+    pending_incidents = _bus_count_map(
+        BusIncidentRecord, bus_ids, BusIncidentRecord.is_pending.is_(True))
+    groups = _bus_count_map(GroupBusAssignment, bus_ids)
+    direct_assignments = _bus_count_map(NotificationBusAssignment, bus_ids)
+    notification_logs = _bus_count_map(NotificationLog, bus_ids)
+    outbox = _bus_count_map(EmailOutbox, bus_ids)
+    pending_outbox = _bus_count_map(
+        EmailOutbox, bus_ids, EmailOutbox.status.in_(_BUS_OUTBOX_ACTIVE_STATUSES))
+    external_identities = {
+        local_id: int(count) for local_id, count in db.session.query(
+            ExternalIdentity.local_id, func.count(ExternalIdentity.id),
+        ).filter(
+            ExternalIdentity.local_table == 'bus',
+            ExternalIdentity.local_id.in_(bus_ids),
+        ).group_by(ExternalIdentity.local_id).all()
+    }
+    import_changes = {
+        target_id: int(count) for target_id, count in db.session.query(
+            ImportChange.target_id, func.count(ImportChange.id),
+        ).filter(
+            ImportChange.target_table == 'bus',
+            ImportChange.target_id.in_(bus_ids),
+        ).group_by(ImportChange.target_id).all()
+    }
+    impacts = {}
+    for bus_id in bus_ids:
+        values = {
+            'incidents': incidents.get(bus_id, 0),
+            'pending_incidents': pending_incidents.get(bus_id, 0),
+            'group_assignments': groups.get(bus_id, 0),
+            'direct_assignments': direct_assignments.get(bus_id, 0),
+            'notification_logs': notification_logs.get(bus_id, 0),
+            'outbox_messages': outbox.get(bus_id, 0),
+            'pending_outbox': pending_outbox.get(bus_id, 0),
+            'external_identities': external_identities.get(bus_id, 0),
+            'import_changes': import_changes.get(bus_id, 0),
+        }
+        values['pending_work'] = (
+            values['pending_incidents'] + values['pending_outbox'])
+        values['protected_dependencies'] = sum(values[key] for key in (
+            'incidents', 'group_assignments', 'direct_assignments',
+            'notification_logs', 'outbox_messages', 'external_identities',
+            'import_changes'))
+        impacts[bus_id] = values
+    return impacts
+
+
+def _bus_lifecycle_version(bus):
+    """Opaque concurrency token for lifecycle actions shown in the inventory."""
+    material = '|'.join((
+        str(bus.id),
+        '1' if bus.active else '0',
+        bus.updated_at.isoformat() if bus.updated_at else '',
+        bus.deactivated_at.isoformat() if bus.deactivated_at else '',
+        bus.deleted_at.isoformat() if bus.deleted_at else '',
+    ))
+    return hashlib.sha256(material.encode('utf-8')).hexdigest()[:32]
+
+
+def _build_bus_inventory(*, can_view_notifications=False):
+    """Build one bounded-query administrative inventory for every bus state."""
+    cfg = get_config()
+    today = district_today(cfg)
+    current_period = get_current_period(cfg)
+    buses = Bus.query.options(
+        selectinload(Bus.schedule_assignments).selectinload(
+            BusScheduleAssignment.schedule_type),
+    ).order_by(Bus.identifier, Bus.name).all()
+    bus_ids = [bus.id for bus in buses]
+    impacts = _bus_inventory_impacts(bus_ids)
+    today_records = []
+    if bus_ids:
+        today_records = BusIncidentRecord.query.options(
+            joinedload(BusIncidentRecord.incident_type),
+            joinedload(BusIncidentRecord.schedule_type),
+            joinedload(BusIncidentRecord.delay_reason),
+        ).filter(
+            BusIncidentRecord.bus_id.in_(bus_ids),
+            BusIncidentRecord.incident_date == today,
+        ).order_by(
+            BusIncidentRecord.created_at.desc(),
+            BusIncidentRecord.id.desc(),
+        ).all()
+    records_by_bus = {}
+    for record in today_records:
+        records_by_bus.setdefault(record.bus_id, []).append(record)
+
+    group_names = {}
+    school_names = {}
+    subscriber_scope = {}
+    if can_view_notifications and bus_ids:
+        group_rows = db.session.query(
+            GroupBusAssignment.bus_id,
+            SubscriberGroup.id,
+            SubscriberGroup.name,
+        ).join(SubscriberGroup).filter(
+            GroupBusAssignment.bus_id.in_(bus_ids),
+        ).order_by(SubscriberGroup.name).all()
+        group_ids_by_bus = {}
+        for bus_id, group_id, group_name in group_rows:
+            group_ids_by_bus.setdefault(bus_id, set()).add(group_id)
+            group_names.setdefault(bus_id, set()).add(group_name)
+        all_group_ids = set().union(*group_ids_by_bus.values()) if group_ids_by_bus else set()
+        if all_group_ids:
+            subscribers_by_group = {}
+            schools_by_group = {}
+            for subscriber_id, group_id, school in db.session.query(
+                    NotificationSubscriber.id,
+                    NotificationSubscriber.group_id,
+                    NotificationSubscriber.school,
+            ).filter(
+                NotificationSubscriber.active.is_(True),
+                NotificationSubscriber.group_id.in_(all_group_ids),
+            ).all():
+                subscribers_by_group.setdefault(group_id, set()).add(subscriber_id)
+                if school:
+                    schools_by_group.setdefault(group_id, set()).add(school)
+            for bus_id, group_ids in group_ids_by_bus.items():
+                for group_id in group_ids:
+                    subscriber_scope.setdefault(bus_id, set()).update(
+                        subscribers_by_group.get(group_id, set()))
+                    school_names.setdefault(bus_id, set()).update(
+                        schools_by_group.get(group_id, set()))
+        for bus_id, subscriber_id in db.session.query(
+                NotificationBusAssignment.bus_id,
+                NotificationBusAssignment.subscriber_id,
+        ).filter(NotificationBusAssignment.bus_id.in_(bus_ids)).all():
+            subscriber_scope.setdefault(bus_id, set()).add(subscriber_id)
+
+    default_type = IncidentType.query.filter_by(is_default=True).first()
+    now = _utcnow()
+    retention_days = app.config['BUS_TRASH_RETENTION_DAYS']
+    inventory = []
+    for bus in buses:
+        records = records_by_bus.get(bus.id, [])
+        period_records = records
+        if current_period:
+            period_records = [record for record in records
+                              if record.schedule_type_id == current_period.id]
+        latest = period_records[0] if period_records else None
+        status = latest.incident_type if latest else default_type
+        reason = ''
+        if latest:
+            reason = (latest.delay_reason.reason
+                      if latest.delay_reason_id and latest.delay_reason
+                      else latest.delay_reason_text or '')
+        assignments = sorted(bus.schedule_assignments, key=lambda assignment: (
+            assignment.schedule_type.sort_order,
+            assignment.schedule_type.name,
+        ))
+        impact = impacts.get(bus.id, {})
+        purge_after = (bus.deleted_at + timedelta(days=retention_days)
+                       if bus.deleted_at else None)
+        purge_blockers = []
+        if bus.deleted_at is None:
+            purge_blockers.append('Move the bus to Trash first.')
+        elif purge_after and purge_after > now:
+            purge_blockers.append(
+                f'Retention ends {format_district_datetime(purge_after, cfg, "%b %d, %Y")}.'
+            )
+        if impact.get('protected_dependencies', 0):
+            purge_blockers.append('Historical or routing dependencies must be retained.')
+        payload = {
+            'id': bus.id,
+            'identifier': bus.identifier,
+            'name': bus.name,
+            'display_name': f'{bus.identifier} - {bus.name}',
+            'route': bus.route or '',
+            'capacity': bus.capacity,
+            'description': bus.description or '',
+            'active': bool(bus.active),
+            'lifecycle_state': bus.lifecycle_state,
+            'lifecycle_version': _bus_lifecycle_version(bus),
+            'status': status.name if status else 'On Time',
+            'status_color': status.color if status else '#10b981',
+            'status_icon': status.icon if status else 'fa-check-circle',
+            'status_priority': int(status.operational_priority or 0) if status else 0,
+            'is_attention': bool(status and not status.is_default),
+            'delay': int(latest.delay_minutes or 0) if latest else 0,
+            'eta': (latest.eta or '') if latest else '',
+            'reason': reason,
+            'latest_pending': bool(latest and latest.is_pending),
+            'schedules': [{
+                'id': assignment.schedule_type_id,
+                'name': assignment.schedule_type.name,
+                'departure_time': assignment.departure_time or '',
+                'departure_label': fmt_time(
+                    assignment.departure_time, cfg.time_format),
+                'warning': schedule_assignment_warning(assignment) or '',
+            } for assignment in assignments],
+            'schedule_names': ', '.join(
+                assignment.schedule_type.name for assignment in assignments),
+            'groups': sorted(group_names.get(bus.id, set()), key=_dashboard_natural_key),
+            'schools': sorted(school_names.get(bus.id, set()), key=_dashboard_natural_key),
+            'subscriber_scope_count': len(subscriber_scope.get(bus.id, set())),
+            'impact': impact,
+            'created_at': bus.created_at.isoformat() if bus.created_at else '',
+            'created_label': format_district_datetime(
+                bus.created_at, cfg, '%b %d, %Y') if bus.created_at else '',
+            'updated_at': bus.updated_at.isoformat() if bus.updated_at else '',
+            'updated_label': format_district_datetime(
+                bus.updated_at, cfg, '%b %d, %Y %I:%M %p') if bus.updated_at else '',
+            'deactivated_at': (
+                bus.deactivated_at.isoformat() if bus.deactivated_at else ''),
+            'deactivated_label': format_district_datetime(
+                bus.deactivated_at, cfg, '%b %d, %Y %I:%M %p')
+                if bus.deactivated_at else '',
+            'deactivated_by': bus.deactivated_by or '',
+            'deactivation_reason': bus.deactivation_reason or '',
+            'deleted_at': bus.deleted_at.isoformat() if bus.deleted_at else '',
+            'deleted_label': format_district_datetime(
+                bus.deleted_at, cfg, '%b %d, %Y %I:%M %p')
+                if bus.deleted_at else '',
+            'deleted_by': bus.deleted_by or '',
+            'deletion_reason': bus.deletion_reason or '',
+            'purge_after': purge_after.isoformat() if purge_after else '',
+            'purge_eligible': not purge_blockers,
+            'purge_blockers': purge_blockers,
+        }
+        inventory.append(payload)
+
+    inventory.sort(key=lambda item: (
+        {'active': 0, 'inactive': 1, 'trash': 2}[item['lifecycle_state']],
+        -item['is_attention'] if item['lifecycle_state'] == 'active' else 0,
+        -item['status_priority'] if item['lifecycle_state'] == 'active' else 0,
+        _dashboard_natural_key(item['identifier'], item['name']),
+    ))
+    counts = {
+        state: sum(item['lifecycle_state'] == state for item in inventory)
+        for state in ('active', 'inactive', 'trash')
+    }
+    counts['attention'] = sum(
+        item['lifecycle_state'] == 'active' and item['is_attention']
+        for item in inventory)
+    counts['pending'] = sum(bool(item['impact'].get('pending_work')) for item in inventory)
+    return {
+        'buses': inventory,
+        'counts': counts,
+        'current_period': current_period,
+        'retention_days': retention_days,
+    }
+
+
 @app.route('/admin/buses')
 @login_required
 @require_module('buses')
 def buses():
     today          = district_today()
-    current_period = get_current_period()
-    buses_data     = bus_list_today(admin=True)   # show all buses regardless of schedule period
     incident_types = IncidentType.query.order_by(IncidentType.sort_order).all()
     schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
     delay_reasons  = DelayReason.query.order_by(DelayReason.sort_order).all()
     can_write      = current_user.has_access('buses', 'full')
+    can_view_notifications = current_user.has_access('notifications', 'limited')
+    can_purge = current_user.has_capability('buses.purge')
+    inventory = _build_bus_inventory(
+        can_view_notifications=can_view_notifications)
     return render_template('admin/buses.html',
-                           buses_data=buses_data, incident_types=incident_types,
+                           inventory=inventory, incident_types=incident_types,
                            schedule_types=schedule_types, delay_reasons=delay_reasons,
-                           current_period=current_period,
+                           current_period=inventory['current_period'],
                            can_write=can_write, today=today,
+                           can_view_notifications=can_view_notifications,
+                           can_purge=can_purge,
                            incident_request_token=(
                                _issue_incident_request_token() if can_write else None))
+
+
+def _validated_bus_form():
+    identifier = _normalize_text(request.form.get('identifier')).upper()
+    name = _normalize_text(request.form.get('name'))
+    route = _normalize_text(request.form.get('route')) or None
+    description = _normalize_text(request.form.get('description')) or None
+    if not identifier or not name:
+        return None, 'Identifier and name are required.'
+    if len(identifier) > 20 or len(name) > 150:
+        return None, 'The bus identifier or name is too long.'
+    if route and len(route) > 200:
+        return None, 'The route cannot exceed 200 characters.'
+    if description and len(description) > 2000:
+        return None, 'The description cannot exceed 2,000 characters.'
+    capacity_raw = _normalize_text(request.form.get('capacity'))
+    capacity = None
+    if capacity_raw:
+        try:
+            capacity = int(capacity_raw)
+        except ValueError:
+            return None, 'Capacity must be a whole number.'
+        if not 1 <= capacity <= 100:
+            return None, 'Capacity must be between 1 and 100.'
+    return {
+        'identifier': identifier, 'name': name, 'route': route,
+        'capacity': capacity, 'description': description,
+    }, None
 
 @app.route('/admin/buses/add', methods=['POST'])
 @login_required
 @require_module('buses', 'full')
 @_serialized_roster_mutation('html')
 def add_bus():
-    identifier = request.form.get('identifier', '').strip().upper()
-    name       = request.form.get('name', '').strip()
-    if not identifier or not name:
-        flash('Identifier and name are required.', 'error')
+    values, values_error = _validated_bus_form()
+    if values_error:
+        flash(values_error, 'error')
         return redirect(url_for('buses'))
-    if Bus.query.filter_by(identifier=identifier, name=name).first():
-        flash(f'A bus with identifier "{identifier}" and name "{name}" already exists.', 'error')
+    identifier = values['identifier']
+    name = values['name']
+    existing_bus = Bus.query.filter_by(identifier=identifier, name=name).first()
+    if existing_bus:
+        state_label = {
+            'active': 'active', 'inactive': 'inactive', 'trash': 'in Trash',
+        }[existing_bus.lifecycle_state]
+        flash(
+            f'Bus {existing_bus.display_name} already exists and is {state_label}. '
+            'Open that record instead of creating a duplicate.', 'error')
         return redirect(url_for('buses'))
     assignments, assignment_error = _schedule_assignments_from_form()
     if assignment_error:
         flash(assignment_error, 'error')
         return redirect(url_for('buses'))
-    bus = Bus(identifier=identifier, name=name,
-              route=request.form.get('route','').strip() or None,
-              capacity=request.form.get('capacity', type=int),
-              description=request.form.get('description','').strip() or None)
+    bus = Bus(**values)
     db.session.add(bus)
     db.session.flush()
     for schedule_id, departure_time in assignments:
@@ -3868,24 +4229,31 @@ def add_bus():
 @_serialized_roster_mutation('html')
 def edit_bus(bus_id):
     bus = Bus.query.get_or_404(bus_id)
-    new_identifier = request.form.get('identifier', bus.identifier).strip().upper()
-    new_name       = request.form.get('name', bus.name).strip()
+    if bus.deleted_at is not None:
+        flash('Restore this bus from Trash before editing it.', 'error')
+        return _bus_inventory_redirect('trash')
+    values, values_error = _validated_bus_form()
+    if values_error:
+        flash(values_error, 'error')
+        return _bus_inventory_redirect(bus.lifecycle_state)
+    new_identifier = values['identifier']
+    new_name = values['name']
     # Check duplicate only if identifier+name changed
     if (new_identifier != bus.identifier or new_name != bus.name):
         dup = Bus.query.filter_by(identifier=new_identifier, name=new_name).first()
         if dup and dup.id != bus_id:
             flash(f'A bus with identifier "{new_identifier}" and name "{new_name}" already exists.', 'error')
-            return redirect(url_for('buses'))
+            return _bus_inventory_redirect(bus.lifecycle_state)
     assignments, assignment_error = _schedule_assignments_from_form()
     if assignment_error:
         flash(assignment_error, 'error')
-        return redirect(url_for('buses'))
+        return _bus_inventory_redirect(bus.lifecycle_state)
     bus.identifier  = new_identifier
     bus.name        = new_name
-    bus.route       = request.form.get('route', '').strip() or None
-    bus.capacity    = request.form.get('capacity', type=int)
-    bus.description = request.form.get('description', '').strip() or None
-    bus.active      = 'active' in request.form
+    bus.route       = values['route']
+    bus.capacity    = values['capacity']
+    bus.description = values['description']
+    bus.updated_at  = _utcnow()
     # Update schedules
     BusScheduleAssignment.query.filter_by(bus_id=bus_id).delete()
     for schedule_id, departure_time in assignments:
@@ -3894,19 +4262,345 @@ def edit_bus(bus_id):
     db.session.commit()
     _audit('edit_bus', 'buses', bus.display_name)
     flash(f'Bus {bus.display_name} updated.', 'success')
-    return redirect(url_for('buses'))
+    return _bus_inventory_redirect(bus.lifecycle_state)
 
+def _bus_inventory_redirect(default_state='active'):
+    requested = _safe_local_redirect(request.form.get('next', ''))
+    return redirect(requested or url_for('buses', state=default_state))
+
+
+def _bus_lifecycle_reason(required=False):
+    reason = _normalize_text(request.form.get('reason'), 256)
+    if len(reason) > 255:
+        return None, 'The reason cannot exceed 255 characters.'
+    if required and not reason:
+        return None, 'Enter a reason before moving this bus to Trash.'
+    return reason or None, None
+
+
+@app.route('/admin/buses/<int:bus_id>/deactivate', methods=['POST'])
 @app.route('/admin/buses/<int:bus_id>/delete', methods=['POST'])
 @login_required
 @require_module('buses', 'full')
 @_serialized_roster_mutation('html')
 def delete_bus(bus_id):
     bus = Bus.query.get_or_404(bus_id)
+    if bus.deleted_at is not None:
+        flash('This bus is already in Trash.', 'warning')
+        return _bus_inventory_redirect('trash')
+    if not bus.active:
+        flash(f'Bus {bus.display_name} is already inactive.', 'warning')
+        return _bus_inventory_redirect('inactive')
+    impact = _bus_inventory_impacts([bus.id])[bus.id]
+    if impact['pending_work']:
+        flash(
+            f'Bus {bus.display_name} has {impact["pending_work"]} pending '
+            'incident or delivery operation(s). Resolve them before deactivation.',
+            'error')
+        return _bus_inventory_redirect('active')
+    reason, reason_error = _bus_lifecycle_reason()
+    if reason_error:
+        flash(reason_error, 'error')
+        return _bus_inventory_redirect('active')
+    now = _utcnow()
     bus.active = False
+    bus.deactivated_at = now
+    bus.deactivated_by = current_user.username
+    bus.deactivation_reason = reason
+    bus.updated_at = now
     db.session.commit()
-    _audit('delete_bus', 'buses', bus.display_name)
-    flash(f'Bus {bus.identifier} deactivated.', 'success')
-    return redirect(url_for('buses'))
+    _audit('deactivate_bus', 'buses', bus.display_name, json.dumps({
+        'reason': reason or '', 'impact': impact,
+    }, sort_keys=True))
+    flash(f'Bus {bus.display_name} deactivated.', 'success')
+    return _bus_inventory_redirect('inactive')
+
+
+@app.route('/admin/buses/<int:bus_id>/activate', methods=['POST'])
+@login_required
+@require_module('buses', 'full')
+@_serialized_roster_mutation('html')
+def activate_bus(bus_id):
+    bus = Bus.query.get_or_404(bus_id)
+    if bus.deleted_at is not None:
+        flash('Restore this bus from Trash before activating it.', 'error')
+        return _bus_inventory_redirect('trash')
+    if bus.active:
+        flash(f'Bus {bus.display_name} is already active.', 'warning')
+        return _bus_inventory_redirect('active')
+    now = _utcnow()
+    bus.active = True
+    bus.deactivated_at = None
+    bus.deactivated_by = None
+    bus.deactivation_reason = None
+    bus.updated_at = now
+    db.session.commit()
+    _audit('activate_bus', 'buses', bus.display_name)
+    flash(f'Bus {bus.display_name} activated.', 'success')
+    return _bus_inventory_redirect('active')
+
+
+@app.route('/admin/buses/<int:bus_id>/trash', methods=['POST'])
+@login_required
+@require_module('buses', 'full')
+@_serialized_roster_mutation('html')
+def trash_bus(bus_id):
+    bus = Bus.query.get_or_404(bus_id)
+    if bus.deleted_at is not None:
+        flash('This bus is already in Trash.', 'warning')
+        return _bus_inventory_redirect('trash')
+    impact = _bus_inventory_impacts([bus.id])[bus.id]
+    if impact['pending_work']:
+        flash(
+            f'Bus {bus.display_name} has {impact["pending_work"]} pending '
+            'incident or delivery operation(s). Resolve them before moving it to Trash.',
+            'error')
+        return _bus_inventory_redirect(bus.lifecycle_state)
+    reason, reason_error = _bus_lifecycle_reason(required=True)
+    if reason_error:
+        flash(reason_error, 'error')
+        return _bus_inventory_redirect(bus.lifecycle_state)
+    now = _utcnow()
+    if bus.active or bus.deactivated_at is None:
+        bus.deactivated_at = now
+        bus.deactivated_by = current_user.username
+        bus.deactivation_reason = reason
+    bus.active = False
+    bus.deleted_at = now
+    bus.deleted_by = current_user.username
+    bus.deletion_reason = reason
+    bus.updated_at = now
+    db.session.commit()
+    _audit('trash_bus', 'buses', bus.display_name, json.dumps({
+        'reason': reason, 'impact': impact,
+    }, sort_keys=True))
+    flash(
+        f'Bus {bus.display_name} moved to Trash. It can be restored safely.',
+        'success')
+    return _bus_inventory_redirect('trash')
+
+
+@app.route('/admin/buses/<int:bus_id>/restore', methods=['POST'])
+@login_required
+@require_module('buses', 'full')
+@_serialized_roster_mutation('html')
+def restore_bus(bus_id):
+    bus = Bus.query.get_or_404(bus_id)
+    if bus.deleted_at is None:
+        flash('This bus is not in Trash.', 'warning')
+        return _bus_inventory_redirect(bus.lifecycle_state)
+    previous = {
+        'deleted_at': bus.deleted_at.isoformat(),
+        'deleted_by': bus.deleted_by or '',
+        'deletion_reason': bus.deletion_reason or '',
+    }
+    now = _utcnow()
+    bus.active = False
+    bus.deleted_at = None
+    bus.deleted_by = None
+    bus.deletion_reason = None
+    bus.deactivated_at = bus.deactivated_at or now
+    bus.deactivated_by = bus.deactivated_by or current_user.username
+    bus.deactivation_reason = bus.deactivation_reason or 'Restored from Trash'
+    bus.updated_at = now
+    db.session.commit()
+    _audit('restore_bus', 'buses', bus.display_name, json.dumps(
+        previous, sort_keys=True))
+    flash(
+        f'Bus {bus.display_name} restored as inactive. Review it before activation.',
+        'success')
+    return _bus_inventory_redirect('inactive')
+
+
+@app.route('/admin/buses/<int:bus_id>/purge', methods=['POST'])
+@login_required
+@require_capability('buses.purge')
+@_serialized_roster_mutation('html')
+def purge_bus(bus_id):
+    bus = Bus.query.get_or_404(bus_id)
+    target = bus.display_name
+    if bus.deleted_at is None:
+        flash('Only buses in Trash can be permanently deleted.', 'error')
+        return _bus_inventory_redirect(bus.lifecycle_state)
+    purge_after = bus.deleted_at + timedelta(
+        days=app.config['BUS_TRASH_RETENTION_DAYS'])
+    if purge_after > _utcnow():
+        flash(
+            'This bus is still inside the required Trash retention period.',
+            'error')
+        return _bus_inventory_redirect('trash')
+    impact = _bus_inventory_impacts([bus.id])[bus.id]
+    if impact['protected_dependencies']:
+        flash(
+            'This bus has routing, import, incident or communication history and '
+            'must remain archived.', 'error')
+        return _bus_inventory_redirect('trash')
+    details = json.dumps({
+        'deleted_at': bus.deleted_at.isoformat(),
+        'deleted_by': bus.deleted_by or '',
+        'deletion_reason': bus.deletion_reason or '',
+    }, sort_keys=True)
+    db.session.delete(bus)
+    db.session.commit()
+    _audit('purge_bus', 'buses', target, details)
+    flash(f'Unused bus {target} permanently deleted.', 'success')
+    return _bus_inventory_redirect('trash')
+
+
+_BUS_BULK_LIFECYCLE_ACTIONS = {
+    'activate': {
+        'allowed_states': {'inactive'},
+        'destination': 'active',
+        'audit_action': 'bulk_activate_buses',
+        'past_tense': 'activated',
+    },
+    'deactivate': {
+        'allowed_states': {'active'},
+        'destination': 'inactive',
+        'audit_action': 'bulk_deactivate_buses',
+        'past_tense': 'deactivated',
+    },
+    'trash': {
+        'allowed_states': {'active', 'inactive'},
+        'destination': 'trash',
+        'audit_action': 'bulk_trash_buses',
+        'past_tense': 'moved to Trash',
+    },
+    'restore': {
+        'allowed_states': {'trash'},
+        'destination': 'inactive',
+        'audit_action': 'bulk_restore_buses',
+        'past_tense': 'restored as inactive',
+    },
+}
+
+
+@app.route('/admin/buses/bulk-lifecycle', methods=['POST'])
+@login_required
+@require_module('buses', 'full')
+@_serialized_roster_mutation('json')
+def bulk_bus_lifecycle():
+    """Apply one lifecycle transition atomically to a reviewed bus selection."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'ok': False, 'message':
+                        'Submit a valid bulk lifecycle request.'}), 400
+    raw_bus_ids = payload.get('bus_ids', [])
+    if not isinstance(raw_bus_ids, list) or not 1 <= len(raw_bus_ids) <= 250:
+        return jsonify({'ok': False, 'message':
+                        'Select between 1 and 250 buses.'}), 400
+    try:
+        bus_ids = sorted({int(value) for value in raw_bus_ids})
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'message':
+                        'The bus selection is invalid.'}), 400
+    if len(bus_ids) != len(raw_bus_ids):
+        return jsonify({'ok': False, 'message':
+                        'The bus selection contains duplicates.'}), 400
+    action = _normalize_text(payload.get('action'), 32).lower()
+    policy = _BUS_BULK_LIFECYCLE_ACTIONS.get(action)
+    if not policy:
+        return jsonify({'ok': False, 'message':
+                        'Select a supported lifecycle action.'}), 400
+    if payload.get('confirmed') is not True:
+        return jsonify({'ok': False, 'message':
+                        'Bulk lifecycle changes require explicit confirmation.'}), 400
+    reason = _normalize_text(payload.get('reason'), 256)
+    if len(reason) > 255:
+        return jsonify({'ok': False, 'message':
+                        'The reason cannot exceed 255 characters.'}), 400
+    if action in {'deactivate', 'trash'} and not reason:
+        return jsonify({'ok': False, 'message':
+                        'Enter a reason for this bulk lifecycle change.'}), 400
+    expected_versions = payload.get('expected_versions') or {}
+    if not isinstance(expected_versions, dict):
+        return jsonify({'ok': False, 'message':
+                        'The displayed bus versions are invalid.'}), 400
+
+    buses = Bus.query.filter(Bus.id.in_(bus_ids)).order_by(Bus.id).all()
+    if len(buses) != len(bus_ids):
+        return jsonify({'ok': False, 'message':
+                        'One or more selected buses no longer exist.'}), 409
+    stale = [bus.display_name for bus in buses
+             if expected_versions.get(str(bus.id)) != _bus_lifecycle_version(bus)]
+    if stale:
+        return jsonify({
+            'ok': False,
+            'message': 'Another operator or import changed the selected buses. Refresh and review again.',
+            'conflict_count': len(stale),
+        }), 409
+
+    impacts = _bus_inventory_impacts(bus_ids)
+    blockers = []
+    for bus in buses:
+        if bus.lifecycle_state not in policy['allowed_states']:
+            blockers.append(
+                f'{bus.display_name} is {bus.lifecycle_state}, not eligible for {action}.')
+        if action in {'deactivate', 'trash'} and impacts[bus.id]['pending_work']:
+            blockers.append(
+                f'{bus.display_name} has {impacts[bus.id]["pending_work"]} pending operation(s).')
+    if blockers:
+        return jsonify({
+            'ok': False,
+            'message': 'The selection was not changed because one or more buses require review.',
+            'blockers': blockers[:10],
+            'blocker_count': len(blockers),
+        }), 409
+
+    now = _utcnow()
+    before_states = {str(bus.id): bus.lifecycle_state for bus in buses}
+    for bus in buses:
+        if action == 'activate':
+            bus.active = True
+            bus.deactivated_at = None
+            bus.deactivated_by = None
+            bus.deactivation_reason = None
+        elif action == 'deactivate':
+            bus.active = False
+            bus.deactivated_at = now
+            bus.deactivated_by = current_user.username
+            bus.deactivation_reason = reason
+        elif action == 'trash':
+            if bus.active or bus.deactivated_at is None:
+                bus.deactivated_at = now
+                bus.deactivated_by = current_user.username
+                bus.deactivation_reason = reason
+            bus.active = False
+            bus.deleted_at = now
+            bus.deleted_by = current_user.username
+            bus.deletion_reason = reason
+        elif action == 'restore':
+            bus.active = False
+            bus.deleted_at = None
+            bus.deleted_by = None
+            bus.deletion_reason = None
+            bus.deactivated_at = bus.deactivated_at or now
+            bus.deactivated_by = bus.deactivated_by or current_user.username
+            bus.deactivation_reason = bus.deactivation_reason or 'Restored from Trash'
+        bus.updated_at = now
+
+    aggregate_impact = {
+        key: sum(impacts[bus.id].get(key, 0) for bus in buses)
+        for key in (
+            'incidents', 'pending_incidents', 'group_assignments',
+            'direct_assignments', 'notification_logs', 'outbox_messages',
+            'pending_outbox', 'external_identities', 'import_changes',
+        )
+    }
+    db.session.commit()
+    _audit(policy['audit_action'], 'buses', f'{len(buses)} buses', json.dumps({
+        'bus_ids': bus_ids,
+        'reason': reason,
+        'before_states': before_states,
+        'destination': policy['destination'],
+        'impact': aggregate_impact,
+    }, sort_keys=True))
+    return jsonify({
+        'ok': True,
+        'count': len(buses),
+        'destination_state': policy['destination'],
+        'message': f'{len(buses)} buses {policy["past_tense"]}.',
+    })
 
 
 def _mapping_integer(values, key, default=None):
@@ -3984,7 +4678,7 @@ def add_bus_incident(bus_id):
     if not _consume_incident_request_token(request_token):
         flash('This status form expired. Open the bus and try again.', 'error')
         return redirect(next_url)
-    if not bus.active:
+    if not bus.active or bus.deleted_at is not None:
         flash('This bus is inactive and cannot receive a status update.', 'error')
         return redirect(next_url)
 
@@ -4159,7 +4853,9 @@ def dashboard_bulk_incidents():
     if validation_error:
         return jsonify({'ok': False, 'message': validation_error,
                         'request_token': _issue_incident_request_token()}), 400
-    buses = Bus.query.filter(Bus.id.in_(bus_ids), Bus.active.is_(True)).all()
+    buses = Bus.query.filter(
+        Bus.id.in_(bus_ids), Bus.active.is_(True),
+        Bus.deleted_at.is_(None)).all()
     if len(buses) != len(bus_ids):
         return jsonify({'ok': False, 'message':
                         'One or more selected buses are no longer active.',
@@ -4360,7 +5056,8 @@ def statistics():
 
     # ── Bus Audit ─────────────────────────────────────────────────────────
     default_type = IncidentType.query.filter_by(is_default=True).first()
-    audit_buses_q = Bus.query.filter_by(active=True).order_by(Bus.identifier)
+    audit_buses_q = Bus.query.filter(
+        Bus.active.is_(True), Bus.deleted_at.is_(None)).order_by(Bus.identifier)
     if bus_id:
         audit_buses_q = audit_buses_q.filter_by(id=bus_id)
     audit_buses_list = audit_buses_q.all()
@@ -4418,7 +5115,8 @@ def statistics():
             if blb in audit_bus_order:
                 audit_datasets[n]['data'][audit_bus_order.index(blb)] += 1
 
-    all_buses  = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
+    all_buses  = Bus.query.filter(
+        Bus.active.is_(True), Bus.deleted_at.is_(None)).order_by(Bus.identifier).all()
     all_types  = IncidentType.query.order_by(IncidentType.sort_order).all()
     can_export = current_user.has_access('statistics', 'limited')
 
@@ -4533,7 +5231,8 @@ def export_statistics(fmt):
 
     # ── Bus Audit for export ──────────────────────────────────────────────
     default_type_exp = IncidentType.query.filter_by(is_default=True).first()
-    exp_buses_q = Bus.query.filter_by(active=True).order_by(Bus.identifier)
+    exp_buses_q = Bus.query.filter(
+        Bus.active.is_(True), Bus.deleted_at.is_(None)).order_by(Bus.identifier)
     if bus_id:
         exp_buses_q = exp_buses_q.filter_by(id=bus_id)
     exp_buses_list = exp_buses_q.all()
@@ -5225,7 +5924,8 @@ def _masked_user(user):
 def notifications():
     subs           = NotificationSubscriber.query.order_by(NotificationSubscriber.last_name).all()
     groups         = SubscriberGroup.query.order_by(SubscriberGroup.name).all()
-    all_buses      = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
+    all_buses      = Bus.query.filter(
+        Bus.active.is_(True), Bus.deleted_at.is_(None)).order_by(Bus.identifier).all()
     admin_users    = User.query.filter_by(active=True).order_by(User.username).all()
     schedule_types = BusScheduleType.query.order_by(BusScheduleType.sort_order).all()
     can_write      = current_user.has_capability('notifications.write')
@@ -5432,6 +6132,7 @@ def _auto_create_group_from_name(group_name):
     if len(parts) == 2:
         prefix, number = parts
         bus = Bus.query.filter(
+            Bus.deleted_at.is_(None),
             db.func.lower(Bus.identifier) == prefix.lower(),
             db.func.lower(Bus.name) == number.lower()
         ).first()
@@ -5439,12 +6140,14 @@ def _auto_create_group_from_name(group_name):
             stripped = number.lstrip('0') or '0'
             if stripped != number:
                 bus = Bus.query.filter(
+                    Bus.deleted_at.is_(None),
                     db.func.lower(Bus.identifier) == prefix.lower(),
                     db.func.lower(Bus.name) == stripped.lower()
                 ).first()
     if not bus:
         # Fallback: match identifier field exactly (single-token group names)
         bus = Bus.query.filter(
+            Bus.deleted_at.is_(None),
             db.func.lower(Bus.identifier) == bus_identifier.lower()
         ).first()
     if not bus:
@@ -5775,6 +6478,7 @@ def preview_import_csv():
         if len(parts) == 2:
             prefix, number = parts
             bus = Bus.query.filter(
+                Bus.deleted_at.is_(None),
                 db.func.lower(Bus.identifier) == prefix.lower(),
                 db.func.lower(Bus.name) == number.lower()
             ).first()
@@ -5782,11 +6486,13 @@ def preview_import_csv():
                 stripped = number.lstrip('0') or '0'
                 if stripped != number:
                     bus = Bus.query.filter(
+                        Bus.deleted_at.is_(None),
                         db.func.lower(Bus.identifier) == prefix.lower(),
                         db.func.lower(Bus.name) == stripped.lower()
                     ).first()
         if not bus:
             bus = Bus.query.filter(
+                Bus.deleted_at.is_(None),
                 db.func.lower(Bus.identifier) == bus_identifier.lower()
             ).first()
         return bus, period_names
@@ -6346,26 +7052,32 @@ def _powerschool_subscriber_identity_current(identity, subscriber):
     )
 
 
-def _powerschool_bus_for_route(prefix, number, period=None):
-    """Resolve a source route against the canonical identity of active buses.
+def _powerschool_bus_for_route(prefix, number, period=None, *, active_only=True):
+    """Resolve a source route against the canonical identity of local buses.
 
     Numeric buses commonly store ``identifier=TT, name=55``. Some district
     buses instead store compound names such as ``identifier=TR, name=ALG1`` or
     encode a schedule token in the name (``identifier=MCK1, name=AM``). Parsing
     the combined local identity prevents those valid routes from being missed
-    without introducing district-specific aliases.
+    without introducing district-specific aliases. Normal imports use the
+    active-only index; the all-state index is diagnostic and never reactivates
+    an inactive or trashed record.
     """
     desired = normalize_route(f'{prefix or ""} {number or ""}')
     if not desired:
         return None
     desired_key = (desired['prefix'], desired['number'])
-    cache_key = '_powerschool_active_bus_index'
+    cache_key = (
+        '_powerschool_active_bus_index'
+        if active_only else '_powerschool_all_state_bus_index')
     index = getattr(g, cache_key, None) if has_request_context() else None
     if index is None:
         index = {}
-        for bus in Bus.query.options(
-                selectinload(Bus.schedule_assignments),
-        ).filter(Bus.active.is_(True)).order_by(Bus.id).all():
+        query = Bus.query.options(selectinload(Bus.schedule_assignments))
+        if active_only:
+            query = query.filter(
+                Bus.active.is_(True), Bus.deleted_at.is_(None))
+        for bus in query.order_by(Bus.id).all():
             parsed = normalize_route(f'{bus.identifier or ""} {bus.name or ""}')
             if not parsed:
                 continue
@@ -6416,6 +7128,15 @@ def _powerschool_group(proposal, create=False, assignment_index=None,
         bus = _powerschool_bus_for_route(
             item.get('route_prefix'), item.get('route_number'), period)
         if not bus:
+            archived_bus = _powerschool_bus_for_route(
+                item.get('route_prefix'), item.get('route_number'), period,
+                active_only=False)
+            if archived_bus and archived_bus.lifecycle_state != 'active':
+                return None, False, (
+                    f'The normalized {period or "unknown"} route matches '
+                    f'{archived_bus.display_name}, which is '
+                    f'{archived_bus.lifecycle_state}. Review that bus in Fleet '
+                    'Inventory; PowerSchool imports never reactivate archived buses.')
             return None, False, (
                 f'The normalized {period or "unknown"} route does not match '
                 'an active bus.')

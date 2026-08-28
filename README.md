@@ -275,6 +275,15 @@ before/after changes and supports fail-closed compensating rollback. It remains 
 unless `POWERSCHOOL_IMPORT_ENABLED=1`. See
 [`docs/powerschool-import-runbook.md`](docs/powerschool-import-runbook.md).
 
+Bus Inventory separates record editing from operational lifecycle changes. Operators
+with full Bus access can activate, deactivate, move to Trash, restore, and apply the
+same transition atomically to a reviewed selection of up to 250 buses. Deactivation
+and Trash require an audit reason, pending incident/delivery work blocks the entire
+operation, and stale browser data is rejected. Permanent deletion is intentionally
+individual and administrator-only after the Trash retention window, and only when the
+bus has no historical, routing, import, or communication dependencies. PowerSchool
+route resolution never reactivates an inactive or trashed bus automatically.
+
 ---
 
 ## Environment Variables
@@ -304,6 +313,7 @@ unless `POWERSCHOOL_IMPORT_ENABLED=1`. See
 | `IMPORT_STAGE_TTL_HOURS` | Unapplied private staging lifetime | `24` |
 | `POWERSCHOOL_IMPORT_ENABLED` | Expose the capability-protected PowerSchool workflow | `0` |
 | `POWERSCHOOL_ROLLBACK_RETENTION_DAYS` | PII/compensating rollback retention window | `30` |
+| `BUS_TRASH_RETENTION_DAYS` | Minimum recovery window before an unused trashed bus can be permanently deleted | `90` |
 | `FLASK_ENV` | Set to `production` to enable secure cookies | `development` |
 | `PORT` | Port to expose (Docker only) | `5000` |
 | `DB_NAME` | PostgreSQL database name (Docker only) | `bustrack` |
