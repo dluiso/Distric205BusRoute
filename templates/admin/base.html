@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="district-timezone" content="{{ get_config().timezone }}">
   <title>{% block title %}Admin{% endblock %} — {{ get_config().app_name }}</title>
   <script>/* suppress Tailwind Play CDN production warning */const _cw=console.warn;console.warn=function(...a){if(a[0]&&String(a[0]).includes('cdn.tailwindcss.com'))return;_cw.apply(console,a)};</script>
   <script src="https://cdn.tailwindcss.com"></script>
@@ -190,8 +191,9 @@
     setSidebarOpen(false);
   }
 
+  const districtTimeZone = document.querySelector('meta[name="district-timezone"]').content || 'America/Chicago';
   document.getElementById('topbar-date').textContent =
-    new Date().toLocaleDateString('en-US', {weekday:'short',year:'numeric',month:'short',day:'numeric'});
+    new Date().toLocaleDateString('en-US', {weekday:'short',year:'numeric',month:'short',day:'numeric',timeZone:districtTimeZone});
   setTimeout(() => {
     document.querySelectorAll('#flash-box > div').forEach(el => {
       el.style.transition = 'opacity .4s'; el.style.opacity = '0';

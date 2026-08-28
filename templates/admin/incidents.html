@@ -35,6 +35,7 @@
             {% if it.is_system %}
             <span class="text-xs bg-slate-100 text-slate-500 px-2 py-0.5 rounded-full font-medium">System</span>
             {% endif %}
+            <span class="text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full font-medium">Priority {{ it.operational_priority }}</span>
           </div>
         </div>
       </div>
@@ -48,7 +49,7 @@
     </div>
     {% if can_write %}
     <div class="px-4 py-3 bg-slate-50 border-t border-slate-100 flex items-center justify-end space-x-2">
-      <button data-incident='{{ {"id": it.id, "name": it.name, "color": it.color, "icon": it.icon, "description": it.description or ""} | tojson }}'
+      <button data-incident='{{ {"id": it.id, "name": it.name, "color": it.color, "icon": it.icon, "description": it.description or "", "priority": it.operational_priority} | tojson }}'
               onclick="openEditFromButton(this)"
               class="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-medium text-slate-600 hover:border-blue-400 hover:text-blue-600 transition-colors">
         <i class="fas fa-edit mr-1"></i>Edit
@@ -140,6 +141,12 @@
         <input type="text" name="description" placeholder="Optional description"
                class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
       </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5" for="add-priority">Operational priority</label>
+        <input type="number" name="operational_priority" id="add-priority" min="0" max="100" value="50"
+               class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <p class="text-xs text-slate-400 mt-1">Higher values appear first in the operational dashboard.</p>
+      </div>
       <div class="flex justify-end space-x-2 pt-2">
         <button type="button" onclick="document.getElementById('modal-add').classList.add('hidden')"
                 class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
@@ -195,6 +202,12 @@
         <input type="text" name="description" id="edit-description"
                class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
       </div>
+      <div>
+        <label class="block text-xs font-semibold text-slate-600 mb-1.5" for="edit-priority">Operational priority</label>
+        <input type="number" name="operational_priority" id="edit-priority" min="0" max="100"
+               class="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <p class="text-xs text-slate-400 mt-1">Higher values appear first in the operational dashboard.</p>
+      </div>
       <div class="flex justify-end space-x-2 pt-2">
         <button type="button" onclick="document.getElementById('modal-edit').classList.add('hidden')"
                 class="px-4 py-2 border border-slate-200 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
@@ -208,20 +221,21 @@
 
 {% block scripts %}
 <script>
-function openEdit(id, name, color, icon, desc) {
+function openEdit(id, name, color, icon, desc, priority) {
   document.getElementById('form-edit').action = `/admin/incidents/${id}/edit`;
   document.getElementById('edit-name').value = name;
   document.getElementById('edit-description').value = desc;
   document.getElementById('edit-color-picker').value = color;
   document.getElementById('edit-color-hex').value = color;
   document.getElementById('edit-icon-input').value = icon;
+  document.getElementById('edit-priority').value = priority;
   updateIconPreview('edit-icon-preview', icon);
   document.getElementById('modal-edit').classList.remove('hidden');
 }
 
 function openEditFromButton(button) {
   const item = JSON.parse(button.dataset.incident);
-  openEdit(item.id, item.name, item.color, item.icon, item.description);
+  openEdit(item.id, item.name, item.color, item.icon, item.description, item.priority);
 }
 
 function updateIconPreview(previewId, iconClass) {

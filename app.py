@@ -14,8 +14,8 @@ from datetime import datetime, date, timedelta, timezone
 from contextlib import contextmanager
 from functools import wraps
 from types import SimpleNamespace
-from sqlalchemy import and_, func, or_
-from sqlalchemy.orm import selectinload
+from sqlalchemy import and_, case, func, or_
+from sqlalchemy.orm import joinedload, selectinload
 from sqlalchemy.exc import IntegrityError
 from urllib.parse import urlsplit
 import click
@@ -496,6 +496,7 @@ class IncidentType(db.Model):
     is_default  = db.Column(db.Boolean, default=False)   # On Time = default
     is_system   = db.Column(db.Boolean, default=False)   # Cannot delete
     sort_order  = db.Column(db.Integer, default=0)
+    operational_priority = db.Column(db.Integer, nullable=False, default=50)
     created_at  = db.Column(db.DateTime, default=_utcnow)
 
 
@@ -548,6 +549,7 @@ class BusIncidentRecord(db.Model):
     created_by_id     = db.Column(db.Integer, db.ForeignKey('user.id'))
     created_at        = db.Column(db.DateTime, default=_utcnow)
     updated_at        = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+    request_token     = db.Column(db.String(64), unique=True, nullable=True)
     incident_type     = db.relationship('IncidentType')
     schedule_type     = db.relationship('BusScheduleType')
     delay_reason      = db.relationship('DelayReason')
@@ -802,11 +804,15 @@ def load_user(uid):
 _cfg_cache = {}
 
 def get_config():
+    if has_request_context() and hasattr(g, '_busroute_configuration'):
+        return g._busroute_configuration
     cfg = Configuration.query.first()
     if not cfg:
         cfg = Configuration()
         db.session.add(cfg)
         db.session.commit()
+    if has_request_context():
+        g._busroute_configuration = cfg
     return cfg
 
 
@@ -844,6 +850,16 @@ def district_date_utc_bounds(date_from, date_to, cfg=None):
         local_start.astimezone(timezone.utc).replace(tzinfo=None),
         local_end.astimezone(timezone.utc).replace(tzinfo=None),
     )
+
+
+def format_district_datetime(value, cfg=None, fmt='%b %d, %Y %I:%M %p'):
+    """Render a naive-UTC database timestamp in the configured district timezone."""
+    if not value:
+        return ''
+    instant = value
+    if instant.tzinfo is None:
+        instant = pytz.utc.localize(instant)
+    return instant.astimezone(district_timezone(cfg)).strftime(fmt).replace(' 0', ' ')
 
 def hex_to_text_class(hex_color):
     """Return 'text-white' or 'text-gray-900' based on luminance"""
@@ -1065,6 +1081,7 @@ app.jinja_env.globals.update(
     public_schedule_label=public_schedule_label,
     format_public_date=format_public_date,
     schedule_assignment_warning=schedule_assignment_warning,
+    format_district_datetime=format_district_datetime,
     csrf_token=_csrf_token,
 )
 
@@ -1099,7 +1116,14 @@ def _migrate_bus_table():
 
 def _migrate_add_columns():
     """Add new columns to existing tables (safe: ignores if already exists)."""
-    from sqlalchemy import text
+    from sqlalchemy import inspect as sa_inspect, text
+    inspector = sa_inspect(db.engine)
+    incident_priority_missing = (
+        'incident_type' in inspector.get_table_names() and
+        'operational_priority' not in {
+            column['name'] for column in inspector.get_columns('incident_type')
+        }
+    )
     cols = [
         ('bus_schedule_assignment', 'departure_time', 'VARCHAR(5)'),
         ('bus_incident_record',     'eta',             'VARCHAR(5)'),
@@ -1124,6 +1148,8 @@ def _migrate_add_columns():
         ('group_bus_assignment',    'schedule_type_id',       'INTEGER'),
         ('user',                    'session_version',        'INTEGER NOT NULL DEFAULT 1'),
         ('import_batch',            'analysis_context_sha256','VARCHAR(64)'),
+        ('incident_type',           'operational_priority',  'INTEGER NOT NULL DEFAULT 50'),
+        ('bus_incident_record',     'request_token',         'VARCHAR(64)'),
     ]
     # Use a separate connection per column so a failed ALTER TABLE (column already
     # exists) never leaves a shared connection in an aborted-transaction state.
@@ -1140,6 +1166,30 @@ def _migrate_add_columns():
                 'CREATE INDEX IF NOT EXISTS '
                 'ix_import_batch_analysis_context_sha256 '
                 'ON import_batch (analysis_context_sha256)'))
+            conn.commit()
+    except Exception:
+        pass
+    if incident_priority_missing:
+        priorities = {
+            'On Time': 0, 'E-Learning': 20, 'Combined': 40,
+            'Double-back': 60, 'Delayed': 70,
+            'Combined/Delayed': 85, 'Out of Service': 100,
+        }
+        try:
+            with db.engine.connect() as conn:
+                for name, priority in priorities.items():
+                    conn.execute(text(
+                        'UPDATE incident_type SET operational_priority = :priority '
+                        'WHERE name = :name'), {'priority': priority, 'name': name})
+                conn.commit()
+        except Exception:
+            pass
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(text(
+                'CREATE UNIQUE INDEX IF NOT EXISTS '
+                'uq_bus_incident_record_request_token '
+                'ON bus_incident_record (request_token)'))
             conn.commit()
     except Exception:
         pass
@@ -1529,10 +1579,10 @@ def init_db():
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 
-def get_current_period():
+def get_current_period(cfg=None):
     """Returns the active BusScheduleType based on current local time, or None."""
     try:
-        cfg = get_config()
+        cfg = cfg or get_config()
         now = district_now(cfg)
         current_time = now.strftime('%H:%M')
         periods = BusScheduleType.query.filter(
@@ -2790,18 +2840,20 @@ def _seed_defaults():
             existing.window_end   = w_end
     db.session.commit()
     # Incident types
-    for name, color, icon, is_def, is_sys, order in [
-        ('On Time','#10b981','fa-check-circle',True,True,0),
-        ('Delayed','#f59e0b','fa-clock',False,True,1),
-        ('E-Learning','#8b5cf6','fa-laptop',False,True,2),
-        ('Combined','#3b82f6','fa-link',False,True,3),
-        ('Double-back','#06b6d4','fa-redo',False,True,4),
-        ('Out of Service','#ef4444','fa-ban',False,True,5),
-        ('Combined/Delayed','#f97316','fa-exclamation-triangle',False,True,6),
+    for name, color, icon, is_def, is_sys, order, priority in [
+        ('On Time','#10b981','fa-check-circle',True,True,0,0),
+        ('Delayed','#f59e0b','fa-clock',False,True,1,70),
+        ('E-Learning','#8b5cf6','fa-laptop',False,True,2,20),
+        ('Combined','#3b82f6','fa-link',False,True,3,40),
+        ('Double-back','#06b6d4','fa-redo',False,True,4,60),
+        ('Out of Service','#ef4444','fa-ban',False,True,5,100),
+        ('Combined/Delayed','#f97316','fa-exclamation-triangle',False,True,6,85),
     ]:
         if not IncidentType.query.filter_by(name=name).first():
             db.session.add(IncidentType(name=name, color=color, icon=icon,
-                                        is_default=is_def, is_system=is_sys, sort_order=order))
+                                        is_default=is_def, is_system=is_sys,
+                                        sort_order=order,
+                                        operational_priority=priority))
     db.session.commit()
     # Delay reasons
     for reason, order in [('Traffic congestion',0),('Road construction',1),('Weather conditions',2),
@@ -3043,6 +3095,31 @@ def _safe_local_redirect(target):
         return None
     return target
 
+
+def _issue_incident_request_token():
+    """Issue a short-lived, session-bound idempotency token for one incident form."""
+    token = secrets.token_hex(24)
+    tokens = [value for value in session.get('_incident_request_tokens', [])
+              if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{48}', value)]
+    tokens.append(token)
+    session['_incident_request_tokens'] = tokens[-12:]
+    session.modified = True
+    return token
+
+
+def _consume_incident_request_token(token):
+    if not isinstance(token, str) or not re.fullmatch(r'[0-9a-f]{48}', token):
+        return False
+    tokens = list(session.get('_incident_request_tokens', []))
+    matched = next((value for value in tokens
+                    if isinstance(value, str) and secrets.compare_digest(value, token)), None)
+    if matched is None:
+        return False
+    tokens.remove(matched)
+    session['_incident_request_tokens'] = tokens
+    session.modified = True
+    return True
+
 @app.route('/admin/login', methods=['GET', 'POST'])
 def login():
     if current_user.is_authenticated:
@@ -3089,99 +3166,299 @@ def logout():
 
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
 
+def _dashboard_natural_key(*parts):
+    text_value = ' '.join(str(part or '') for part in parts).casefold()
+    return tuple(int(piece) if piece.isdigit() else piece
+                 for piece in re.split(r'(\d+)', text_value))
+
+
+def _dashboard_incident_payload(record, cfg, now_utc):
+    if record.delay_reason_id and record.delay_reason:
+        reason = record.delay_reason.reason
+    else:
+        reason = record.delay_reason_text or ''
+    pending_until = None
+    pending_remaining = 0
+    if record.is_pending:
+        pending_until = record.created_at + timedelta(minutes=cfg.commit_delay_min or 0)
+        pending_remaining = max(0, int((pending_until - now_utc).total_seconds()))
+    return {
+        'id': record.id,
+        'type_id': record.incident_type_id,
+        'type': record.incident_type.name,
+        'color': record.incident_type.color,
+        'icon': record.incident_type.icon,
+        'priority': int(record.incident_type.operational_priority or 0),
+        'is_default': bool(record.incident_type.is_default),
+        'delay': int(record.delay_minutes or 0),
+        'eta': record.eta or '',
+        'eta_label': fmt_time(record.eta, cfg.time_format),
+        'reason': reason,
+        'notes': record.notes or '',
+        'schedule': record.schedule_type.name if record.schedule_type else '',
+        'schedule_id': record.schedule_type_id,
+        'pending': bool(record.is_pending),
+        'pending_remaining_seconds': pending_remaining,
+        'created_label': format_district_datetime(record.created_at, cfg, '%I:%M %p'),
+        'created_by': record.created_by.username if record.created_by else '',
+    }
+
+
+def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
+                              can_view_statistics, can_view_notifications):
+    """Build one permission-aware read model for the operational dashboard."""
+    cfg = get_config()
+    today = district_today(cfg)
+    now_local = district_now(cfg)
+    now_utc = _utcnow()
+    d_from, d_to = _parse_period(period, date_from, date_to, today)
+    current_period = get_current_period(cfg)
+    snapshot = {
+        'cfg': cfg,
+        'today': today,
+        'now_local': now_local,
+        'timezone': district_timezone(cfg).zone,
+        'period': period,
+        'date_from': d_from,
+        'date_to': d_to,
+        'current_period': current_period,
+        'buses': [],
+        'attention_buses': [],
+        'on_time_buses': [],
+        'total_buses': 0,
+        'on_time_count': 0,
+        'attention_count': 0,
+        'pending_today': 0,
+        'schedule_warning_count': 0,
+        'period_incidents': 0,
+        'period_pending': 0,
+        'period_delay_minutes': 0,
+        'period_average_delay': 0,
+        'by_type': {},
+        'by_type_colors': [],
+        'by_bus': {},
+        'by_day': {},
+        'recent': [],
+    }
+
+    if can_view_buses:
+        buses = Bus.query.options(
+            selectinload(Bus.schedule_assignments).selectinload(
+                BusScheduleAssignment.schedule_type),
+        ).filter_by(active=True).order_by(Bus.identifier, Bus.name).all()
+        bus_ids = [bus.id for bus in buses]
+        today_records = []
+        if bus_ids:
+            today_records = BusIncidentRecord.query.options(
+                joinedload(BusIncidentRecord.incident_type),
+                joinedload(BusIncidentRecord.schedule_type),
+                joinedload(BusIncidentRecord.delay_reason),
+                joinedload(BusIncidentRecord.created_by),
+            ).filter(
+                BusIncidentRecord.bus_id.in_(bus_ids),
+                BusIncidentRecord.incident_date == today,
+            ).order_by(BusIncidentRecord.created_at.desc()).all()
+        records_by_bus = {}
+        for record in today_records:
+            records_by_bus.setdefault(record.bus_id, []).append(record)
+
+        default_type = IncidentType.query.filter_by(is_default=True).first()
+        group_counts = {}
+        if can_view_notifications and bus_ids:
+            group_counts = dict(db.session.query(
+                GroupBusAssignment.bus_id,
+                func.count(func.distinct(GroupBusAssignment.group_id)),
+            ).filter(GroupBusAssignment.bus_id.in_(bus_ids)).group_by(
+                GroupBusAssignment.bus_id).all())
+
+        bus_payloads = []
+        for bus in buses:
+            records = records_by_bus.get(bus.id, [])
+            period_records = records
+            if current_period:
+                period_records = [record for record in records
+                                  if record.schedule_type_id == current_period.id]
+            latest = period_records[0] if period_records else None
+            status = latest.incident_type if latest else default_type
+            status_is_default = not status or bool(status.is_default)
+            assignments = sorted(
+                bus.schedule_assignments,
+                key=lambda assignment: (
+                    assignment.schedule_type.sort_order,
+                    assignment.schedule_type.name,
+                ),
+            )
+            warnings = [schedule_assignment_warning(assignment)
+                        for assignment in assignments]
+            warnings = [warning for warning in warnings if warning]
+            incident_payloads = [
+                _dashboard_incident_payload(record, cfg, now_utc)
+                for record in records
+            ]
+            latest_payload = (_dashboard_incident_payload(latest, cfg, now_utc)
+                              if latest else None)
+            priority = int(status.operational_priority or 0) if status else 0
+            payload = {
+                'id': bus.id,
+                'identifier': bus.identifier,
+                'name': bus.name,
+                'display_name': f'{bus.identifier} - {bus.name}',
+                'route': bus.route or '',
+                'capacity': bus.capacity,
+                'description': bus.description or '',
+                'status': status.name if status else 'On Time',
+                'status_color': status.color if status else '#10b981',
+                'status_icon': status.icon if status else 'fa-check-circle',
+                'status_priority': priority,
+                'is_attention': not status_is_default,
+                'delay': int(latest.delay_minutes or 0) if latest else 0,
+                'eta': latest.eta if latest else '',
+                'eta_label': fmt_time(latest.eta, cfg.time_format) if latest else '',
+                'reason': latest_payload['reason'] if latest_payload else '',
+                'latest': latest_payload,
+                'incidents': incident_payloads,
+                'schedules': [{
+                    'id': assignment.schedule_type_id,
+                    'name': assignment.schedule_type.name,
+                    'departure_time': assignment.departure_time or '',
+                    'departure_label': fmt_time(assignment.departure_time, cfg.time_format),
+                } for assignment in assignments],
+                'schedule_names': ', '.join(
+                    assignment.schedule_type.name for assignment in assignments),
+                'schedule_warnings': warnings,
+                'group_count': int(group_counts.get(bus.id, 0)),
+            }
+            bus_payloads.append(payload)
+
+        attention = sorted(
+            (item for item in bus_payloads if item['is_attention']),
+            key=lambda item: (-item['status_priority'], -item['delay'],
+                              _dashboard_natural_key(item['identifier'], item['name'])),
+        )
+        on_time = sorted(
+            (item for item in bus_payloads if not item['is_attention']),
+            key=lambda item: _dashboard_natural_key(item['identifier'], item['name']),
+        )
+        snapshot.update({
+            'buses': attention + on_time,
+            'attention_buses': attention,
+            'on_time_buses': on_time,
+            'total_buses': len(bus_payloads),
+            'attention_count': len(attention),
+            'on_time_count': len(on_time),
+            'pending_today': sum(
+                1 for item in bus_payloads
+                if item['is_attention'] and item['latest']
+                and item['latest']['pending']),
+            'schedule_warning_count': sum(
+                len(item['schedule_warnings']) for item in bus_payloads),
+        })
+
+    if can_view_statistics:
+        actual_filter = IncidentType.is_default.is_(False)
+        base_filters = (
+            BusIncidentRecord.incident_date >= d_from,
+            BusIncidentRecord.incident_date <= d_to,
+        )
+        totals = db.session.query(
+            func.count(BusIncidentRecord.id),
+            func.coalesce(func.sum(case(
+                (BusIncidentRecord.is_pending.is_(True), 1), else_=0)), 0),
+            func.coalesce(func.sum(BusIncidentRecord.delay_minutes), 0),
+            func.avg(case(
+                (BusIncidentRecord.delay_minutes > 0,
+                 BusIncidentRecord.delay_minutes), else_=None)),
+        ).join(IncidentType).filter(*base_filters, actual_filter).one()
+        by_type_rows = db.session.query(
+            IncidentType.name, IncidentType.color,
+            func.count(BusIncidentRecord.id),
+        ).join(BusIncidentRecord).filter(*base_filters, actual_filter).group_by(
+            IncidentType.id, IncidentType.name, IncidentType.color,
+            IncidentType.operational_priority).order_by(
+                IncidentType.operational_priority.desc(), IncidentType.name).all()
+        by_bus_rows = db.session.query(
+            Bus.id, Bus.identifier, Bus.name, func.count(BusIncidentRecord.id),
+        ).join(BusIncidentRecord).join(IncidentType).filter(
+            *base_filters, actual_filter).group_by(
+                Bus.id, Bus.identifier, Bus.name).order_by(
+                    func.count(BusIncidentRecord.id).desc(),
+                    Bus.identifier, Bus.name).limit(12).all()
+        by_day_rows = db.session.query(
+            BusIncidentRecord.incident_date, func.count(BusIncidentRecord.id),
+        ).join(IncidentType).filter(*base_filters, actual_filter).group_by(
+            BusIncidentRecord.incident_date).order_by(
+                BusIncidentRecord.incident_date).all()
+        recent = BusIncidentRecord.query.options(
+            joinedload(BusIncidentRecord.bus),
+            joinedload(BusIncidentRecord.incident_type),
+            joinedload(BusIncidentRecord.schedule_type),
+            joinedload(BusIncidentRecord.created_by),
+        ).join(IncidentType).filter(
+            *base_filters, actual_filter).order_by(
+                BusIncidentRecord.created_at.desc()).limit(15).all()
+        snapshot.update({
+            'period_incidents': int(totals[0] or 0),
+            'period_pending': int(totals[1] or 0),
+            'period_delay_minutes': int(totals[2] or 0),
+            'period_average_delay': round(float(totals[3] or 0), 1),
+            'by_type': {name: int(count) for name, _color, count in by_type_rows},
+            'by_type_colors': [color for _name, color, _count in by_type_rows],
+            'by_bus': {
+                f'{identifier} - {name}': int(count)
+                for _bus_id, identifier, name, count in by_bus_rows
+            },
+            'by_day': {day.isoformat(): int(count) for day, count in by_day_rows},
+            'recent': recent,
+        })
+    return snapshot
+
 @app.route('/admin/')
 @app.route('/admin/dashboard')
 @login_required
 def dashboard():
-    today = district_today()
-    # Date filter
+    cfg = get_config()
+    today = district_today(cfg)
     period = request.args.get('period', 'today')
+    if period not in {'today', 'week', 'month', 'year', 'custom'}:
+        period = 'today'
     date_from = request.args.get('date_from', today.isoformat())
-    date_to   = request.args.get('date_to',   today.isoformat())
-
-    if period == 'today':
-        d_from = d_to = today
-    elif period == 'week':
-        d_from = today - timedelta(days=today.weekday())
-        d_to   = today
-    elif period == 'month':
-        d_from = today.replace(day=1)
-        d_to   = today
-    elif period == 'year':
-        d_from = today.replace(month=1, day=1)
-        d_to   = today
-    else:
-        try:
-            d_from = date.fromisoformat(date_from)
-            d_to   = date.fromisoformat(date_to)
-        except Exception:
-            d_from = d_to = today
-
-    buses      = Bus.query.filter_by(active=True).all()
-    total_buses = len(buses)
-
-    # Today's status summary
-    on_time_count = 0
-    for bus in buses:
-        status, _ = get_bus_status(bus.id, today)
-        if status and status.is_default:
-            on_time_count += 1
-
-    # All incidents in period (pending + committed)
-    period_incidents = BusIncidentRecord.query.filter(
-        BusIncidentRecord.incident_date >= d_from,
-        BusIncidentRecord.incident_date <= d_to,
-    ).all()
-    pending_count = sum(1 for inc in period_incidents if inc.is_pending)
-
-    # Chart data: by incident type (only non-default types)
-    by_type = {}
-    by_type_colors = {}
-    for inc in period_incidents:
-        if not inc.incident_type.is_default:
-            name = inc.incident_type.name
-            by_type[name] = by_type.get(name, 0) + 1
-            by_type_colors[name] = inc.incident_type.color
-
-    # Chart data: by bus (only buses with non-default incidents)
-    by_bus = {}
-    for inc in period_incidents:
-        if not inc.incident_type.is_default:
-            n = inc.bus.identifier
-            by_bus[n] = by_bus.get(n, 0) + 1
-
-    # Chart data: incidents per day (non-default only)
-    by_day = {}
-    for inc in period_incidents:
-        if not inc.incident_type.is_default:
-            d = inc.incident_date.isoformat()
-            by_day[d] = by_day.get(d, 0) + 1
-
-    recent = BusIncidentRecord.query.filter(
-        BusIncidentRecord.incident_date >= d_from,
-    ).order_by(BusIncidentRecord.created_at.desc()).limit(15).all()
-
-    buses_today     = bus_list_today()
-    incident_types  = IncidentType.query.order_by(IncidentType.sort_order).all()
-    all_buses       = Bus.query.filter_by(active=True).order_by(Bus.identifier).all()
-
-    # period_incidents count: only non-default (actual incidents)
-    actual_incidents = sum(1 for inc in period_incidents if not inc.incident_type.is_default)
-
-    return render_template('admin/dashboard.html',
-        total_buses=total_buses, on_time_count=on_time_count,
-        with_incidents=total_buses - on_time_count,
-        period_incidents=actual_incidents,
-        pending_count=pending_count,
-        buses_today=buses_today,
-        recent=recent, period=period,
-        date_from=d_from.isoformat(), date_to=d_to.isoformat(),
-        by_type_json=by_type,
-        by_type_colors_json=list(by_type_colors.values()),
-        by_bus_json=by_bus,
-        by_day_json=by_day,
-        incident_types=incident_types, all_buses=all_buses,
-        today=today,
+    date_to = request.args.get('date_to', today.isoformat())
+    can_view_buses = current_user.has_access('buses', 'limited')
+    can_write_buses = current_user.has_access('buses', 'full')
+    can_view_statistics = current_user.has_access('statistics', 'limited')
+    can_view_notifications = current_user.has_access('notifications', 'limited')
+    snapshot = _build_dashboard_snapshot(
+        period, date_from, date_to,
+        can_view_buses=can_view_buses,
+        can_view_statistics=can_view_statistics,
+        can_view_notifications=can_view_notifications,
+    )
+    incident_types = []
+    schedule_types = []
+    delay_reasons = []
+    incident_request_token = None
+    if can_view_buses:
+        incident_types = IncidentType.query.order_by(
+            IncidentType.operational_priority.desc(),
+            IncidentType.sort_order, IncidentType.name).all()
+        schedule_types = BusScheduleType.query.order_by(
+            BusScheduleType.sort_order).all()
+    if can_write_buses:
+        delay_reasons = DelayReason.query.order_by(DelayReason.sort_order).all()
+        incident_request_token = _issue_incident_request_token()
+    selected_bus_id = request.args.get('bus', type=int)
+    return render_template(
+        'admin/dashboard.html', snapshot=snapshot,
+        period=period, date_from=snapshot['date_from'].isoformat(),
+        date_to=snapshot['date_to'].isoformat(), today=today,
+        can_view_buses=can_view_buses,
+        can_write_buses=can_write_buses,
+        can_view_statistics=can_view_statistics,
+        can_view_notifications=can_view_notifications,
+        incident_types=incident_types, schedule_types=schedule_types,
+        delay_reasons=delay_reasons,
+        incident_request_token=incident_request_token,
+        selected_bus_id=selected_bus_id,
     )
 
 
@@ -3202,7 +3479,9 @@ def buses():
                            buses_data=buses_data, incident_types=incident_types,
                            schedule_types=schedule_types, delay_reasons=delay_reasons,
                            current_period=current_period,
-                           can_write=can_write, today=today)
+                           can_write=can_write, today=today,
+                           incident_request_token=(
+                               _issue_incident_request_token() if can_write else None))
 
 @app.route('/admin/buses/add', methods=['POST'])
 @login_required
@@ -3286,38 +3565,96 @@ def delete_bus(bus_id):
 @require_module('buses', 'full')
 def add_bus_incident(bus_id):
     bus = Bus.query.get_or_404(bus_id)
+    next_url = _safe_local_redirect(request.form.get('next', '')) or url_for('buses')
+    request_token = request.form.get('request_token', '').strip()
+    existing = (BusIncidentRecord.query.filter_by(request_token=request_token).first()
+                if request_token else None)
+    if existing:
+        flash('This status update was already recorded.', 'warning')
+        return redirect(next_url)
+    if not _consume_incident_request_token(request_token):
+        flash('This status form expired. Open the bus and try again.', 'error')
+        return redirect(next_url)
+    if not bus.active:
+        flash('This bus is inactive and cannot receive a status update.', 'error')
+        return redirect(next_url)
+
     inc_type_id = request.form.get('incident_type_id', type=int)
-    if not inc_type_id:
-        flash('Select an incident type.', 'error')
-        return redirect(url_for('buses'))
-    # Handle delay reason: preset or free-text
-    reason_id   = request.form.get('delay_reason_id', type=int) or None
+    incident_type = db.session.get(IncidentType, inc_type_id) if inc_type_id else None
+    if not incident_type:
+        flash('Select a valid incident type.', 'error')
+        return redirect(next_url)
+    schedule_type_id = request.form.get('schedule_type_id', type=int) or None
+    if schedule_type_id and not db.session.get(BusScheduleType, schedule_type_id):
+        flash('Select a valid schedule period.', 'error')
+        return redirect(next_url)
+    delay_minutes = request.form.get('delay_minutes', type=int)
+    if delay_minutes is None or not 0 <= delay_minutes <= 999:
+        flash('Delay must be between 0 and 999 minutes.', 'error')
+        return redirect(next_url)
+    eta = request.form.get('eta', '').strip() or None
+    if eta and _parse_clock_value(eta) is None:
+        flash('Enter a valid ETA.', 'error')
+        return redirect(next_url)
+    reason_raw = request.form.get('delay_reason_id', '').strip()
+    reason_id = int(reason_raw) if reason_raw.isdigit() else None
+    if reason_id and not db.session.get(DelayReason, reason_id):
+        flash('Select a valid delay reason.', 'error')
+        return redirect(next_url)
     reason_text = request.form.get('delay_reason_text', '').strip() or None
+    if reason_text and len(reason_text) > 200:
+        flash('The custom delay reason cannot exceed 200 characters.', 'error')
+        return redirect(next_url)
     if reason_id:
-        reason_text = None  # preset takes precedence
+        reason_text = None
+    notes = request.form.get('notes', '').strip() or None
+    if notes and len(notes) > 2000:
+        flash('Notes cannot exceed 2,000 characters.', 'error')
+        return redirect(next_url)
     rec = BusIncidentRecord(
         bus_id=bus_id, incident_type_id=inc_type_id,
-        schedule_type_id=request.form.get('schedule_type_id', type=int) or None,
-        delay_minutes=request.form.get('delay_minutes', 0, type=int),
-        eta=request.form.get('eta', '').strip() or None,
+        schedule_type_id=schedule_type_id,
+        delay_minutes=delay_minutes,
+        eta=eta,
         delay_reason_id=reason_id,
         delay_reason_text=reason_text,
-        notes=request.form.get('notes', '').strip() or None,
+        notes=notes,
         incident_date=district_today(), is_pending=True,
         created_by_id=current_user.id,
+        request_token=request_token,
     )
     db.session.add(rec)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        if BusIncidentRecord.query.filter_by(request_token=request_token).first():
+            flash('This status update was already recorded.', 'warning')
+            return redirect(next_url)
+        raise
+    _audit('add_bus_incident', 'buses', bus.display_name, json.dumps({
+        'incident_record_id': rec.id,
+        'incident_type_id': incident_type.id,
+        'schedule_type_id': schedule_type_id,
+        'delay_minutes': delay_minutes,
+    }, sort_keys=True))
     flash(f'Incident recorded for {bus.identifier}.', 'success')
-    return redirect(url_for('buses'))
+    return redirect(next_url)
 
 @app.route('/admin/bus-incidents/<int:rec_id>/delete', methods=['POST'])
 @login_required
 @require_module('buses', 'full')
 def delete_bus_incident(rec_id):
     rec = BusIncidentRecord.query.get_or_404(rec_id)
+    target = rec.bus.display_name
+    details = json.dumps({
+        'incident_record_id': rec.id,
+        'incident_type_id': rec.incident_type_id,
+        'was_pending': bool(rec.is_pending),
+    }, sort_keys=True)
     db.session.delete(rec)
     db.session.commit()
+    _audit('delete_bus_incident', 'buses', target, details)
     flash('Incident removed.', 'success')
     return redirect(request.referrer or url_for('buses'))
 
@@ -3361,11 +3698,14 @@ def add_incident_type():
     color = request.form.get('color', '#6b7280').strip()
     icon = request.form.get('icon', 'fa-circle').strip()
     description = request.form.get('description', '').strip() or None
+    priority = request.form.get('operational_priority', 50, type=int)
     if (len(name) > 100 or not re.fullmatch(r'#[0-9A-Fa-f]{6}', color) or
             not re.fullmatch(r'fa-[a-z0-9-]{1,47}', icon) or
+            priority is None or not 0 <= priority <= 100 or
             (description and len(description) > 255)):
         abort(400)
-    it = IncidentType(name=name, color=color, icon=icon, description=description)
+    it = IncidentType(name=name, color=color, icon=icon, description=description,
+                      operational_priority=priority)
     db.session.add(it)
     db.session.commit()
     flash(f'Status type "{name}" created.', 'success')
@@ -3380,14 +3720,18 @@ def edit_incident_type(type_id):
     color = request.form.get('color', it.color).strip()
     icon = request.form.get('icon', it.icon).strip()
     description = request.form.get('description', '').strip() or None
+    priority = request.form.get(
+        'operational_priority', it.operational_priority, type=int)
     if (not name or len(name) > 100 or not re.fullmatch(r'#[0-9A-Fa-f]{6}', color) or
             not re.fullmatch(r'fa-[a-z0-9-]{1,47}', icon) or
+            priority is None or not 0 <= priority <= 100 or
             (description and len(description) > 255)):
         abort(400)
     it.name = name
     it.color = color
     it.icon = icon
     it.description = description
+    it.operational_priority = priority
     db.session.commit()
     flash('Status type updated.', 'success')
     return redirect(url_for('incidents'))
@@ -3595,7 +3939,11 @@ def _parse_period(period, d_from_s, d_to_s, today):
     if period == 'month':    return today.replace(day=1), today
     if period == 'year':     return today.replace(month=1, day=1), today
     try:
-        return date.fromisoformat(d_from_s), date.fromisoformat(d_to_s)
+        selected_from = date.fromisoformat(d_from_s)
+        selected_to = date.fromisoformat(d_to_s)
+        if selected_from > selected_to:
+            selected_from, selected_to = selected_to, selected_from
+        return selected_from, selected_to
     except Exception:
         return today, today
 

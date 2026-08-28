@@ -1,0 +1,81 @@
+<input type="hidden" name="request_token" value="{{ incident_request_token or '' }}">
+<input type="hidden" name="next" id="incident-next" value="{{ incident_return_to or url_for('buses') }}">
+<div>
+  <label class="block text-xs font-semibold text-slate-600 mb-2">Status type *</label>
+  <div class="grid grid-cols-2 gap-2 max-h-52 overflow-y-auto pr-1">
+    {% for it in incident_types %}
+    <label class="flex items-center space-x-2.5 p-2.5 border-2 border-slate-100 rounded-xl cursor-pointer hover:border-blue-300 transition-all has-[:checked]:border-blue-500 has-[:checked]:bg-blue-50">
+      <input type="radio" name="incident_type_id" value="{{ it.id }}" class="sr-only" required>
+      <span class="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0"
+            style="background-color:{{ it.color }}20; color:{{ it.color }}">
+        <i class="fas {{ it.icon }} text-xs" aria-hidden="true"></i>
+      </span>
+      <span class="text-xs font-medium text-slate-700 leading-tight">{{ it.name }}</span>
+    </label>
+    {% endfor %}
+  </div>
+</div>
+<div class="grid grid-cols-2 gap-3">
+  <div>
+    <label class="block text-xs font-semibold text-slate-600 mb-1" for="incident-schedule">Schedule period</label>
+    <select name="schedule_type_id" id="incident-schedule" class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      <option value="">Not specified</option>
+      {% for s in schedule_types %}<option value="{{ s.id }}">{{ s.name }}{% if s.time_label %} ({{ s.time_label }}){% endif %}</option>{% endfor %}
+    </select>
+  </div>
+  <div>
+    <label class="block text-xs font-semibold text-slate-600 mb-1" for="inc-delay">Delay (minutes)</label>
+    <input type="number" name="delay_minutes" id="inc-delay" min="0" max="999" value="0"
+           class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+  </div>
+  <div class="col-span-2">
+    <label class="block text-xs font-semibold text-slate-600 mb-1" for="inc-eta">ETA <span class="font-normal text-slate-400">(estimated arrival time)</span></label>
+    <input type="time" name="eta" id="inc-eta"
+           class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+  </div>
+</div>
+<div>
+  <label class="block text-xs font-semibold text-slate-600 mb-1" for="inc-reason-select">Delay reason <span class="font-normal text-slate-400">(optional)</span></label>
+  <div class="flex space-x-2">
+    <select name="delay_reason_id" id="inc-reason-select" onchange="toggleCustomReason()"
+            class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      <option value="">No specific reason</option>
+      {% for dr in delay_reasons %}<option value="{{ dr.id }}">{{ dr.reason }}</option>{% endfor %}
+      <option value="custom">Write custom reason…</option>
+    </select>
+    <button type="button" onclick="showAddReason()"
+            class="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm transition-colors"
+            title="Add new reason to list" aria-label="Add a delay reason">
+      <i class="fas fa-plus text-xs" aria-hidden="true"></i>
+    </button>
+  </div>
+  <div id="inc-reason-custom" class="hidden mt-2">
+    <input type="text" name="delay_reason_text" id="inc-reason-text" maxlength="200"
+           placeholder="Describe the reason…"
+           class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+  </div>
+  <div id="add-reason-panel" class="hidden mt-2 flex space-x-2">
+    <input type="text" id="new-reason-input" maxlength="200" placeholder="New reason to add to list…"
+           class="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <button type="button" onclick="submitNewReason()"
+            class="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium transition-colors"
+            aria-label="Save delay reason"><i class="fas fa-plus" aria-hidden="true"></i></button>
+  </div>
+</div>
+<div>
+  <label class="block text-xs font-semibold text-slate-600 mb-1" for="incident-notes">Notes (optional)</label>
+  <textarea name="notes" id="incident-notes" rows="2" maxlength="2000"
+            class="w-full px-3 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+            placeholder="Additional details…"></textarea>
+</div>
+<div class="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700 flex items-start space-x-2">
+  <i class="fas fa-clock flex-shrink-0 mt-0.5" aria-hidden="true"></i>
+  <span>This update will be committed to statistics after the configured confirmation period.</span>
+</div>
+<div class="flex space-x-2">
+  <button type="button" data-close-incident
+          class="flex-1 min-h-11 py-2.5 border border-slate-200 text-slate-600 rounded-xl text-sm hover:bg-slate-50">Cancel</button>
+  <button type="submit" class="flex-1 min-h-11 py-2.5 bg-amber-500 text-white rounded-xl text-sm font-semibold hover:bg-amber-600">
+    <i class="fas fa-save mr-1" aria-hidden="true"></i>Record update
+  </button>
+</div>
