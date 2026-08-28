@@ -23,6 +23,8 @@
   const groupFilter = byId('dashboard-group-filter');
   const schoolFilter = byId('dashboard-school-filter');
   const savedView = byId('dashboard-saved-view');
+  const filterToggle = byId('dashboard-filter-toggle');
+  const filterPanel = byId('dashboard-filter-panel');
   const resultStatus = byId('dashboard-filter-status');
   const noResults = byId('dashboard-no-results');
   const attentionSection = byId('attention-bus-section');
@@ -163,15 +165,15 @@
   function fillFilter(select, kind, label) {
     if (!select) return;
     const current = select.value;
-    select.replaceChildren(new Option(`All ${label}`, ''));
+    select.replaceChildren(new Option(label, ''));
     optionValues(kind).forEach((value) => select.add(new Option(value, normalize(value))));
     select.value = Array.from(select.options).some((option) => option.value === current) ? current : '';
   }
 
   function populateDynamicFilters() {
-    fillFilter(routeFilter, 'route', 'routes');
-    fillFilter(groupFilter, 'group', 'groups');
-    fillFilter(schoolFilter, 'school', 'schools');
+    fillFilter(routeFilter, 'route', 'Route');
+    fillFilter(groupFilter, 'group', 'Group');
+    fillFilter(schoolFilter, 'school', 'School');
   }
 
   function matchesSearch(card, query) {
@@ -212,7 +214,14 @@
       if (query || selectedStatus || selectedSchedule || selectedRoute || selectedGroup || selectedSchool || summaryMode === 'on-time') onTimeSection.open = visibleOnTime > 0;
     }
     noResults?.classList.toggle('hidden', visible !== 0);
-    if (resultStatus) resultStatus.textContent = `${visible} of ${cards.length} buses shown`;
+    if (resultStatus) resultStatus.textContent = `${visible}/${cards.length} buses`;
+    const activeFilterCount = [query, selectedStatus, selectedSchedule, selectedRoute, selectedGroup, selectedSchool].filter(Boolean).length + (summaryMode === 'all' ? 0 : 1);
+    const filterCount = byId('dashboard-filter-count');
+    if (filterCount) {
+      filterCount.textContent = String(activeFilterCount);
+      filterCount.classList.toggle('hidden', activeFilterCount === 0);
+      filterCount.classList.toggle('inline-flex', activeFilterCount > 0);
+    }
     document.querySelectorAll('[data-summary-filter]').forEach((button) => {
       const active = button.dataset.summaryFilter === summaryMode;
       button.setAttribute('aria-pressed', String(active));
@@ -243,7 +252,7 @@
 
   function renderSavedViews() {
     if (!savedView) return;
-    savedView.replaceChildren(new Option('Saved views…', ''));
+    savedView.replaceChildren(new Option('Views…', ''));
     storedViews().forEach((view, index) => savedView.add(new Option(view.name, String(index))));
   }
 
@@ -550,6 +559,11 @@
   byId('dashboard-pending-shortcut')?.addEventListener('click', () => byId('dashboard-pending-section')?.scrollIntoView({behavior: 'smooth'}));
   byId('dashboard-save-view')?.addEventListener('click', saveView);
   savedView?.addEventListener('change', () => applySavedFilters(storedViews()[Number(savedView.value)]?.filters));
+  filterToggle?.addEventListener('click', () => {
+    const open = filterToggle.getAttribute('aria-expanded') !== 'true';
+    filterToggle.setAttribute('aria-expanded', String(open));
+    filterPanel?.classList.toggle('is-open', open);
+  });
   byId('dashboard-bulk-toggle')?.addEventListener('click', () => toggleBulkMode());
   byId('dashboard-clear-selection')?.addEventListener('click', clearSelection);
   byId('dashboard-select-visible')?.addEventListener('click', () => { document.querySelectorAll('.dashboard-filterable:not(.hidden)').forEach((card) => selectedBusIds.add(Number(card.dataset.busId))); updateSelectionUI(); });

@@ -250,6 +250,8 @@ def test_dashboard_phase_three_and_four_ui_contracts():
         'dashboard-refresh', 'dashboard-pending-section', 'dashboard-bulk-bar',
         'dashboard-bulk-modal', 'dashboard-route-filter', 'dashboard-group-filter',
         'dashboard-school-filter', 'dashboard-saved-view',
+        'dashboard-filter-toggle', 'dashboard-filter-panel',
+        'dashboard-filter-count', 'dashboard-operations-header',
         'drawer-preview-recipients', 'dashboard-toast-region',
     ):
         assert contract in template
@@ -257,6 +259,7 @@ def test_dashboard_phase_three_and_four_ui_contracts():
         'If-None-Match', 'document.hidden', 'visibilitychange',
         'setInterval(() => refreshOperations(false), 25000)',
         'localStorage', 'expected_latest_ids', 'data-pending-until',
+        "filterPanel?.classList.toggle('is-open', open)",
     ):
         assert contract in script
     assert 'data-contact-field="preferred_language"' in notifications
