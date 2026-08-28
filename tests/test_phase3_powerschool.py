@@ -370,7 +370,7 @@ def test_recovery_command_closes_clean_interruption_and_preserves_evidence(
 
     runner = application.app.test_cli_runner()
     dry_run = runner.invoke(args=[
-        'recover-powerschool-apply', report['batch_id'],
+        'recover-powerschool-apply', '--', report['batch_id'],
     ])
     assert dry_run.exit_code == 0, dry_run.output
     proof = json.loads(dry_run.output)
@@ -378,12 +378,13 @@ def test_recovery_command_closes_clean_interruption_and_preserves_evidence(
     assert proof['prestate_mismatches'] == 0
 
     recovered = runner.invoke(args=[
-        'recover-powerschool-apply', report['batch_id'],
-        '--apply', '--manifest-sha', proof['manifest_sha256'],
+        'recover-powerschool-apply', '--apply',
+        '--manifest-sha', proof['manifest_sha256'],
         '--expected-plan-hash', proof['plan_hash'],
         '--expected-file-sha', proof['file_sha256'],
         '--expected-selected', str(proof['selected_rows']),
         '--approved-by', 'admin', '--confirm-worker-stopped',
+        '--', report['batch_id'],
     ])
     assert recovered.exit_code == 0, recovered.output
     with application.app.app_context():
@@ -422,7 +423,7 @@ def test_recovery_command_fails_closed_when_any_change_exists(
 
     runner = application.app.test_cli_runner()
     result = runner.invoke(args=[
-        'recover-powerschool-apply', report['batch_id'],
+        'recover-powerschool-apply', '--', report['batch_id'],
     ])
     assert result.exit_code == 0, result.output
     proof = json.loads(result.output)
@@ -1054,6 +1055,7 @@ def test_rollback_fails_closed_after_subscriber_pk_is_reused_identically(
         replacement = application.NotificationSubscriber(
             id=expected['id'], notes=expected['notes'],
             active=expected['active'], group_id=expected['group_id'],
+            school=expected.get('school'),
             created_at=change_created_at + timedelta(seconds=1))
         application.db.session.add(replacement)
         application.db.session.flush()
@@ -1062,6 +1064,7 @@ def test_rollback_fails_closed_after_subscriber_pk_is_reused_identically(
                 id=item['id'], subscriber_id=replacement.id,
                 first_name=item['first_name'], last_name=item['last_name'],
                 email=item['email'], phone=item['phone'], role=item['role'],
+                preferred_language=item.get('preferred_language', 'en'),
                 sort_order=item['sort_order']))
         application.db.session.commit()
         current = application._subscriber_snapshot(replacement)

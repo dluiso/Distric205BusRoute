@@ -112,7 +112,7 @@ def test_brightarrow_transportation_v2_raw_headers_expand_am_and_pm():
 
     student = result["students"][0]
     assert result["normalizer_revision"] == NORMALIZER_REVISION
-    assert NORMALIZER_REVISION == "2026-08-27.7"
+    assert NORMALIZER_REVISION == "2026-08-27.8"
     assert result["preflight"]["transportation_contract"] == (
         TRANSPORTATION_V2_CONTRACT
     )

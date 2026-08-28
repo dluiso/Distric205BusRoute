@@ -392,6 +392,8 @@
     document.getElementById('inc-reason-custom').classList.add('hidden');
     document.getElementById('inc-reason-text').value = '';
     document.getElementById('add-reason-panel').classList.add('hidden');
+    document.getElementById('incident-expected-latest').value = '';
+    document.getElementById('incident-replace-id').value = '';
     // Auto-select the active period
     const sel = document.querySelector('#form-incident select[name="schedule_type_id"]');
     if (sel) sel.value = CURRENT_PERIOD_ID !== null ? String(CURRENT_PERIOD_ID) : '';

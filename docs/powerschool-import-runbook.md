@@ -293,7 +293,7 @@ the original database transaction cannot still be running. Then run the recovery
 from the application environment without `--apply`:
 
 ```bash
-flask --app app recover-powerschool-apply BATCH_ID
+flask --app app recover-powerschool-apply -- BATCH_ID
 ```
 
 The dry run verifies the immutable plan, raw-file checksums, selected count, target
@@ -303,14 +303,15 @@ result is a NO-GO for automated recovery. To close only that proven clean interr
 copy every pin exactly and run:
 
 ```bash
-flask --app app recover-powerschool-apply BATCH_ID \
+flask --app app recover-powerschool-apply \
   --apply \
   --manifest-sha MANIFEST_SHA_FROM_DRY_RUN \
   --expected-plan-hash PLAN_HASH_FROM_DRY_RUN \
   --expected-file-sha FILE_SHA_FROM_DRY_RUN \
   --expected-selected SELECTED_COUNT_FROM_DRY_RUN \
   --approved-by ACTIVE_ADMIN_USERNAME \
-  --confirm-worker-stopped
+  --confirm-worker-stopped \
+  -- BATCH_ID
 ```
 
 Recovery marks the interrupted batch `failed`, retains its rows/files as evidence and

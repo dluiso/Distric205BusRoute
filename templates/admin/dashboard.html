@@ -7,6 +7,9 @@
 <style>
   .dashboard-bus-card { transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease; }
   .dashboard-bus-card:hover { transform: translateY(-1px); box-shadow: 0 12px 24px rgb(15 23 42 / .08); }
+  .dashboard-bus-card.is-changed { animation: dashboard-change 2.4s ease; }
+  .dashboard-bus-card.is-selected { border-color: rgb(37 99 235); box-shadow: 0 0 0 2px rgb(37 99 235 / .18); }
+  @keyframes dashboard-change { 0%, 35% { box-shadow: 0 0 0 4px rgb(59 130 246 / .32); } 100% { box-shadow: none; } }
   .dashboard-drawer { transform: translateX(100%); transition: transform .22s ease; }
   .dashboard-drawer.is-open { transform: translateX(0); }
   .dashboard-overlay { opacity: 0; transition: opacity .22s ease; }
@@ -19,12 +22,17 @@
 {% endblock %}
 
 {% macro bus_card(bus, compact=False) -%}
-<article class="dashboard-bus-card dashboard-filterable bg-white rounded-2xl border overflow-hidden {{ 'border-amber-200' if bus.is_attention else 'border-slate-100' }}"
+<article class="dashboard-bus-card dashboard-filterable relative bg-white rounded-2xl border overflow-hidden {{ 'border-amber-200' if bus.is_attention else 'border-slate-100' }}"
          data-bus-id="{{ bus.id }}" data-status="{{ bus.status }}"
          data-schedule="{{ bus.schedule_names|lower }}"
+         data-route="{{ bus.route|lower }}"
+         data-groups="{{ bus.group_names|join(' ')|lower }}"
+         data-schools="{{ bus.school_names|join(' ')|lower }}"
+         data-version="{{ bus.version }}"
          data-search="{{ (bus.identifier ~ ' ' ~ bus.name ~ ' ' ~ bus.route)|lower }}"
          data-attention="{{ '1' if bus.is_attention else '0' }}"
          data-pending="{{ '1' if bus.latest and bus.latest.pending else '0' }}">
+  {% if can_write_buses %}<label class="dashboard-bulk-selector hidden absolute z-10 mt-3 ml-3 w-9 h-9 rounded-xl bg-white border border-slate-200 shadow-sm items-center justify-center" aria-label="Select {{ bus.display_name }}"><input type="checkbox" data-select-bus="{{ bus.id }}" class="w-4 h-4 rounded border-slate-300 text-blue-600"></label>{% endif %}
   <button type="button" data-open-bus="{{ bus.id }}" class="w-full text-left focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500">
     <div class="h-1.5" style="background:{{ bus.status_color }}"></div>
     <div class="{{ 'p-3' if compact else 'p-4' }}">
@@ -77,11 +85,13 @@
     </form>
     {% endif %}
     <div class="xl:ml-auto flex flex-wrap items-center gap-2 text-xs">
-      <span class="inline-flex items-center gap-2 px-3 min-h-10 rounded-xl bg-emerald-50 text-emerald-700 font-semibold">
+      <span id="dashboard-period-chip" class="inline-flex items-center gap-2 px-3 min-h-10 rounded-xl bg-emerald-50 text-emerald-700 font-semibold">
         <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
-        {{ snapshot.current_period.name ~ ' period' if snapshot.current_period else 'No active period' }}
+        <span id="dashboard-period-name">{{ snapshot.current_period.name ~ ' period' if snapshot.current_period else 'No active period' }}</span>
       </span>
-      <span class="px-3 min-h-10 inline-flex items-center rounded-xl bg-slate-50 text-slate-500">District time {{ snapshot.now_local.strftime('%-I:%M %p') }}</span>
+      <span id="dashboard-sync-status" class="px-3 min-h-10 inline-flex items-center gap-2 rounded-xl bg-slate-50 text-slate-500"><i class="fas fa-signal text-emerald-500" aria-hidden="true"></i><span>Updated {{ snapshot.now_local.strftime('%-I:%M:%S %p') }}</span></span>
+      <button id="dashboard-refresh" type="button" class="min-h-10 inline-flex items-center gap-2 px-3 rounded-xl border border-slate-200 text-slate-600 font-semibold"><i class="fas fa-rotate" aria-hidden="true"></i>Refresh</button>
+      <button id="dashboard-pending-shortcut" type="button" class="min-h-10 inline-flex items-center gap-2 px-3 rounded-xl bg-purple-50 text-purple-700 font-semibold"><i class="fas fa-hourglass-half" aria-hidden="true"></i>Pending <span id="dashboard-pending-badge" class="min-w-5 h-5 px-1 rounded-full bg-purple-600 text-white inline-flex items-center justify-center">{{ snapshot.pending_today }}</span></button>
       {% if can_write_buses %}<a href="{{ url_for('buses') }}" class="min-h-10 inline-flex items-center gap-2 px-3 rounded-xl bg-blue-50 text-blue-700 font-semibold"><i class="fas fa-plus-circle" aria-hidden="true"></i>Record update</a>{% endif %}
     </div>
   </div>
@@ -93,24 +103,25 @@
   <h2 class="font-bold text-slate-700">No operational modules assigned</h2>
   <p class="text-sm text-slate-400 mt-1">Ask an administrator for Buses or Statistics access.</p>
 </section>
+
 {% endif %}
 
 {% if can_view_buses %}
 <section class="grid grid-cols-2 xl:grid-cols-4 gap-3 mb-4" aria-label="Current operational summary">
   <button type="button" data-summary-filter="attention" class="bg-white rounded-2xl border border-slate-100 p-4 text-left shadow-sm hover:border-amber-300 focus:ring-2 focus:ring-amber-400">
-    <div class="flex items-center justify-between"><span class="w-10 h-10 rounded-xl bg-amber-100 text-amber-600 flex items-center justify-center"><i class="fas fa-triangle-exclamation" aria-hidden="true"></i></span><span class="text-2xl font-black text-slate-800">{{ snapshot.attention_count }}</span></div>
+    <div class="flex items-center justify-between"><span class="w-10 h-10 rounded-xl bg-amber-100 text-amber-600 flex items-center justify-center"><i class="fas fa-triangle-exclamation" aria-hidden="true"></i></span><span data-kpi="attention" class="text-2xl font-black text-slate-800">{{ snapshot.attention_count }}</span></div>
     <p class="text-xs font-semibold text-slate-500 mt-2">Needs attention now</p>
   </button>
   <button type="button" data-summary-filter="pending" class="bg-white rounded-2xl border border-slate-100 p-4 text-left shadow-sm hover:border-purple-300 focus:ring-2 focus:ring-purple-400">
-    <div class="flex items-center justify-between"><span class="w-10 h-10 rounded-xl bg-purple-100 text-purple-600 flex items-center justify-center"><i class="fas fa-hourglass-half" aria-hidden="true"></i></span><span class="text-2xl font-black text-slate-800">{{ snapshot.pending_today }}</span></div>
+    <div class="flex items-center justify-between"><span class="w-10 h-10 rounded-xl bg-purple-100 text-purple-600 flex items-center justify-center"><i class="fas fa-hourglass-half" aria-hidden="true"></i></span><span data-kpi="pending" class="text-2xl font-black text-slate-800">{{ snapshot.pending_today }}</span></div>
     <p class="text-xs font-semibold text-slate-500 mt-2">Pending confirmation</p>
   </button>
   <button type="button" data-summary-filter="on-time" class="bg-white rounded-2xl border border-slate-100 p-4 text-left shadow-sm hover:border-emerald-300 focus:ring-2 focus:ring-emerald-400">
-    <div class="flex items-center justify-between"><span class="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-600 flex items-center justify-center"><i class="fas fa-circle-check" aria-hidden="true"></i></span><span class="text-2xl font-black text-slate-800">{{ snapshot.on_time_count }}</span></div>
+    <div class="flex items-center justify-between"><span class="w-10 h-10 rounded-xl bg-emerald-100 text-emerald-600 flex items-center justify-center"><i class="fas fa-circle-check" aria-hidden="true"></i></span><span data-kpi="on-time" class="text-2xl font-black text-slate-800">{{ snapshot.on_time_count }}</span></div>
     <p class="text-xs font-semibold text-slate-500 mt-2">On time now</p>
   </button>
   <button type="button" data-summary-filter="all" class="bg-white rounded-2xl border border-slate-100 p-4 text-left shadow-sm hover:border-blue-300 focus:ring-2 focus:ring-blue-400">
-    <div class="flex items-center justify-between"><span class="w-10 h-10 rounded-xl bg-blue-100 text-blue-600 flex items-center justify-center"><i class="fas fa-bus" aria-hidden="true"></i></span><span class="text-2xl font-black text-slate-800">{{ snapshot.total_buses }}</span></div>
+    <div class="flex items-center justify-between"><span class="w-10 h-10 rounded-xl bg-blue-100 text-blue-600 flex items-center justify-center"><i class="fas fa-bus" aria-hidden="true"></i></span><span data-kpi="total" class="text-2xl font-black text-slate-800">{{ snapshot.total_buses }}</span></div>
     <p class="text-xs font-semibold text-slate-500 mt-2">Active buses</p>
   </button>
 </section>
@@ -127,7 +138,7 @@
       <h2 id="operations-heading" class="font-black text-slate-800 flex items-center gap-2"><i class="fas fa-satellite-dish text-emerald-500" aria-hidden="true"></i>Live bus operations</h2>
       <p class="text-xs text-slate-400 mt-0.5">Exceptions first · current district period</p>
     </div>
-    <div class="lg:ml-auto flex flex-col sm:flex-row gap-2">
+    <div class="lg:ml-auto flex flex-wrap gap-2">
       <div class="relative min-w-64">
         <label class="sr-only" for="dashboard-bus-search">Search buses</label>
         <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-300 text-xs" aria-hidden="true"></i>
@@ -137,6 +148,18 @@
       <select id="dashboard-status-filter" class="min-h-11 px-3 border border-slate-200 rounded-xl text-sm bg-white"><option value="">All statuses</option>{% for type in incident_types %}<option value="{{ type.name }}">{{ type.name }}</option>{% endfor %}</select>
       <label class="sr-only" for="dashboard-schedule-filter">Filter by schedule</label>
       <select id="dashboard-schedule-filter" class="min-h-11 px-3 border border-slate-200 rounded-xl text-sm bg-white"><option value="">All schedules</option>{% for schedule in schedule_types %}<option value="{{ schedule.name|lower }}">{{ schedule.name }}</option>{% endfor %}</select>
+      <label class="sr-only" for="dashboard-route-filter">Filter by route</label>
+      <select id="dashboard-route-filter" class="min-h-11 px-3 border border-slate-200 rounded-xl text-sm bg-white"><option value="">All routes</option></select>
+      {% if can_view_notifications %}
+      <label class="sr-only" for="dashboard-group-filter">Filter by group</label>
+      <select id="dashboard-group-filter" class="min-h-11 px-3 border border-slate-200 rounded-xl text-sm bg-white"><option value="">All groups</option></select>
+      <label class="sr-only" for="dashboard-school-filter">Filter by school</label>
+      <select id="dashboard-school-filter" class="min-h-11 px-3 border border-slate-200 rounded-xl text-sm bg-white"><option value="">All schools</option></select>
+      {% endif %}
+      <label class="sr-only" for="dashboard-saved-view">Saved filter</label>
+      <select id="dashboard-saved-view" class="min-h-11 px-3 border border-slate-200 rounded-xl text-sm bg-white"><option value="">Saved views…</option></select>
+      <button id="dashboard-save-view" type="button" class="min-h-11 px-3 rounded-xl border border-slate-200 text-slate-600 text-sm font-semibold"><i class="fas fa-bookmark mr-1" aria-hidden="true"></i>Save view</button>
+      {% if can_write_buses %}<button id="dashboard-bulk-toggle" type="button" class="min-h-11 px-3 rounded-xl bg-blue-600 text-white text-sm font-semibold"><i class="fas fa-list-check mr-1" aria-hidden="true"></i>Select buses</button>{% endif %}
     </div>
   </div>
 
@@ -144,21 +167,26 @@
     <div id="dashboard-filter-status" class="text-xs text-slate-400 mb-3" role="status" aria-live="polite"></div>
     <div id="attention-bus-section">
       <div class="flex items-center justify-between mb-3">
-        <h3 class="text-sm font-black text-slate-700"><span class="inline-flex min-w-6 h-6 px-1.5 items-center justify-center rounded-full bg-amber-100 text-amber-700 mr-2">{{ snapshot.attention_count }}</span>Needs attention</h3>
+        <h3 class="text-sm font-black text-slate-700"><span data-kpi="attention" class="inline-flex min-w-6 h-6 px-1.5 items-center justify-center rounded-full bg-amber-100 text-amber-700 mr-2">{{ snapshot.attention_count }}</span>Needs attention</h3>
       </div>
-      {% if snapshot.attention_buses %}
       <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3" id="attention-bus-grid">{% for bus in snapshot.attention_buses %}{{ bus_card(bus) }}{% endfor %}</div>
-      {% else %}
-      <div id="all-clear-state" class="rounded-2xl border border-emerald-100 bg-emerald-50 p-6 text-center"><i class="fas fa-circle-check text-3xl text-emerald-400" aria-hidden="true"></i><p class="font-bold text-emerald-800 mt-2">All buses are on time</p><p class="text-xs text-emerald-600 mt-1">No current service exceptions.</p></div>
-      {% endif %}
+      <div id="all-clear-state" class="{{ 'hidden' if snapshot.attention_buses else '' }} rounded-2xl border border-emerald-100 bg-emerald-50 p-6 text-center"><i class="fas fa-circle-check text-3xl text-emerald-400" aria-hidden="true"></i><p class="font-bold text-emerald-800 mt-2">All buses are on time</p><p class="text-xs text-emerald-600 mt-1">No current service exceptions.</p></div>
     </div>
 
     <details id="on-time-bus-section" class="mt-5 border-t border-slate-100 pt-4">
-      <summary class="cursor-pointer min-h-11 flex items-center justify-between text-sm font-bold text-slate-600 list-none"><span><i class="fas fa-circle-check text-emerald-500 mr-2" aria-hidden="true"></i>On-time buses <span class="text-slate-400 font-medium">({{ snapshot.on_time_count }})</span></span><span class="text-xs text-blue-600">View all <i class="fas fa-chevron-down ml-1" aria-hidden="true"></i></span></summary>
+      <summary class="cursor-pointer min-h-11 flex items-center justify-between text-sm font-bold text-slate-600 list-none"><span><i class="fas fa-circle-check text-emerald-500 mr-2" aria-hidden="true"></i>On-time buses <span class="text-slate-400 font-medium">(<span data-kpi="on-time">{{ snapshot.on_time_count }}</span>)</span></span><span class="text-xs text-blue-600">View all <i class="fas fa-chevron-down ml-1" aria-hidden="true"></i></span></summary>
       <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3 mt-3" id="on-time-bus-grid">{% for bus in snapshot.on_time_buses %}{{ bus_card(bus, True) }}{% endfor %}</div>
     </details>
     <div id="dashboard-no-results" class="hidden py-12 text-center text-slate-400"><i class="fas fa-search text-3xl text-slate-200 mb-2" aria-hidden="true"></i><p>No buses match these filters.</p></div>
   </div>
+</section>
+
+<section id="dashboard-pending-section" class="{{ 'hidden' if not snapshot.pending_queue else '' }} bg-white rounded-2xl border border-purple-100 shadow-sm overflow-hidden mb-5" aria-labelledby="pending-heading">
+  <div class="px-4 lg:px-5 py-4 border-b border-purple-100 bg-purple-50/50 flex items-center justify-between gap-3">
+    <div><h2 id="pending-heading" class="font-black text-slate-800"><i class="fas fa-hourglass-half text-purple-500 mr-2" aria-hidden="true"></i>Pending confirmation queue</h2><p class="text-xs text-slate-500 mt-0.5">Review, confirm, correct or cancel before automatic delivery.</p></div>
+    <span id="dashboard-pending-count" class="min-w-8 h-8 px-2 rounded-full bg-purple-600 text-white text-sm font-black inline-flex items-center justify-center">{{ snapshot.pending_queue|length }}</span>
+  </div>
+  <div id="dashboard-pending-list" class="divide-y divide-slate-100"></div>
 </section>
 {% endif %}
 
@@ -205,6 +233,7 @@
   <div class="p-5 space-y-5">
     <section class="rounded-2xl border border-slate-100 p-4"><div class="flex items-center justify-between gap-3"><div><p class="text-xs text-slate-400">Current status</p><div id="drawer-status" class="mt-1"></div></div><div class="text-right"><p id="drawer-delay" class="font-black text-slate-800"></p><p id="drawer-eta" class="text-xs text-blue-600 font-semibold"></p></div></div><p id="drawer-reason" class="text-sm text-slate-500 mt-3"></p></section>
     <section class="grid grid-cols-2 gap-3 text-sm"><div class="rounded-2xl bg-slate-50 p-3"><p class="text-xs text-slate-400">Schedules</p><p id="drawer-schedules" class="font-semibold text-slate-700 mt-1"></p></div>{% if can_view_notifications %}<div class="rounded-2xl bg-slate-50 p-3"><p class="text-xs text-slate-400">Assigned groups</p><p id="drawer-groups" class="font-semibold text-slate-700 mt-1"></p></div>{% endif %}</section>
+    {% if can_view_notifications %}<section class="rounded-2xl border border-blue-100 bg-blue-50/40 p-4"><div class="flex items-center justify-between gap-3"><div><h3 class="text-sm font-black text-slate-700">Recipient scope</h3><p class="text-xs text-slate-500 mt-0.5">Aggregate preview only; no contact details are exposed.</p></div><button id="drawer-preview-recipients" type="button" class="min-h-10 px-3 rounded-xl bg-white border border-blue-200 text-blue-700 text-xs font-bold">Preview</button></div><div id="drawer-recipient-preview" class="hidden mt-3"></div></section>{% endif %}
     <section><h3 class="text-sm font-black text-slate-700 mb-2">Today's timeline</h3><div id="drawer-timeline" class="space-y-2"></div><div id="drawer-no-timeline" class="hidden rounded-xl bg-slate-50 p-4 text-sm text-slate-400">No updates recorded today.</div></section>
     {% if can_write_buses %}
     <section class="border-t border-slate-100 pt-5"><button id="drawer-toggle-form" type="button" class="w-full min-h-11 rounded-xl bg-blue-600 text-white text-sm font-bold"><i class="fas fa-plus-circle mr-2" aria-hidden="true"></i>Record or update status</button><form id="dashboard-incident-form" method="POST" class="hidden mt-4 space-y-4">{% set incident_return_to = url_for('dashboard', period=period, date_from=date_from, date_to=date_to) %}{% include 'admin/_incident_form_fields.html' %}</form></section>
@@ -212,12 +241,49 @@
     <a href="{{ url_for('buses') }}" class="min-h-11 rounded-xl border border-slate-200 text-slate-600 text-sm font-semibold flex items-center justify-center"><i class="fas fa-arrow-up-right-from-square mr-2" aria-hidden="true"></i>Open full bus management</a>
   </div>
 </aside>
+
+{% if can_write_buses %}
+<div id="dashboard-bulk-bar" class="hidden fixed bottom-4 left-1/2 -translate-x-1/2 z-30 w-[min(94vw,760px)] rounded-2xl bg-slate-900 text-white shadow-2xl p-3 flex flex-wrap items-center gap-3">
+  <span class="font-bold"><span id="dashboard-selected-count">0</span> buses selected</span>
+  <button id="dashboard-select-visible" type="button" class="ml-auto min-h-10 px-3 rounded-xl bg-white/10 text-xs font-semibold">Select visible</button>
+  <button id="dashboard-clear-selection" type="button" class="min-h-10 px-3 rounded-xl bg-white/10 text-xs font-semibold">Clear</button>
+  <button id="dashboard-open-bulk" type="button" class="min-h-10 px-4 rounded-xl bg-blue-500 text-sm font-black">Bulk status update</button>
+</div>
+
+<div id="dashboard-bulk-modal" class="hidden fixed inset-0 z-[60] bg-slate-950/60 p-4 overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="dashboard-bulk-title">
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-auto my-6 overflow-hidden">
+    <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between"><div><h2 id="dashboard-bulk-title" class="font-black text-slate-800">Bulk bus status update</h2><p class="text-xs text-slate-400"><span id="dashboard-bulk-modal-count">0</span> selected buses</p></div><button type="button" data-close-bulk class="w-10 h-10 rounded-xl bg-slate-100 text-slate-500"><i class="fas fa-xmark" aria-hidden="true"></i></button></div>
+    <form id="dashboard-bulk-form" class="p-5 space-y-4">
+      <div class="grid sm:grid-cols-2 gap-3"><div><label class="block text-xs font-bold text-slate-600 mb-1" for="bulk-incident-type">Status</label><select id="bulk-incident-type" required class="w-full min-h-11 px-3 rounded-xl border border-slate-200 bg-white"><option value="">Select status…</option>{% for type in incident_types %}<option value="{{ type.id }}">{{ type.name }}</option>{% endfor %}</select></div><div><label class="block text-xs font-bold text-slate-600 mb-1" for="bulk-schedule">Period</label><select id="bulk-schedule" class="w-full min-h-11 px-3 rounded-xl border border-slate-200 bg-white"><option value="">No specific period</option>{% for schedule in schedule_types %}<option value="{{ schedule.id }}" {% if snapshot.current_period and snapshot.current_period.id == schedule.id %}selected{% endif %}>{{ schedule.name }}</option>{% endfor %}</select></div></div>
+      <div class="grid sm:grid-cols-2 gap-3"><div><label class="block text-xs font-bold text-slate-600 mb-1" for="bulk-delay">Delay minutes</label><input id="bulk-delay" type="number" min="0" max="999" value="0" class="w-full min-h-11 px-3 rounded-xl border border-slate-200"></div><div><label class="block text-xs font-bold text-slate-600 mb-1" for="bulk-eta">Estimated arrival</label><input id="bulk-eta" type="time" class="w-full min-h-11 px-3 rounded-xl border border-slate-200"></div></div>
+      <div><label class="block text-xs font-bold text-slate-600 mb-1" for="bulk-reason">Reason</label><select id="bulk-reason" class="w-full min-h-11 px-3 rounded-xl border border-slate-200 bg-white"><option value="">No preset reason</option>{% for reason in delay_reasons %}<option value="{{ reason.id }}">{{ reason.reason }}</option>{% endfor %}<option value="custom">Custom reason…</option></select><input id="bulk-reason-text" type="text" maxlength="200" placeholder="Custom reason" class="hidden w-full min-h-11 px-3 mt-2 rounded-xl border border-slate-200"></div>
+      <div><label class="block text-xs font-bold text-slate-600 mb-1" for="bulk-notes">Internal notes</label><textarea id="bulk-notes" maxlength="2000" rows="2" class="w-full px-3 py-2 rounded-xl border border-slate-200"></textarea></div>
+      {% if can_view_notifications %}<div class="rounded-xl border border-blue-100 bg-blue-50/40 p-3"><div class="flex items-center justify-between gap-3"><p class="text-xs font-bold text-slate-600">Aggregate recipient preview</p><button id="dashboard-bulk-preview" type="button" class="min-h-9 px-3 rounded-lg bg-white border border-blue-200 text-blue-700 text-xs font-bold">Calculate</button></div><div id="dashboard-bulk-recipient-preview" class="mt-2 text-xs text-slate-500">Preview has not been calculated.</div></div>{% endif %}
+      <label class="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3"><input id="dashboard-bulk-confirm" type="checkbox" class="mt-0.5 w-4 h-4 rounded border-slate-300 text-blue-600"><span class="text-xs text-amber-800">I reviewed the selected buses, status and period. Create pending updates for all selected buses.</span></label>
+      <div id="dashboard-bulk-error" class="hidden rounded-xl bg-red-50 text-red-700 p-3 text-sm"></div>
+      <div class="flex justify-end gap-2"><button type="button" data-close-bulk class="min-h-11 px-4 rounded-xl border border-slate-200 text-slate-600 font-semibold">Cancel</button><button id="dashboard-submit-bulk" type="submit" class="min-h-11 px-4 rounded-xl bg-blue-600 text-white font-black">Stage updates</button></div>
+    </form>
+  </div>
+</div>
 {% endif %}
+{% endif %}
+
+<div id="dashboard-toast-region" class="fixed top-4 right-4 z-[80] space-y-2" aria-live="polite" aria-atomic="true"></div>
 
 <script id="dashboard-config" type="application/json">{{ {
   'buses': snapshot.buses,
   'selectedBusId': selected_bus_id,
   'currentPeriodId': snapshot.current_period.id if snapshot.current_period else None,
+  'pendingQueue': snapshot.pending_queue,
+  'operationsRevision': operations_revision,
+  'operationsUrl': url_for('dashboard_operations'),
+  'recipientPreviewUrl': url_for('dashboard_recipient_preview') if can_view_notifications else None,
+  'bulkUrl': url_for('dashboard_bulk_incidents') if can_write_buses else None,
+  'bulkToken': bulk_request_token,
+  'csrfToken': csrf_token(),
+  'canWrite': can_write_buses,
+  'canPreviewRecipients': can_view_notifications,
+  'savedViewsKey': 'd205-dashboard-views-' ~ current_user.id,
   'dashboardUrl': url_for('dashboard', period=period, date_from=date_from, date_to=date_to),
   'analytics': {'byType': snapshot.by_type, 'typeColors': snapshot.by_type_colors, 'byBus': snapshot.by_bus, 'byDay': snapshot.by_day}
 }|tojson }}</script>

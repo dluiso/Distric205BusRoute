@@ -18,7 +18,7 @@ from collections import defaultdict
 
 EMAIL_RE = re.compile(r"^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
-NORMALIZER_REVISION = "2026-08-27.7"
+NORMALIZER_REVISION = "2026-08-27.8"
 STUDENT_SELF_CONTACT_ID = "student-self"
 TRANSPORTATION_V2_CONTRACT = "students_combined_dual_route"
 ROUTE_RE = re.compile(
@@ -97,6 +97,10 @@ DEFAULT_MAPPING_V1 = {
                     "BRIGHTARROW.010_enroll_status",
                 ],
                 "school_year": ["school_year", "year"],
+                "preferred_language": [
+                    "preferred_language", "preferred_language_code",
+                    "student_preferred_language", "language", "lang",
+                ],
                 "source_id": [
                     "source_id", "TRANSPORTATION.ID", "TRANSPORTATION.dcid",
                 ],
@@ -144,6 +148,10 @@ DEFAULT_MAPPING_V1 = {
                 ],
                 "notification_preference": [
                     "notification_preference", "notify", "preferred_contact_method",
+                ],
+                "preferred_language": [
+                    "preferred_language", "preferred_language_code",
+                    "contact_preferred_language", "language", "lang",
                 ],
                 "priority": ["priority", "contact_priority", "custody_priority"],
             },
@@ -401,7 +409,7 @@ def _contact_has_payload(row, resolved):
         normalize_text(value)
         for canonical in (
             "first_name", "last_name", "relationship", "email", "phone",
-            "notification_preference", "priority",
+            "notification_preference", "preferred_language", "priority",
         )
         for value in _values(row, resolved, canonical)
     )
@@ -518,6 +526,8 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
             "transport_status": normalize_text(
                 _first(row, transport_map, "transport_status"), 40),
             "school_year": normalize_text(_first(row, transport_map, "school_year"), 20),
+            "preferred_language": normalize_text(
+                _first(row, transport_map, "preferred_language"), 32),
             "assignments": [], "contacts": [], "source_rows": [],
         })
         for field in ("first_name", "last_name", "school", "grade", "stop"):
@@ -820,6 +830,8 @@ def build_normalized_plan(transport_payload, contacts_payload, mapping, max_rows
                     _values(row, contact_map, "phone")),
                 "notification_preference": normalize_text(
                     _first(row, contact_map, "notification_preference"), 40).lower(),
+                "preferred_language": normalize_text(
+                    _first(row, contact_map, "preferred_language"), 32),
                 "priority": normalize_text(
                     _first(row, contact_map, "priority"), 20),
             }

@@ -221,6 +221,22 @@ def _normalize_phone(value):
     return compact[:30]
 
 
+def _normalize_language(value):
+    """Normalize common labels to a compact language tag; blank defaults to English."""
+    raw = _normalize_text(value, 32).casefold().replace('_', '-')
+    aliases = {
+        'english': 'en', 'ingles': 'en', 'inglés': 'en',
+        'spanish': 'es', 'espanol': 'es', 'español': 'es',
+    }
+    raw = aliases.get(raw, raw)
+    if not raw:
+        return 'en'
+    if not re.fullmatch(r'[a-z]{2,3}(?:-[a-z0-9]{2,8})?', raw):
+        return 'en'
+    parts = raw.split('-', 1)
+    return parts[0] + (f'-{parts[1].upper()}' if len(parts) > 1 else '')
+
+
 def _valid_csv_upload(file):
     if not file or not file.filename or not file.filename.lower().endswith('.csv'):
         return False
@@ -584,6 +600,7 @@ class NotificationSubscriber(db.Model):
     active      = db.Column(db.Boolean, default=True)
     created_at  = db.Column(db.DateTime, default=_utcnow)
     group_id    = db.Column(db.Integer, db.ForeignKey('subscriber_group.id'), nullable=True)
+    school      = db.Column(db.String(100))
     # Legacy columns — kept for DB compat, migrated to SubscriberContact on startup
     first_name  = db.Column(db.String(80))
     last_name   = db.Column(db.String(80))
@@ -614,6 +631,7 @@ class SubscriberContact(db.Model):
     email         = db.Column(db.String(500))
     phone         = db.Column(db.String(30))
     role          = db.Column(db.String(20), default='parent')  # 'parent' | 'student'
+    preferred_language = db.Column(db.String(10), nullable=False, default='en')
     sort_order    = db.Column(db.Integer, default=0)
 
     @property
@@ -699,6 +717,19 @@ class EmailOutbox(db.Model):
     broadcast_job_id   = db.Column(db.String(64), db.ForeignKey('broadcast_job.public_id'), index=True)
     created_at         = db.Column(db.DateTime, nullable=False, default=_utcnow)
     updated_at         = db.Column(db.DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+
+class CommunicationEvent(db.Model):
+    """Provider-neutral, PII-free event for future communication adapters."""
+    __tablename__ = 'communication_event'
+    id                 = db.Column(db.Integer, primary_key=True)
+    event_key          = db.Column(db.String(128), unique=True, nullable=False, index=True)
+    event_type         = db.Column(db.String(40), nullable=False, index=True)
+    incident_record_id = db.Column(db.Integer, db.ForeignKey('bus_incident_record.id'),
+                                   nullable=False, unique=True, index=True)
+    payload_json       = db.Column(db.Text, nullable=False, default='{}')
+    status             = db.Column(db.String(20), nullable=False, default='ready', index=True)
+    created_at         = db.Column(db.DateTime, nullable=False, default=_utcnow, index=True)
 
 
 class ImportMappingProfile(db.Model):
@@ -1137,6 +1168,9 @@ def _migrate_add_columns():
         ('configuration',           'time_format',     "VARCHAR(4) DEFAULT '12h'"),
         ('notification_subscriber', 'group_id',        'INTEGER'),
         ('notification_subscriber', 'notes',           'VARCHAR(200)'),
+        ('notification_subscriber', 'school',          'VARCHAR(100)'),
+        ('subscriber_contact',      'preferred_language',
+                                                   "VARCHAR(10) NOT NULL DEFAULT 'en'"),
         ('bus_schedule_type',       'window_start',    'VARCHAR(5)'),
         ('bus_schedule_type',       'window_end',      'VARCHAR(5)'),
         ('holiday',                 'custom_message',        'TEXT'),
@@ -2360,24 +2394,80 @@ def process_email_outbox():
                 db.session.commit()
 
 
+def _record_communication_event(rec):
+    event_key = f'bus_status:{rec.id}'
+    existing = CommunicationEvent.query.filter_by(event_key=event_key).first()
+    if existing:
+        return existing
+    payload = {
+        'schema_version': 1,
+        'incident_record_id': rec.id,
+        'bus_id': rec.bus_id,
+        'bus_label': rec.bus.display_name,
+        'incident_type_id': rec.incident_type_id,
+        'status': rec.incident_type.name,
+        'schedule_type_id': rec.schedule_type_id,
+        'delay_minutes': int(rec.delay_minutes or 0),
+        'eta': rec.eta or '',
+        'incident_date': rec.incident_date.isoformat(),
+    }
+    event = CommunicationEvent(
+        event_key=event_key, event_type='bus_status_committed',
+        incident_record_id=rec.id,
+        payload_json=json.dumps(payload, sort_keys=True), status='ready')
+    try:
+        with db.session.begin_nested():
+            db.session.add(event)
+            db.session.flush()
+        return event
+    except IntegrityError:
+        return CommunicationEvent.query.filter_by(event_key=event_key).first()
+
+
+def _commit_pending_incident_once(record_id):
+    """Atomically claim and commit one pending incident across all workers."""
+    committed_at = _utcnow()
+    claimed = BusIncidentRecord.query.filter(
+        BusIncidentRecord.id == record_id,
+        BusIncidentRecord.is_pending.is_(True),
+    ).update({
+        BusIncidentRecord.is_pending: False,
+        BusIncidentRecord.committed_at: committed_at,
+        BusIncidentRecord.updated_at: committed_at,
+    }, synchronize_session=False)
+    if claimed != 1:
+        db.session.rollback()
+        return None
+    rec = BusIncidentRecord.query.options(
+        joinedload(BusIncidentRecord.bus),
+        joinedload(BusIncidentRecord.incident_type),
+    ).filter_by(id=record_id).one()
+    _record_communication_event(rec)
+    _send_bus_notifications(rec)
+    db.session.commit()
+    return rec
+
+
 def commit_pending_incidents():
     with app.app_context():
         try:
             cfg = Configuration.query.first()
             delay = cfg.commit_delay_min if cfg else 5
             cutoff = _utcnow() - timedelta(minutes=delay)
-            pending = BusIncidentRecord.query.filter(
-                BusIncidentRecord.is_pending == True,
-                BusIncidentRecord.created_at <= cutoff
-            ).all()
-            for rec in pending:
-                rec.is_pending = False
-                rec.committed_at = _utcnow()
-                _send_bus_notifications(rec)
-            if pending:
-                db.session.commit()
+            pending_ids = [record_id for (record_id,) in db.session.query(
+                BusIncidentRecord.id).filter(
+                    BusIncidentRecord.is_pending.is_(True),
+                    BusIncidentRecord.created_at <= cutoff,
+                ).order_by(BusIncidentRecord.created_at).all()]
+            for record_id in pending_ids:
+                try:
+                    _commit_pending_incident_once(record_id)
+                except Exception as exc:
+                    db.session.rollback()
+                    print(f'[Scheduler] incident {record_id} commit error: {type(exc).__name__}')
         except Exception as e:
-            print(f'[Scheduler] commit error: {e}')
+            db.session.rollback()
+            print(f'[Scheduler] commit error: {type(e).__name__}')
 
 def _send_bus_notifications(rec):
     try:
@@ -3194,13 +3284,19 @@ def _dashboard_incident_payload(record, cfg, now_utc):
         'eta': record.eta or '',
         'eta_label': fmt_time(record.eta, cfg.time_format),
         'reason': reason,
+        'reason_id': record.delay_reason_id,
+        'reason_text': record.delay_reason_text or '',
         'notes': record.notes or '',
         'schedule': record.schedule_type.name if record.schedule_type else '',
         'schedule_id': record.schedule_type_id,
         'pending': bool(record.is_pending),
         'pending_remaining_seconds': pending_remaining,
+        'pending_until_utc': (
+            pending_until.replace(tzinfo=timezone.utc).isoformat()
+            if pending_until else ''),
         'created_label': format_district_datetime(record.created_at, cfg, '%I:%M %p'),
         'created_by': record.created_by.username if record.created_by else '',
+        'version': f'{record.id}:{record.updated_at.isoformat() if record.updated_at else ""}',
     }
 
 
@@ -3229,6 +3325,7 @@ def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
         'on_time_count': 0,
         'attention_count': 0,
         'pending_today': 0,
+        'pending_queue': [],
         'schedule_warning_count': 0,
         'period_incidents': 0,
         'period_pending': 0,
@@ -3264,12 +3361,30 @@ def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
 
         default_type = IncidentType.query.filter_by(is_default=True).first()
         group_counts = {}
+        group_metadata = {}
+        group_schools = {}
         if can_view_notifications and bus_ids:
-            group_counts = dict(db.session.query(
-                GroupBusAssignment.bus_id,
-                func.count(func.distinct(GroupBusAssignment.group_id)),
-            ).filter(GroupBusAssignment.bus_id.in_(bus_ids)).group_by(
-                GroupBusAssignment.bus_id).all())
+            group_rows = db.session.query(
+                GroupBusAssignment.bus_id, SubscriberGroup.id, SubscriberGroup.name,
+            ).join(SubscriberGroup).filter(
+                GroupBusAssignment.bus_id.in_(bus_ids)).order_by(
+                    SubscriberGroup.name).all()
+            group_ids = {group_id for _bus_id, group_id, _name in group_rows}
+            for bus_id, group_id, group_name in group_rows:
+                group_metadata.setdefault(bus_id, {})[group_id] = group_name
+            group_counts = {
+                bus_id: len(groups) for bus_id, groups in group_metadata.items()
+            }
+            if group_ids:
+                for group_id, school in db.session.query(
+                        NotificationSubscriber.group_id,
+                        NotificationSubscriber.school).filter(
+                            NotificationSubscriber.active.is_(True),
+                            NotificationSubscriber.group_id.in_(group_ids),
+                            NotificationSubscriber.school.isnot(None),
+                        ).distinct().all():
+                    if school:
+                        group_schools.setdefault(group_id, set()).add(school)
 
         bus_payloads = []
         for bus in buses:
@@ -3297,6 +3412,11 @@ def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
             ]
             latest_payload = (_dashboard_incident_payload(latest, cfg, now_utc)
                               if latest else None)
+            bus_groups = group_metadata.get(bus.id, {})
+            bus_schools = sorted({
+                school for group_id in bus_groups
+                for school in group_schools.get(group_id, set())
+            }, key=_dashboard_natural_key)
             priority = int(status.operational_priority or 0) if status else 0
             payload = {
                 'id': bus.id,
@@ -3316,6 +3436,7 @@ def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
                 'eta_label': fmt_time(latest.eta, cfg.time_format) if latest else '',
                 'reason': latest_payload['reason'] if latest_payload else '',
                 'latest': latest_payload,
+                'version': latest_payload['version'] if latest_payload else '0',
                 'incidents': incident_payloads,
                 'schedules': [{
                     'id': assignment.schedule_type_id,
@@ -3327,6 +3448,9 @@ def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
                     assignment.schedule_type.name for assignment in assignments),
                 'schedule_warnings': warnings,
                 'group_count': int(group_counts.get(bus.id, 0)),
+                'group_ids': list(bus_groups),
+                'group_names': list(bus_groups.values()),
+                'school_names': bus_schools,
             }
             bus_payloads.append(payload)
 
@@ -3339,6 +3463,19 @@ def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
             (item for item in bus_payloads if not item['is_attention']),
             key=lambda item: _dashboard_natural_key(item['identifier'], item['name']),
         )
+        pending_queue = sorted([
+            {
+                **_dashboard_incident_payload(record, cfg, now_utc),
+                'bus_id': record.bus_id,
+                'bus_label': next((
+                    item['display_name'] for item in bus_payloads
+                    if item['id'] == record.bus_id), ''),
+            }
+            for record in today_records
+            if record.is_pending
+        ], key=lambda item: (
+            -item['priority'], item['pending_remaining_seconds'],
+            _dashboard_natural_key(item['bus_label'])))
         snapshot.update({
             'buses': attention + on_time,
             'attention_buses': attention,
@@ -3346,12 +3483,10 @@ def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
             'total_buses': len(bus_payloads),
             'attention_count': len(attention),
             'on_time_count': len(on_time),
-            'pending_today': sum(
-                1 for item in bus_payloads
-                if item['is_attention'] and item['latest']
-                and item['latest']['pending']),
+            'pending_today': len(pending_queue),
             'schedule_warning_count': sum(
                 len(item['schedule_warnings']) for item in bus_payloads),
+            'pending_queue': pending_queue,
         })
 
     if can_view_statistics:
@@ -3412,6 +3547,158 @@ def _build_dashboard_snapshot(period, date_from, date_to, *, can_view_buses,
         })
     return snapshot
 
+
+def _dashboard_operations_revision(snapshot):
+    material = {
+        'period_id': snapshot['current_period'].id if snapshot['current_period'] else None,
+        'buses': [{
+            'id': bus['id'], 'version': bus['version'], 'status': bus['status'],
+            'schedule_names': bus['schedule_names'],
+            'group_ids': bus['group_ids'], 'school_names': bus['school_names'],
+        } for bus in snapshot['buses']],
+        'pending': [item['version'] for item in snapshot['pending_queue']],
+    }
+    return hashlib.sha256(json.dumps(
+        material, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def _dashboard_operations_payload(snapshot):
+    return {
+        'revision': _dashboard_operations_revision(snapshot),
+        'generated_at': _utcnow().replace(tzinfo=timezone.utc).isoformat(),
+        'generated_label': snapshot['now_local'].strftime('%-I:%M:%S %p'),
+        'timezone': snapshot['timezone'],
+        'current_period_id': (
+            snapshot['current_period'].id if snapshot['current_period'] else None),
+        'current_period_name': (
+            snapshot['current_period'].name if snapshot['current_period'] else ''),
+        'attention_count': snapshot['attention_count'],
+        'pending_count': snapshot['pending_today'],
+        'on_time_count': snapshot['on_time_count'],
+        'total_buses': snapshot['total_buses'],
+        'schedule_warning_count': snapshot['schedule_warning_count'],
+        'buses': snapshot['buses'],
+        'pending_queue': snapshot['pending_queue'],
+    }
+
+
+def _dashboard_recipient_preview(bus_ids, schedule_type_id=None):
+    """Return aggregate, non-PII delivery scope for selected buses."""
+    bus_ids = {int(bus_id) for bus_id in bus_ids}
+    active_bus_ids = {
+        bus_id for (bus_id,) in db.session.query(Bus.id).filter(
+            Bus.active.is_(True), Bus.id.in_(bus_ids)).all()
+    }
+    if not active_bus_ids:
+        return {
+            'bus_count': 0, 'subscriber_count': 0, 'contact_count': 0,
+            'email_count': 0, 'sms_count': 0, 'roles': {}, 'languages': {},
+            'schools': {}, 'groups': [], 'buses_without_recipients': 0,
+        }
+
+    group_query = db.session.query(
+        GroupBusAssignment.bus_id, SubscriberGroup.id, SubscriberGroup.name,
+    ).join(SubscriberGroup).filter(
+        GroupBusAssignment.bus_id.in_(active_bus_ids))
+    if schedule_type_id:
+        group_query = group_query.filter(or_(
+            GroupBusAssignment.schedule_type_id.is_(None),
+            GroupBusAssignment.schedule_type_id == schedule_type_id,
+        ))
+    group_rows = group_query.all()
+    group_ids = {group_id for _bus_id, group_id, _name in group_rows}
+    group_names = {group_id: name for _bus_id, group_id, name in group_rows}
+    subscribers = []
+    if group_ids:
+        subscribers.extend(NotificationSubscriber.query.filter(
+            NotificationSubscriber.active.is_(True),
+            NotificationSubscriber.group_id.in_(group_ids),
+        ).all())
+    direct_subscriber_ids = {
+        subscriber_id for _bus_id, subscriber_id in db.session.query(
+            NotificationBusAssignment.bus_id,
+            NotificationBusAssignment.subscriber_id,
+        ).filter(NotificationBusAssignment.bus_id.in_(active_bus_ids)).all()
+    }
+    if direct_subscriber_ids:
+        subscribers.extend(NotificationSubscriber.query.filter(
+            NotificationSubscriber.active.is_(True),
+            NotificationSubscriber.id.in_(direct_subscriber_ids),
+        ).all())
+    subscriber_by_id = {subscriber.id: subscriber for subscriber in subscribers}
+    active_group_ids = {
+        subscriber.group_id for subscriber in subscriber_by_id.values()
+        if subscriber.group_id
+    }
+    buses_with_scope = {
+        bus_id for bus_id, group_id, _name in group_rows
+        if group_id in active_group_ids
+    }
+    if subscriber_by_id:
+        buses_with_scope.update(
+            bus_id for bus_id, _subscriber_id in db.session.query(
+                NotificationBusAssignment.bus_id,
+                NotificationBusAssignment.subscriber_id,
+            ).filter(
+                NotificationBusAssignment.bus_id.in_(active_bus_ids),
+                NotificationBusAssignment.subscriber_id.in_(subscriber_by_id),
+            ).all()
+        )
+    contacts = (SubscriberContact.query.filter(
+        SubscriberContact.subscriber_id.in_(subscriber_by_id)).all()
+        if subscriber_by_id else [])
+    contacts_by_subscriber = {}
+    for contact in contacts:
+        contacts_by_subscriber.setdefault(contact.subscriber_id, []).append(contact)
+
+    emails, phones = set(), set()
+    roles, languages, schools = {}, {}, {}
+    contact_count = 0
+    for subscriber in subscriber_by_id.values():
+        school = subscriber.school or 'Unspecified'
+        schools[school] = schools.get(school, 0) + 1
+        subscriber_contacts = contacts_by_subscriber.get(subscriber.id, [])
+        if not subscriber_contacts:
+            subscriber_contacts = [SimpleNamespace(
+                role='parent', preferred_language='en',
+                email=subscriber.email, phone=subscriber.phone)]
+        for contact in subscriber_contacts:
+            contact_count += 1
+            role = contact.role if contact.role in {'parent', 'student'} else 'parent'
+            language = _normalize_language(contact.preferred_language)
+            roles[role] = roles.get(role, 0) + 1
+            languages[language] = languages.get(language, 0) + 1
+            for address in (contact.email or '').split(','):
+                normalized = address.strip().lower()
+                if normalized:
+                    emails.add(normalized)
+            phone = _normalize_phone(contact.phone)
+            if phone:
+                phones.add(phone)
+
+    group_counts = dict(db.session.query(
+        NotificationSubscriber.group_id,
+        func.count(NotificationSubscriber.id),
+    ).filter(
+        NotificationSubscriber.active.is_(True),
+        NotificationSubscriber.group_id.in_(group_ids),
+    ).group_by(NotificationSubscriber.group_id).all()) if group_ids else {}
+    return {
+        'bus_count': len(active_bus_ids),
+        'subscriber_count': len(subscriber_by_id),
+        'contact_count': contact_count,
+        'email_count': len(emails),
+        'sms_count': len(phones),
+        'roles': dict(sorted(roles.items())),
+        'languages': dict(sorted(languages.items())),
+        'schools': dict(sorted(schools.items(), key=lambda item: (-item[1], item[0]))),
+        'groups': [{
+            'id': group_id, 'name': group_names[group_id],
+            'subscribers': int(group_counts.get(group_id, 0)),
+        } for group_id in sorted(group_ids, key=lambda value: group_names[value].casefold())],
+        'buses_without_recipients': len(active_bus_ids - buses_with_scope),
+    }
+
 @app.route('/admin/')
 @app.route('/admin/dashboard')
 @login_required
@@ -3437,6 +3724,7 @@ def dashboard():
     schedule_types = []
     delay_reasons = []
     incident_request_token = None
+    bulk_request_token = None
     if can_view_buses:
         incident_types = IncidentType.query.order_by(
             IncidentType.operational_priority.desc(),
@@ -3446,6 +3734,7 @@ def dashboard():
     if can_write_buses:
         delay_reasons = DelayReason.query.order_by(DelayReason.sort_order).all()
         incident_request_token = _issue_incident_request_token()
+        bulk_request_token = _issue_incident_request_token()
     selected_bus_id = request.args.get('bus', type=int)
     return render_template(
         'admin/dashboard.html', snapshot=snapshot,
@@ -3458,8 +3747,53 @@ def dashboard():
         incident_types=incident_types, schedule_types=schedule_types,
         delay_reasons=delay_reasons,
         incident_request_token=incident_request_token,
+        bulk_request_token=bulk_request_token,
+        operations_revision=_dashboard_operations_revision(snapshot),
         selected_bus_id=selected_bus_id,
     )
+
+
+@app.route('/admin/dashboard/operations.json')
+@login_required
+@require_module('buses', 'limited')
+def dashboard_operations():
+    cfg = get_config()
+    today = district_today(cfg)
+    snapshot = _build_dashboard_snapshot(
+        'today', today.isoformat(), today.isoformat(),
+        can_view_buses=True, can_view_statistics=False,
+        can_view_notifications=current_user.has_access('notifications', 'limited'),
+    )
+    payload = _dashboard_operations_payload(snapshot)
+    response = jsonify(payload)
+    response.set_etag(payload['revision'])
+    response.cache_control.private = True
+    response.cache_control.no_cache = True
+    return response.make_conditional(request)
+
+
+@app.route('/admin/dashboard/recipients/preview', methods=['POST'])
+@login_required
+@require_module('buses', 'limited')
+@require_module('notifications', 'limited')
+def dashboard_recipient_preview():
+    payload = request.get_json(silent=True) or {}
+    raw_bus_ids = payload.get('bus_ids', [])
+    if not isinstance(raw_bus_ids, list) or not 1 <= len(raw_bus_ids) <= 250:
+        return jsonify({'ok': False, 'message': 'Select between 1 and 250 buses.'}), 400
+    try:
+        bus_ids = {int(value) for value in raw_bus_ids}
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'message': 'The bus selection is invalid.'}), 400
+    schedule_type_id = payload.get('schedule_type_id')
+    try:
+        schedule_type_id = int(schedule_type_id) if schedule_type_id else None
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'message': 'The schedule period is invalid.'}), 400
+    if schedule_type_id and not db.session.get(BusScheduleType, schedule_type_id):
+        return jsonify({'ok': False, 'message': 'The schedule period is unavailable.'}), 400
+    return jsonify({'ok': True, 'preview': _dashboard_recipient_preview(
+        bus_ids, schedule_type_id)})
 
 
 # ── BUSES MODULE ──────────────────────────────────────────────────────────────
@@ -3560,6 +3894,67 @@ def delete_bus(bus_id):
     flash(f'Bus {bus.identifier} deactivated.', 'success')
     return redirect(url_for('buses'))
 
+
+def _mapping_integer(values, key, default=None):
+    raw = values.get(key, default)
+    if raw in (None, ''):
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _validated_incident_input(values):
+    incident_type_id = _mapping_integer(values, 'incident_type_id')
+    incident_type = (db.session.get(IncidentType, incident_type_id)
+                     if incident_type_id else None)
+    if not incident_type:
+        return None, 'Select a valid incident type.'
+    schedule_type_id = _mapping_integer(values, 'schedule_type_id')
+    if values.get('schedule_type_id') not in (None, '') and schedule_type_id is None:
+        return None, 'Select a valid schedule period.'
+    if schedule_type_id and not db.session.get(BusScheduleType, schedule_type_id):
+        return None, 'Select a valid schedule period.'
+    delay_minutes = _mapping_integer(values, 'delay_minutes', 0)
+    if delay_minutes is None or not 0 <= delay_minutes <= 999:
+        return None, 'Delay must be between 0 and 999 minutes.'
+    eta = _normalize_text(values.get('eta'), 5) or None
+    if eta and _parse_clock_value(eta) is None:
+        return None, 'Enter a valid ETA.'
+    reason_raw = _normalize_text(values.get('delay_reason_id'), 20)
+    reason_id = int(reason_raw) if reason_raw.isdigit() else None
+    if reason_id and not db.session.get(DelayReason, reason_id):
+        return None, 'Select a valid delay reason.'
+    reason_text = _normalize_text(values.get('delay_reason_text'), 201) or None
+    if reason_text and len(reason_text) > 200:
+        return None, 'The custom delay reason cannot exceed 200 characters.'
+    if reason_id:
+        reason_text = None
+    notes = _normalize_text(values.get('notes'), 2001) or None
+    if notes and len(notes) > 2000:
+        return None, 'Notes cannot exceed 2,000 characters.'
+    return {
+        'incident_type_id': incident_type.id,
+        'schedule_type_id': schedule_type_id,
+        'delay_minutes': delay_minutes,
+        'eta': eta,
+        'delay_reason_id': reason_id,
+        'delay_reason_text': reason_text,
+        'notes': notes,
+    }, None
+
+
+def _latest_bus_incident(bus_id, incident_date, schedule_type_id):
+    query = BusIncidentRecord.query.filter_by(
+        bus_id=bus_id, incident_date=incident_date)
+    if schedule_type_id:
+        query = query.filter_by(schedule_type_id=schedule_type_id)
+    else:
+        query = query.filter(BusIncidentRecord.schedule_type_id.is_(None))
+    return query.order_by(
+        BusIncidentRecord.created_at.desc(), BusIncidentRecord.id.desc()).first()
+
 @app.route('/admin/buses/<int:bus_id>/incident', methods=['POST'])
 @login_required
 @require_module('buses', 'full')
@@ -3579,46 +3974,35 @@ def add_bus_incident(bus_id):
         flash('This bus is inactive and cannot receive a status update.', 'error')
         return redirect(next_url)
 
-    inc_type_id = request.form.get('incident_type_id', type=int)
-    incident_type = db.session.get(IncidentType, inc_type_id) if inc_type_id else None
-    if not incident_type:
-        flash('Select a valid incident type.', 'error')
+    incident_input, validation_error = _validated_incident_input(request.form)
+    if validation_error:
+        flash(validation_error, 'error')
         return redirect(next_url)
-    schedule_type_id = request.form.get('schedule_type_id', type=int) or None
-    if schedule_type_id and not db.session.get(BusScheduleType, schedule_type_id):
-        flash('Select a valid schedule period.', 'error')
-        return redirect(next_url)
-    delay_minutes = request.form.get('delay_minutes', type=int)
-    if delay_minutes is None or not 0 <= delay_minutes <= 999:
-        flash('Delay must be between 0 and 999 minutes.', 'error')
-        return redirect(next_url)
-    eta = request.form.get('eta', '').strip() or None
-    if eta and _parse_clock_value(eta) is None:
-        flash('Enter a valid ETA.', 'error')
-        return redirect(next_url)
-    reason_raw = request.form.get('delay_reason_id', '').strip()
-    reason_id = int(reason_raw) if reason_raw.isdigit() else None
-    if reason_id and not db.session.get(DelayReason, reason_id):
-        flash('Select a valid delay reason.', 'error')
-        return redirect(next_url)
-    reason_text = request.form.get('delay_reason_text', '').strip() or None
-    if reason_text and len(reason_text) > 200:
-        flash('The custom delay reason cannot exceed 200 characters.', 'error')
-        return redirect(next_url)
-    if reason_id:
-        reason_text = None
-    notes = request.form.get('notes', '').strip() or None
-    if notes and len(notes) > 2000:
-        flash('Notes cannot exceed 2,000 characters.', 'error')
-        return redirect(next_url)
+    expected_latest_raw = request.form.get('expected_latest_id', '').strip()
+    current_latest = _latest_bus_incident(
+        bus.id, district_today(), incident_input['schedule_type_id'])
+    if expected_latest_raw:
+        try:
+            expected_latest_id = int(expected_latest_raw)
+        except ValueError:
+            flash('The displayed bus state is invalid. Refresh and try again.', 'error')
+            return redirect(next_url)
+        if expected_latest_id != (current_latest.id if current_latest else 0):
+            flash('Another operator changed this bus. Review the latest status before retrying.',
+                  'warning')
+            return redirect(next_url)
+    replace_id = request.form.get('replace_incident_id', type=int)
+    replaced = None
+    if replace_id:
+        replaced = BusIncidentRecord.query.filter_by(
+            id=replace_id, bus_id=bus.id, is_pending=True).first()
+        if not replaced or (current_latest and replaced.id != current_latest.id):
+            flash('The pending update changed and can no longer be corrected.', 'warning')
+            return redirect(next_url)
+        db.session.delete(replaced)
+        db.session.flush()
     rec = BusIncidentRecord(
-        bus_id=bus_id, incident_type_id=inc_type_id,
-        schedule_type_id=schedule_type_id,
-        delay_minutes=delay_minutes,
-        eta=eta,
-        delay_reason_id=reason_id,
-        delay_reason_text=reason_text,
-        notes=notes,
+        bus_id=bus_id, **incident_input,
         incident_date=district_today(), is_pending=True,
         created_by_id=current_user.id,
         request_token=request_token,
@@ -3634,9 +4018,10 @@ def add_bus_incident(bus_id):
         raise
     _audit('add_bus_incident', 'buses', bus.display_name, json.dumps({
         'incident_record_id': rec.id,
-        'incident_type_id': incident_type.id,
-        'schedule_type_id': schedule_type_id,
-        'delay_minutes': delay_minutes,
+        'incident_type_id': rec.incident_type_id,
+        'schedule_type_id': rec.schedule_type_id,
+        'delay_minutes': rec.delay_minutes,
+        'replaced_incident_id': replaced.id if replaced else None,
     }, sort_keys=True))
     flash(f'Incident recorded for {bus.identifier}.', 'success')
     return redirect(next_url)
@@ -3657,6 +4042,160 @@ def delete_bus_incident(rec_id):
     _audit('delete_bus_incident', 'buses', target, details)
     flash('Incident removed.', 'success')
     return redirect(request.referrer or url_for('buses'))
+
+
+@app.route('/admin/dashboard/incidents/<int:rec_id>/confirm', methods=['POST'])
+@login_required
+@require_module('buses', 'full')
+def dashboard_confirm_incident(rec_id):
+    payload = request.get_json(silent=True) or {}
+    record = db.session.get(BusIncidentRecord, rec_id)
+    if not record:
+        return jsonify({'ok': False, 'message': 'The pending update no longer exists.'}), 404
+    expected_version = str(payload.get('version') or '')
+    current_version = f'{record.id}:{record.updated_at.isoformat() if record.updated_at else ""}'
+    if not record.is_pending or (expected_version and not hmac.compare_digest(
+            expected_version, current_version)):
+        return jsonify({'ok': False, 'message':
+                        'The pending update changed. Refresh before continuing.'}), 409
+    bus_label = record.bus.display_name
+    committed = _commit_pending_incident_once(record.id)
+    if not committed:
+        return jsonify({'ok': False, 'message':
+                        'Another operator already processed this update.'}), 409
+    _audit('confirm_bus_incident', 'buses', bus_label, json.dumps({
+        'incident_record_id': rec_id, 'manual_confirmation': True,
+    }, sort_keys=True))
+    return jsonify({'ok': True, 'message': f'{bus_label} was confirmed.',
+                    'request_token': _issue_incident_request_token()})
+
+
+@app.route('/admin/dashboard/incidents/<int:rec_id>/cancel', methods=['POST'])
+@login_required
+@require_module('buses', 'full')
+def dashboard_cancel_incident(rec_id):
+    payload = request.get_json(silent=True) or {}
+    record = db.session.get(BusIncidentRecord, rec_id)
+    if not record:
+        return jsonify({'ok': False, 'message': 'The pending update no longer exists.'}), 404
+    expected_version = str(payload.get('version') or '')
+    current_version = f'{record.id}:{record.updated_at.isoformat() if record.updated_at else ""}'
+    if not record.is_pending or (expected_version and not hmac.compare_digest(
+            expected_version, current_version)):
+        return jsonify({'ok': False, 'message':
+                        'The pending update changed. Refresh before continuing.'}), 409
+    bus_label = record.bus.display_name
+    details = json.dumps({
+        'incident_record_id': record.id,
+        'incident_type_id': record.incident_type_id,
+        'schedule_type_id': record.schedule_type_id,
+        'delay_minutes': int(record.delay_minutes or 0),
+    }, sort_keys=True)
+    claimed = BusIncidentRecord.query.filter(
+        BusIncidentRecord.id == rec_id,
+        BusIncidentRecord.is_pending.is_(True),
+        BusIncidentRecord.updated_at == record.updated_at,
+    ).delete(synchronize_session=False)
+    if claimed != 1:
+        db.session.rollback()
+        return jsonify({'ok': False, 'message':
+                        'Another operator already processed this update.'}), 409
+    db.session.commit()
+    _audit('cancel_bus_incident', 'buses', bus_label, details)
+    return jsonify({'ok': True, 'message': f'Pending update for {bus_label} was cancelled.',
+                    'request_token': _issue_incident_request_token()})
+
+
+@app.route('/admin/dashboard/incidents/bulk', methods=['POST'])
+@login_required
+@require_module('buses', 'full')
+def dashboard_bulk_incidents():
+    payload = request.get_json(silent=True) or {}
+    raw_bus_ids = payload.get('bus_ids', [])
+    if not isinstance(raw_bus_ids, list) or not 1 <= len(raw_bus_ids) <= 250:
+        return jsonify({'ok': False, 'message': 'Select between 1 and 250 buses.'}), 400
+    try:
+        bus_ids = sorted({int(value) for value in raw_bus_ids})
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'message': 'The bus selection is invalid.'}), 400
+    if payload.get('confirmed') is not True:
+        return jsonify({'ok': False, 'message':
+                        'Bulk operations require explicit confirmation.'}), 400
+    request_token = _normalize_text(payload.get('request_token'), 64)
+    if not re.fullmatch(r'[0-9a-f]{48}', request_token):
+        return jsonify({'ok': False, 'message': 'The bulk operation form expired.'}), 409
+    row_tokens = {
+        bus_id: hashlib.sha256(
+            f'bulk:{request_token}:{bus_id}'.encode('utf-8')).hexdigest()
+        for bus_id in bus_ids
+    }
+    existing_count = BusIncidentRecord.query.filter(
+        BusIncidentRecord.request_token.in_(row_tokens.values())).count()
+    if existing_count:
+        if existing_count == len(bus_ids):
+            return jsonify({'ok': True, 'duplicate': True,
+                            'message': 'This bulk operation was already recorded.',
+                            'request_token': _issue_incident_request_token()})
+        return jsonify({'ok': False, 'message':
+                        'The bulk operation is partially recorded and requires review.'}), 409
+    if not _consume_incident_request_token(request_token):
+        return jsonify({'ok': False, 'message': 'The bulk operation form expired.'}), 409
+    incident_input, validation_error = _validated_incident_input(
+        payload.get('incident') or {})
+    if validation_error:
+        return jsonify({'ok': False, 'message': validation_error,
+                        'request_token': _issue_incident_request_token()}), 400
+    buses = Bus.query.filter(Bus.id.in_(bus_ids), Bus.active.is_(True)).all()
+    if len(buses) != len(bus_ids):
+        return jsonify({'ok': False, 'message':
+                        'One or more selected buses are no longer active.',
+                        'request_token': _issue_incident_request_token()}), 409
+    expected_versions = payload.get('expected_latest_ids') or {}
+    if not isinstance(expected_versions, dict):
+        return jsonify({'ok': False, 'message': 'The displayed bus versions are invalid.',
+                        'request_token': _issue_incident_request_token()}), 400
+    conflicts = []
+    today = district_today()
+    for bus in buses:
+        latest = _latest_bus_incident(
+            bus.id, today, incident_input['schedule_type_id'])
+        try:
+            expected_id = int(expected_versions.get(str(bus.id), 0))
+        except (TypeError, ValueError):
+            expected_id = -1
+        if expected_id != (latest.id if latest else 0):
+            conflicts.append(bus.display_name)
+    if conflicts:
+        return jsonify({'ok': False, 'message':
+                        'Another operator changed one or more selected buses.',
+                        'conflict_count': len(conflicts),
+                        'request_token': _issue_incident_request_token()}), 409
+    records = []
+    for bus in buses:
+        record = BusIncidentRecord(
+            bus_id=bus.id, **incident_input, incident_date=today,
+            is_pending=True, created_by_id=current_user.id,
+            request_token=row_tokens[bus.id])
+        db.session.add(record)
+        records.append(record)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({'ok': False, 'message':
+                        'The bulk operation raced with another request; refresh and review.',
+                        'request_token': _issue_incident_request_token()}), 409
+    _audit('bulk_add_bus_incident', 'buses', f'{len(records)} buses', json.dumps({
+        'incident_record_ids': [record.id for record in records],
+        'incident_type_id': incident_input['incident_type_id'],
+        'schedule_type_id': incident_input['schedule_type_id'],
+        'delay_minutes': incident_input['delay_minutes'],
+    }, sort_keys=True))
+    return jsonify({
+        'ok': True, 'created': len(records),
+        'message': f'{len(records)} bus status updates were staged.',
+        'request_token': _issue_incident_request_token(),
+    })
 
 @app.route('/admin/delay-reasons/add', methods=['POST'])
 @login_required
@@ -4644,12 +5183,14 @@ def _masked_subscriber(subscriber):
         email=', '.join(_mask_email(item) for item in (contact.email or '').split(',') if item.strip()),
         phone=_mask_phone(contact.phone),
         role=contact.role,
+        preferred_language=contact.preferred_language or 'en',
         full_name=' '.join(filter(None, (
             _mask_name(contact.first_name), _mask_name(contact.last_name)))),
     ) for contact in subscriber.contacts]
     return SimpleNamespace(
         id=subscriber.id, notes=_mask_name(subscriber.notes), active=subscriber.active,
         group_id=subscriber.group_id, group=subscriber.group,
+        school=subscriber.school or '',
         contacts=contacts, first_name=_mask_name(subscriber.first_name),
         last_name=_mask_name(subscriber.last_name), email=_mask_email(subscriber.email),
         phone=_mask_phone(subscriber.phone), full_name=(
@@ -4698,12 +5239,14 @@ def _save_contacts(subscriber_id, form):
         em = form.get(f'contact_{i}_email',       '').strip()
         ph = form.get(f'contact_{i}_phone',       '').strip()
         rl = form.get(f'contact_{i}_role',        'parent').strip()
+        language = _normalize_language(
+            form.get(f'contact_{i}_preferred_language', 'en'))
         if fn or em:
             db.session.add(SubscriberContact(
                 subscriber_id=subscriber_id,
                 first_name=fn or None, last_name=ln or None,
                 email=em or None,      phone=ph or None,
-                role=rl,               sort_order=i,
+                role=rl, preferred_language=language, sort_order=i,
             ))
 
 
@@ -4735,6 +5278,7 @@ def add_subscriber():
     s = NotificationSubscriber(
         notes=request.form.get('notes', '').strip() or None,
         group_id=request.form.get('group_id', type=int) or None,
+        school=_normalize_text(request.form.get('school'), 100) or None,
     )
     db.session.add(s)
     db.session.flush()
@@ -4756,6 +5300,7 @@ def edit_subscriber(sid):
     s.notes    = request.form.get('notes', '').strip() or None
     s.active   = 'active' in request.form
     s.group_id = request.form.get('group_id', type=int) or None
+    s.school   = _normalize_text(request.form.get('school'), 100) or None
     _delete_contact_external_identities(
         contact.id for contact in s.contacts)
     SubscriberContact.query.filter_by(subscriber_id=sid).delete()
@@ -5264,10 +5809,13 @@ def preview_import_csv():
         phone      = _normalize_phone(row.get('phone'))
         role_raw   = (row.get('role') or 'parent').strip().lower()
         role       = role_raw if role_raw in ('parent', 'student') else 'parent'
+        school     = _normalize_text(row.get('school'), 100)
+        language   = _normalize_language(row.get('preferred_language'))
         normalized = {
             'group': group_name, 'household_label': household,
             'first_name': first_name, 'last_name': last_name,
             'email': email, 'phone': phone, 'role': role,
+            'school': school, 'preferred_language': language,
         }
 
         if not first_name and not email:
@@ -5419,11 +5967,13 @@ def import_subscribers_csv():
                 groups_cache[group_name.lower()] = group_obj
                 created_groups.append(group_name)
             household = normalized.get('household_label', '').strip()
-            key = (group_obj.id if group_obj else None,
+            school = _normalize_text(normalized.get('school'), 100)
+            key = (group_obj.id if group_obj else None, school,
                    household if household else f'__row_{row.row_number}__')
             households.setdefault(key, {
                 'group_id': group_obj.id if group_obj else None,
-                'notes': household or None, 'contacts': [], 'rows': [],
+                'school': school or None, 'notes': household or None,
+                'contacts': [], 'rows': [],
             })
             households[key]['contacts'].append({
                 'first_name': normalized.get('first_name') or None,
@@ -5431,13 +5981,16 @@ def import_subscribers_csv():
                 'email': normalized.get('email') or None,
                 'phone': normalized.get('phone') or None,
                 'role': normalized.get('role') or 'parent',
+                'preferred_language': _normalize_language(
+                    normalized.get('preferred_language')),
             })
             households[key]['rows'].append(row)
 
         imported = 0
         for household in households.values():
             subscriber = NotificationSubscriber(
-                notes=household['notes'], group_id=household['group_id'], active=True)
+                notes=household['notes'], group_id=household['group_id'],
+                school=household['school'], active=True)
             db.session.add(subscriber)
             db.session.flush()
             for index, contact in enumerate(household['contacts']):
@@ -5652,6 +6205,7 @@ def _subscriber_snapshot(subscriber, contact_identities=None):
             'id': contact.id, 'first_name': contact.first_name,
             'last_name': contact.last_name, 'email': contact.email,
             'phone': contact.phone, 'role': contact.role,
+            'preferred_language': contact.preferred_language or 'en',
             'sort_order': contact.sort_order,
             'identities': [[item.entity_type, item.external_key]
                            for item in identities],
@@ -5659,6 +6213,7 @@ def _subscriber_snapshot(subscriber, contact_identities=None):
     return {
         'id': subscriber.id, 'notes': subscriber.notes,
         'active': bool(subscriber.active), 'group_id': subscriber.group_id,
+        'school': subscriber.school,
         'created_at': _snapshot_datetime(subscriber.created_at),
         'contacts': contacts,
     }
@@ -5674,6 +6229,13 @@ def _subscriber_matches_snapshot(subscriber, expected,
             subscriber.created_at, expected, change_created_at):
         return False
     current = _subscriber_snapshot(subscriber, contact_identities)
+    if 'school' not in expected:
+        current.pop('school', None)
+    expected_contacts = expected.get('contacts') or []
+    current_contacts = current.get('contacts') or []
+    if all('preferred_language' not in contact for contact in expected_contacts):
+        for contact in current_contacts:
+            contact.pop('preferred_language', None)
     if 'created_at' not in expected:
         current.pop('created_at', None)
     return _snapshot_hash(current) == _snapshot_hash(expected)
@@ -5944,6 +6506,8 @@ def _powerschool_contact_specs(proposal):
         'first_name': proposal.get('first_name') or '',
         'last_name': proposal.get('last_name') or '',
         'email': '', 'phone': '', 'role': 'student',
+        'preferred_language': _normalize_language(
+            proposal.get('preferred_language')),
         'identities': [('student_contact', student_number)],
     }
     specs = []
@@ -5962,6 +6526,8 @@ def _powerschool_contact_specs(proposal):
                 'last_name': contact.get('last_name') or '',
                 'email': contact.get('email') or '',
                 'phone': contact.get('phone') or '', 'role': 'parent',
+                'preferred_language': _normalize_language(
+                    contact.get('preferred_language')),
                 'identities': [identity],
             })
     if student_spec['first_name'] or student_spec['email'] or student_spec['phone']:
@@ -6007,6 +6573,10 @@ def _powerschool_compare_proposal(proposal):
             changes.append({'field': 'household_label',
                             'current': subscriber.notes or '',
                             'proposed': expected_label})
+        proposed_school = _normalize_text(proposal.get('school'), 100)
+        if (subscriber.school or '') != proposed_school:
+            changes.append({'field': 'school', 'current': subscriber.school or '',
+                            'proposed': proposed_school})
         for spec in specs:
             mapped = []
             for entity_type, external_key in spec['identities']:
@@ -6028,7 +6598,8 @@ def _powerschool_compare_proposal(proposal):
                                 'proposed': ' '.join(filter(None, [
                                     spec['first_name'], spec['last_name']]))})
             else:
-                for field in ('first_name', 'last_name', 'email', 'phone', 'role'):
+                for field in ('first_name', 'last_name', 'email', 'phone', 'role',
+                              'preferred_language'):
                     current = getattr(contact, field) or ''
                     proposed = spec[field] or ''
                     if current != proposed:
@@ -7814,6 +8385,7 @@ def _apply_powerschool_proposal(
         db.session.add(subscriber)
     subscriber.group_id = group.id
     subscriber.notes = _powerschool_household_label(proposal)
+    subscriber.school = _normalize_text(proposal.get('school'), 100) or None
     subscriber.active = True
     specs = _powerschool_contact_specs(proposal)
     prepared_contacts = []
@@ -7839,6 +8411,7 @@ def _apply_powerschool_proposal(
         contact.email = spec['email'] or None
         contact.phone = spec['phone'] or None
         contact.role = spec['role']
+        contact.preferred_language = spec['preferred_language'] or 'en'
         contact.sort_order = index
         prepared_contacts.append((spec, contact))
 
@@ -8409,6 +8982,8 @@ def _restore_subscriber_snapshot(subscriber, snapshot):
     subscriber.notes = snapshot.get('notes')
     subscriber.active = bool(snapshot.get('active'))
     subscriber.group_id = snapshot.get('group_id')
+    if 'school' in snapshot:
+        subscriber.school = snapshot.get('school')
     desired = {item['id']: item for item in snapshot.get('contacts', [])}
     for contact in list(subscriber.contacts):
         if contact.id not in desired:
@@ -8417,7 +8992,10 @@ def _restore_subscriber_snapshot(subscriber, snapshot):
         contact = db.session.get(SubscriberContact, contact_id)
         if not contact:
             raise ValueError('Rollback cannot recreate a removed pre-import contact safely.')
-        for field in ('first_name', 'last_name', 'email', 'phone', 'role', 'sort_order'):
+        for field in ('first_name', 'last_name', 'email', 'phone', 'role',
+                      'preferred_language', 'sort_order'):
+            if field not in item:
+                continue
             setattr(contact, field, item.get(field))
 
 

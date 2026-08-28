@@ -1,5 +1,7 @@
 <input type="hidden" name="request_token" value="{{ incident_request_token or '' }}">
 <input type="hidden" name="next" id="incident-next" value="{{ incident_return_to or url_for('buses') }}">
+<input type="hidden" name="expected_latest_id" id="incident-expected-latest" value="">
+<input type="hidden" name="replace_incident_id" id="incident-replace-id" value="">
 <div>
   <label class="block text-xs font-semibold text-slate-600 mb-2">Status type *</label>
   <div class="grid grid-cols-2 gap-2 max-h-52 overflow-y-auto pr-1">
